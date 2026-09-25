@@ -1,0 +1,114 @@
+.nori-search {
+  width: 680px;
+  max-width: 100%;
+  height: 430px;
+  display: flex;
+  flex-direction: column;
+  background: var(--nori-raised);
+  border: 1px solid var(--nori-strong-border);
+  border-radius: 15px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.nori-search-header {
+  height: 60px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--nori-border);
+}
+
+.nori-search-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--nori-text);
+  font-size: 14px;
+}
+.nori-search-input::placeholder {
+  color: var(--nori-faint);
+}
+
+.nori-search-esc {
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 10.5px;
+  color: var(--nori-faint);
+  border: 1px solid var(--nori-border);
+}
+
+.nori-search-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 6px;
+}
+
+.nori-search-row {
+  min-height: 54px;
+  margin: 2px 6px 0;
+  padding: 7px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-radius: 9px;
+  border: 1px solid var(--nori-raised);
+  background: var(--nori-raised);
+  cursor: pointer;
+}
+.nori-search-row:hover {
+  background: var(--nori-hover);
+}
+.nori-search-row--selected {
+  border-color: var(--nori-strong-border);
+  background: var(--nori-selected);
+}
+
+.nori-search-row-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nori-search-row-sender {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--nori-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nori-search-row-subject {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--nori-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nori-search-row-time {
+  font-size: 10.5px;
+  color: var(--nori-faint);
+  flex: none;
+}
+
+.nori-search-row-preview {
+  font-size: 11px;
+  color: var(--nori-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nori-search-empty {
+  padding: 20px;
+  color: var(--nori-faint);
+  font-size: 12px;
+}

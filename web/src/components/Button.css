@@ -1,0 +1,71 @@
+.nori-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 0 8px;
+  height: 28px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  background: transparent;
+  color: var(--nori-muted);
+  white-space: nowrap;
+}
+
+.nori-button--dense {
+  height: 22px;
+  padding: 0 5px;
+  gap: 4px;
+  font-size: 11px;
+  border-radius: 5px;
+}
+
+.nori-button--full {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.nori-button--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--nori-muted);
+}
+.nori-button--ghost:hover:not(:disabled) {
+  background: var(--nori-hover);
+}
+.nori-button--ghost:active:not(:disabled) {
+  background: var(--nori-active);
+}
+
+.nori-button--subtle {
+  background: var(--nori-surface);
+  border-color: var(--nori-border);
+  color: var(--nori-text);
+}
+.nori-button--subtle:hover:not(:disabled) {
+  background: var(--nori-raised);
+}
+
+.nori-button--accent {
+  background: var(--nori-text);
+  border-color: var(--nori-text);
+  color: var(--nori-canvas);
+}
+
+.nori-button--disabled {
+  background: var(--nori-surface);
+  color: var(--nori-faint);
+  cursor: default;
+}
+
+.nori-button:focus-visible {
+  outline: 1px solid var(--nori-focus);
+  outline-offset: 1px;
+}
+
+.nori-button__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

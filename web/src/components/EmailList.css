@@ -1,0 +1,102 @@
+.nori-inbox {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--nori-canvas);
+}
+.nori-inbox:focus-visible {
+  outline: 1px solid var(--nori-focus);
+  outline-offset: -1px;
+}
+
+.nori-email-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  width: 100%;
+}
+
+.nori-email-row {
+  height: 70px;
+  width: 100%;
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--nori-border);
+  background: var(--nori-canvas);
+  cursor: pointer;
+  padding-right: 6px;
+}
+.nori-email-row:hover {
+  background: var(--nori-hover);
+}
+.nori-email-row:active {
+  background: var(--nori-active);
+}
+.nori-email-row--selected {
+  background: var(--nori-selected);
+}
+.nori-email-row--selected:hover {
+  background: var(--nori-selected);
+}
+
+.nori-email-row-main {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.nori-email-row-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.nori-email-row-sender {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--nori-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nori-email-row-sender--unread {
+  font-weight: 600;
+}
+
+.nori-email-row-time {
+  font-size: 10.5px;
+  color: var(--nori-faint);
+  flex: none;
+}
+
+.nori-email-row-subject {
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--nori-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nori-email-row-subject--unread {
+  font-weight: 600;
+}
+
+.nori-email-row-preview {
+  font-size: 11px;
+  color: var(--nori-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nori-email-empty {
+  padding: 24px;
+  color: var(--nori-faint);
+  font-size: 13px;
+}

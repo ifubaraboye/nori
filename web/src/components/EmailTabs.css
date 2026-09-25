@@ -1,0 +1,58 @@
+.nori-tabs {
+  height: 40px;
+  width: 100%;
+  flex: none;
+  display: flex;
+  align-items: center;
+  background: var(--nori-canvas);
+  border-bottom: 1px solid var(--nori-border);
+}
+
+.nori-tabs-scroll {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 0 8px;
+}
+
+.nori-tab {
+  height: 28px;
+  min-width: 118px;
+  max-width: 220px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  font-size: 12px;
+  color: var(--nori-muted);
+  cursor: pointer;
+}
+.nori-tab:hover {
+  background: var(--nori-hover);
+}
+.nori-tab:focus-visible {
+  outline: 1px solid var(--nori-focus);
+  outline-offset: -1px;
+}
+.nori-tab--active {
+  background: var(--nori-selected);
+  color: var(--nori-text);
+}
+.nori-tab--active:hover {
+  background: var(--nori-selected);
+}
+
+.nori-tab-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

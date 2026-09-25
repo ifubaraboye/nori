@@ -1,0 +1,48 @@
+.nori-app {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--nori-canvas);
+  color: var(--nori-text);
+  overflow: hidden;
+}
+
+.nori-app-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.nori-workspace {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.nori-workspace-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.nori-show-sidebar {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+}
+
+.nori-overlay {
+  position: absolute;
+  inset: 0;
+  background: var(--nori-overlay);
+}
+
+.nori-overlay-top {
+  display: flex;
+  justify-content: center;
+  padding-top: 52px;
+}

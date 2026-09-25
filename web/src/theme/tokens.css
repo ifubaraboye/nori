@@ -1,0 +1,18 @@
+/* Port of crates/nori-ui/src/theme.rs Theme::dark() into CSS variables. */
+:root {
+  --nori-canvas: #1a1a1a;
+  --nori-chrome: #181818;
+  --nori-surface: #212121;
+  --nori-raised: #232323;
+  --nori-overlay: rgba(0, 0, 0, 0.26);
+  --nori-border: #2d2d2d;
+  --nori-strong-border: #3b3b3b;
+  --nori-text: #e2e2e2;
+  --nori-muted: #a3a3a3;
+  --nori-faint: #7d7d7d;
+  --nori-accent: #e2795b;
+  --nori-selected: #2a2a2a;
+  --nori-hover: rgba(255, 255, 255, 0.06);
+  --nori-active: rgba(255, 255, 255, 0.1);
+  --nori-focus: #e2795b;
+}

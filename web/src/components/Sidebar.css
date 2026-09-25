@@ -1,0 +1,172 @@
+.nori-sidebar-shell {
+  position: relative;
+  height: 100%;
+  flex: none;
+  overflow: hidden;
+  background: var(--nori-chrome);
+  border-right: 1px solid var(--nori-border);
+  transition: width 0.18s ease;
+}
+
+.nori-sidebar-shell--hidden {
+  border-right-color: transparent;
+}
+
+.nori-sidebar-content {
+  height: 100%;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.nori-sidebar-header {
+  height: 48px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+}
+
+.nori-sidebar-hide {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--nori-muted);
+}
+.nori-sidebar-hide:hover {
+  background: var(--nori-hover);
+}
+.nori-sidebar-hide:focus-visible {
+  outline: 1px solid var(--nori-focus);
+}
+
+.nori-sidebar-compose {
+  padding: 10px 10px 1px;
+}
+
+.nori-sidebar-nav {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.nori-sidebar-search {
+  padding: 0 10px 1px;
+}
+
+.nori-sidebar-group {
+  padding: 0 10px;
+}
+
+.nori-sidebar-group-toggle {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  padding: 0 8px 0 4px;
+  width: 100%;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--nori-faint);
+  cursor: pointer;
+}
+.nori-sidebar-group-toggle:hover {
+  color: var(--nori-text);
+}
+.nori-sidebar-group-toggle:focus-visible {
+  outline: 1px solid var(--nori-focus);
+}
+
+.nori-sidebar-row-wrap {
+  padding: 0 10px 1px;
+}
+
+.nori-sidebar-row {
+  height: 32px;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: none;
+  background: transparent;
+  color: var(--nori-muted);
+  cursor: pointer;
+  font-size: 13px;
+  text-align: left;
+}
+.nori-sidebar-row:hover {
+  background: var(--nori-selected);
+}
+.nori-sidebar-row:focus-visible {
+  outline: 1px solid var(--nori-focus);
+}
+.nori-sidebar-row--selected {
+  background: var(--nori-selected);
+  color: var(--nori-text);
+}
+
+.nori-sidebar-row-icon {
+  width: 20px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nori-sidebar-row-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nori-sidebar-row-count {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--nori-faint);
+}
+
+.nori-sidebar-footer {
+  height: 40px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+}
+
+.nori-sidebar-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 9px;
+  cursor: ew-resize;
+}
+.nori-sidebar-resize:focus-visible {
+  outline: 1px solid var(--nori-focus);
+}
+.nori-sidebar-resize-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: transparent;
+}
+.nori-sidebar-resize:hover .nori-sidebar-resize-line {
+  background: var(--nori-focus);
+}

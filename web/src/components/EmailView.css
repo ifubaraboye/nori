@@ -1,0 +1,87 @@
+.nori-email-view {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--nori-canvas);
+}
+.nori-email-view:focus-visible {
+  outline: 1px solid var(--nori-focus);
+  outline-offset: -1px;
+}
+
+.nori-email-view-inner {
+  width: 720px;
+  max-width: 100%;
+  margin: 0 auto;
+  padding: 32px 44px 48px;
+}
+
+.nori-email-view-subject {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--nori-text);
+  margin: 0;
+}
+
+.nori-email-view-meta {
+  margin-top: 17px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.nori-email-view-from {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.nori-email-view-sender {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--nori-text);
+}
+
+.nori-email-view-to {
+  font-size: 11.5px;
+  color: var(--nori-muted);
+}
+
+.nori-email-view-date {
+  font-size: 11.5px;
+  color: var(--nori-faint);
+}
+
+.nori-email-view-rule {
+  margin-top: 23px;
+  height: 1px;
+  background: var(--nori-border);
+}
+.nori-email-view-rule + .nori-email-view-body {
+  margin-top: 25px;
+}
+.nori-email-view-body + .nori-email-view-rule {
+  margin-top: 28px;
+}
+
+.nori-email-view-body {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.nori-email-view-body p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--nori-text);
+  white-space: pre-line;
+}
+
+.nori-email-view-actions {
+  margin-top: 15px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}

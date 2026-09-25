@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/nori-desktop", "crates/nori-ui"]
+default-members = ["crates/nori-desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+
+[workspace.dependencies]
+anyhow = "1.0"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "f8f0a28508393b2620d2a7cead470d9cc11fdf4d", default-features = false, features = ["wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "f8f0a28508393b2620d2a7cead470d9cc11fdf4d", default-features = false, features = ["wayland", "x11"] }
+nori-ui = { path = "crates/nori-ui" }
+unicode-segmentation = "1.12"

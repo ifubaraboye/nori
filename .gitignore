@@ -1,0 +1,8 @@
+/target
+*.png
+!crates/nori-desktop/assets/app-icon.png
+
+# web build artifacts
+node_modules/
+web/dist/
+

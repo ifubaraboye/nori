@@ -1,0 +1,43 @@
+.nori-topbar {
+  height: 44px;
+  width: 100%;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  background: var(--nori-canvas);
+  border-bottom: 1px solid var(--nori-border);
+}
+
+.nori-topbar-toggle {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--nori-muted);
+}
+.nori-topbar-toggle:hover {
+  background: var(--nori-hover);
+}
+.nori-topbar-toggle:focus-visible {
+  outline: 1px solid var(--nori-focus);
+}
+
+.nori-topbar-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--nori-text);
+}
