@@ -144,6 +144,7 @@ impl RenderOnce for EmailView {
                             .child(
                                 Button::new("reply-button", "Reply")
                                     .dense()
+                                    .scaled(1.05)
                                     .icon(Icon::new("icons/reply.svg", 13., theme.muted))
                                     .style(ButtonStyle::Subtle)
                                     .on_click(move |_event, window, cx| on_reply(window, cx)),
@@ -151,6 +152,7 @@ impl RenderOnce for EmailView {
                             .child(
                                 Button::new("reply-all-button", "Reply All")
                                     .dense()
+                                    .scaled(1.05)
                                     .icon(Icon::new("icons/reply-all.svg", 13., theme.muted))
                                     .style(ButtonStyle::Subtle)
                                     .on_click(move |_event, window, cx| on_reply_all(window, cx)),
@@ -158,6 +160,7 @@ impl RenderOnce for EmailView {
                             .child(
                                 Button::new("forward-button", "Forward")
                                     .dense()
+                                    .scaled(1.05)
                                     .icon(Icon::new("icons/forward.svg", 13., theme.muted))
                                     .style(ButtonStyle::Subtle)
                                     .on_click(move |_event, window, cx| on_forward(window, cx)),
@@ -179,6 +182,7 @@ impl RenderOnce for EmailView {
                                             if pinned { "Unpin" } else { "Pin" },
                                         )
                                         .dense()
+                                        .scaled(1.05)
                                         .icon(Icon::new(
                                             if pinned {
                                                 "icons/pin.svg"

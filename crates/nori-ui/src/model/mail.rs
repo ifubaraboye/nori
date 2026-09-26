@@ -228,6 +228,18 @@ pub struct DraftSeed {
     pub body: String,
 }
 
+impl DraftSeed {
+    /// Whether the seed asks for nothing in particular.
+    ///
+    /// A blank seed is how "just open a compose pane" is spelled, as opposed to
+    /// a reply seeding a recipient and subject. The distinction is what lets
+    /// a parked draft come back on the next blank request while a real reply
+    /// still wins.
+    pub fn is_blank(&self) -> bool {
+        self.to.trim().is_empty() && self.subject.trim().is_empty() && self.body.trim().is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceView {
     Mailbox,

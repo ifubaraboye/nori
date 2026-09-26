@@ -28,8 +28,8 @@ pub struct Theme {
     ///
     /// Not `text` and not `canvas` unconditionally: the accent is a mid-tone in
     /// both palettes, so it needs the darker of the two as its foreground.
-    /// Inverting that choice in either theme drops the button label to about
-    /// 3.5:1, under the 4.5:1 a 12px label needs.
+    /// Reaching for the lighter one drops the label to 3.29:1 in light mode
+    /// and 2.28:1 in dark, both under the 4.5:1 a 12px label needs.
     pub on_accent: Hsla,
     pub selected: Hsla,
     /// Neutral wash for selected rows/cards on workspace surfaces, in the
@@ -130,9 +130,13 @@ impl Theme {
             faint: rgba(0x8c8c8cff).into(),
             ghost: rgba(0xb8b8b8ff).into(),
             inset: rgba(0xf4f4f4ff).into(),
-            // Deeper than the dark palette's accent: the same orange is only
-            // ~2.9:1 on white, and this doubles as the focus ring colour.
-            accent: rgba(0xcf5f38ff).into(),
+            // Only the button label constrains this value, because the focus
+            // ring has its own `focus` token. A filled accent button needs its
+            // 12px label at 4.5:1, and the previous #cf5f38 only reached
+            // 4.34:1 against `on_accent` — which is why the sign-in label read
+            // as hard to make out. Lifting it to #dd6a44 buys 5.05:1 without
+            // washing the orange out.
+            accent: rgba(0xdd6a44ff).into(),
             on_accent: rgba(0x1c1c1cff).into(),
             selected: rgba(0xe4e4e4ff).into(),
             selected_layer: hsla(0., 0., 0., 0.09),

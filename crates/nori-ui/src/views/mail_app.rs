@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::actions::{
-    CloseTab, Compose, Dismiss, MoveSelectionDown, MoveSelectionUp, NextTab, OpenSearch,
-    OpenSelected, OpenSettings, PreviousTab, ToggleSidebar, ToggleTabStrip,
+    CloseTab, Compose, Dismiss, GoArchive, GoBack, GoDrafts, GoForward, GoInbox, GoSent, GoStarred,
+    GoTrash, MoveSelectionDown, MoveSelectionUp, NextTab, OpenSearch, OpenSelected, OpenSettings,
+    PreviousTab, ToggleSidebar, ToggleTabStrip,
 };
 use gpui::{
     Context, CursorStyle, Entity, FocusHandle, ImageFormat, IntoElement, MouseButton,
@@ -205,6 +206,10 @@ pub struct MailApp {
     tab_strip_visible: bool,
     sidebar_width: f32,
     mailboxes_collapsed: bool,
+    /// Whether Ctrl or Cmd is held, in which case the sidebar swaps each
+    /// mailbox's count for its shortcut. Held-state rather than a toggle: the
+    /// hint has to come back by itself the moment the key comes up.
+    shortcuts_visible: bool,
     sidebar_resize: Option<SidebarResize>,
     /// Width of the compose column, remembered between openings so a resize
     /// is not undone by closing the pane.
@@ -244,6 +249,15 @@ pub struct MailApp {
     /// that triggers it, which meant it passed whether or not pinning saved
     /// anything — the exact bug it was written to catch.
     index_cache_override: Option<IndexCache>,
+    /// Where the "which account did we last sign in to" pointer lives, when
+    /// that should not be the real config directory.
+    ///
+    /// Signing out deletes that file, and it is named after nobody — not the
+    /// account, not the test — so a test pressing the real Disconnect button
+    /// deletes the pointer belonging to whoever is running the suite. That is
+    /// not hypothetical: it happened, and the account had to be put back by
+    /// hand. Production leaves this `None` and resolves the config directory.
+    account_pointer: Option<std::path::PathBuf>,
     /// How the connected account reads, for the settings page and the top bar.
     /// `MailApp` owns it because the token store and the sync both live here,
     /// and the settings view is discarded on close.
@@ -283,8 +297,19 @@ pub struct MailApp {
     /// one overlay is open at a time — so they share a slot, and `close_overlay`
     /// drops it. Keeping it separate from the theme observer is what stops a
     /// closed composer from taking the others' listeners with it.
-    overlay_subscription: Option<Subscription>,
-    previous_focus: Option<FocusHandle>,
+    /// The compose and search layers can be open at the same time, and each has
+    /// to hand focus back to whatever was focused before *it* opened. One
+    /// shared slot could only remember the last, so a popup opened over the
+    /// compose pane would have sent focus to the wrong place on close.
+    compose_subscription: Option<Subscription>,
+    search_subscription: Option<Subscription>,
+    settings_previous_focus: Option<FocusHandle>,
+    compose_previous_focus: Option<FocusHandle>,
+    search_previous_focus: Option<FocusHandle>,
+    /// The draft the compose pane was holding when it closed. Dropping the
+    /// pane drops its fields, so the text is lifted out on the way and put
+    /// back the next time a blank compose is asked for.
+    compose_draft: Option<DraftSeed>,
 }
 
 impl MailApp {
@@ -343,6 +368,17 @@ impl MailApp {
         )));
         let settings_state = settings_store.load().unwrap_or_default();
         cx.set_global(Theme::for_light_mode(settings_state.light_mode));
+        // Production resolves the real pointer. A test gets a throwaway file,
+        // because signing out deletes the pointer and no test should be able
+        // to delete the one the person running the suite signs in with.
+        #[cfg(not(test))]
+        let account_pointer: Option<std::path::PathBuf> = None;
+        #[cfg(test)]
+        let account_pointer = Some(std::env::temp_dir().join(format!(
+            "nori-pointer-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
         Self {
             store,
             labels,
@@ -360,6 +396,7 @@ impl MailApp {
             tab_strip_visible: true,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             mailboxes_collapsed: false,
+            shortcuts_visible: false,
             sidebar_resize: None,
             compose_pane_width: COMPOSE_PANE_WIDTH,
             compose_resize: None,
@@ -371,6 +408,7 @@ impl MailApp {
             settings_state,
             settings_store,
             index_cache_override: None,
+            account_pointer,
             account: AccountState::default(),
             loaded_mailboxes: HashSet::new(),
             exhausted_mailboxes: HashSet::new(),
@@ -381,8 +419,12 @@ impl MailApp {
             search_generation: 0,
             _theme_subscription: theme_subscription,
             settings_subscription: None,
-            overlay_subscription: None,
-            previous_focus: None,
+            compose_subscription: None,
+            search_subscription: None,
+            settings_previous_focus: None,
+            compose_previous_focus: None,
+            search_previous_focus: None,
+            compose_draft: None,
         }
     }
 
@@ -416,10 +458,14 @@ impl MailApp {
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         if self.label_menu.is_some() {
             self.close_label_menu(cx);
+        } else if self.search.is_some() {
+            // The popup is the topmost thing on screen, so it goes first and
+            // whatever opened it — the compose pane, or settings — stays.
+            self.close_search(window, cx);
+        } else if self.compose.is_some() {
+            self.close_compose(window, cx);
         } else if self.settings.is_some() {
             self.close_settings(window, cx);
-        } else if self.store.overlay().is_some() {
-            self.close_overlay(window, cx);
         } else if self.store.workspace_view() == WorkspaceView::Mailbox {
             return;
         } else {
@@ -443,24 +489,27 @@ impl MailApp {
         //
         // Search is modal and would sit on top of settings, so it is the one
         // thing that actually goes.
-        if self.search.take().is_some() {
-            self.store
-                .set_overlay(self.compose.as_ref().map(|_| Overlay::Compose));
+        if self.search.is_some() {
+            self.close_search(window, cx);
         }
-        self.previous_focus = window.focused(cx);
+        self.settings_previous_focus = window.focused(cx);
         self.settings_page = SettingsPage::General;
         let settings_entity = cx.entity();
         let page_entity = cx.entity();
         let sign_in_entity = cx.entity();
         let sign_out_entity = cx.entity();
-        let state = self.settings_state;
+        let state_entity = cx.entity();
         let page = self.settings_page;
-        let account = self.account.clone();
+        // A reader, not a snapshot: the account page has to follow the app
+        // through signing in, a sync landing and Disconnect. Handing it a copy
+        // left it rendering a Disconnect button over an account that was
+        // already gone.
+        let account_entity = cx.entity();
         let settings = cx.new(|cx| {
             SettingsView::new(
                 window,
                 cx,
-                state,
+                move |cx| state_entity.read_with(cx, |this, _| this.settings_state),
                 page,
                 move |setting, enabled, cx| {
                     settings_entity.update(cx, |this, cx| this.set_setting(setting, enabled, cx));
@@ -468,7 +517,7 @@ impl MailApp {
                 move |page, cx| {
                     page_entity.update(cx, |this, cx| this.set_settings_page(page, cx));
                 },
-                account,
+                move |cx| account_entity.read_with(cx, |this, _| this.account.clone()),
                 move |cx| {
                     sign_in_entity.update(cx, |this, cx| this.start_sign_in(cx));
                 },
@@ -490,13 +539,31 @@ impl MailApp {
         cx.notify();
     }
 
-    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings = None;
+    /// Drop the settings view and its subscription, without touching focus.
+    ///
+    /// Focus is the caller's problem because there are two ways out of
+    /// settings and they want different things: closing it restores where the
+    /// user was, whereas making room for a compose pane must leave focus
+    /// alone or it would be yanked back to the mailbox the pane is opening
+    /// over.
+    fn take_settings(&mut self) -> bool {
+        if self.settings.take().is_none() {
+            return false;
+        }
         // Only this view's listener. The composer's lives in its own slot and
         // has to outlive a settings visit, or the composer's own close button
         // goes dead while it is still on screen.
+        //
+        // The focus slot is deliberately left alone: `close_settings` still
+        // reads it. A caller that is *not* returning focus to where settings
+        // was opened clears it itself, so the two exits differ.
         self.settings_subscription = None;
-        if let Some(previous) = self.previous_focus.take() {
+        true
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_settings();
+        if let Some(previous) = self.settings_previous_focus.take() {
             window.focus(&previous, cx);
         } else {
             window.focus(&self.inbox_focus, cx);
@@ -576,6 +643,22 @@ impl MailApp {
         }
     }
 
+    /// The only writer of the account state.
+    ///
+    /// Ten-odd places set it — signing in, a sync landing, a sync failing,
+    /// signing out — and the settings page renders it, so "changed the state"
+    /// and "the page must be told" are the same act here rather than two that
+    /// have to be remembered together at every site.
+    fn set_account(&mut self, account: AccountState, cx: &mut Context<Self>) {
+        self.account = account;
+        // The settings page is its own entity, so notifying the app does not
+        // reach it. It renders this state, so it is told here rather than at
+        // each of the ten-odd places that could have forgotten.
+        if let Some(settings) = self.settings.clone() {
+            settings.update(cx, |_, cx| cx.notify());
+        }
+    }
+
     /// Begin an OAuth sign-in.
     ///
     /// Split deliberately. The listener is bound and the browser opened on the
@@ -590,9 +673,12 @@ impl MailApp {
         let credentials = match nori_gmail::credentials() {
             Ok(credentials) => credentials,
             Err(error) => {
-                self.account = AccountState::Failed {
-                    reason: format!("{error}"),
-                };
+                self.set_account(
+                    AccountState::Failed {
+                        reason: format!("{error}"),
+                    },
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -600,9 +686,12 @@ impl MailApp {
         let request = match nori_gmail::oauth::begin(&credentials) {
             Ok(request) => request,
             Err(error) => {
-                self.account = AccountState::Failed {
-                    reason: format!("could not start the sign-in: {error}"),
-                };
+                self.set_account(
+                    AccountState::Failed {
+                        reason: format!("could not start the sign-in: {error}"),
+                    },
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -610,7 +699,7 @@ impl MailApp {
 
         // The user has to see this, so it is a state change rather than a
         // silent wait on a browser that may never have opened.
-        self.account = AccountState::Connecting;
+        self.set_account(AccountState::Connecting, cx);
         cx.notify();
         cx.open_url(&request.url);
 
@@ -642,15 +731,18 @@ impl MailApp {
                     // next launch asks the pointer which account to load, finds
                     // nothing, and reports "No account connected" with a
                     // working grant sitting on disk.
-                    if let Ok(pointer) = nori_gmail::LastAccount::with_config_dir() {
+                    if let Some(pointer) = this.account_pointer() {
                         this.remember_account(&pointer, &address);
                     }
                     this.fetch_after_sign_in(address, cx);
                 }
                 Err(error) => {
-                    this.account = AccountState::Failed {
-                        reason: format!("{error}"),
-                    };
+                    this.set_account(
+                        AccountState::Failed {
+                            reason: format!("{error}"),
+                        },
+                        cx,
+                    );
                 }
             });
         })
@@ -997,25 +1089,34 @@ impl MailApp {
     /// for the better part of a minute.
     fn fetch_after_sign_in(&mut self, address: String, cx: &mut Context<Self>) {
         let Ok(credentials) = nori_gmail::credentials() else {
-            self.account = AccountState::Failed {
-                reason: "the Gmail client credentials went missing between the two \
+            self.set_account(
+                AccountState::Failed {
+                    reason: "the Gmail client credentials went missing between the two \
                          halves of the sign-in. Set them and try again."
-                    .to_string(),
-            };
+                        .to_string(),
+                },
+                cx,
+            );
             cx.notify();
             return;
         };
         let Ok(store) = nori_gmail::FileTokenStore::with_account(&address) else {
-            self.account = AccountState::Failed {
-                reason: format!("could not open the token store for {address}."),
-            };
+            self.set_account(
+                AccountState::Failed {
+                    reason: format!("could not open the token store for {address}."),
+                },
+                cx,
+            );
             cx.notify();
             return;
         };
 
-        self.account = AccountState::Fetching {
-            address: address.clone(),
-        };
+        self.set_account(
+            AccountState::Fetching {
+                address: address.clone(),
+            },
+            cx,
+        );
         self.syncing = true;
         cx.notify();
 
@@ -1043,9 +1144,12 @@ impl MailApp {
                         }
                     }
                     Err(error) => {
-                        this.account = AccountState::Failed {
-                            reason: format!("{error}"),
-                        };
+                        this.set_account(
+                            AccountState::Failed {
+                                reason: format!("{error}"),
+                            },
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -1079,12 +1183,15 @@ impl MailApp {
         self.labels.clear();
         self.store.set_synced_history_id(history_id);
         self.absorb(snapshot, cx);
-        self.account = AccountState::Connected {
-            address,
-            mail,
-            labels,
-            counts,
-        };
+        self.set_account(
+            AccountState::Connected {
+                address,
+                mail,
+                labels,
+                counts,
+            },
+            cx,
+        );
     }
 
     /// Record which account Nori is signed in as.
@@ -1111,6 +1218,18 @@ impl MailApp {
         self.labels.create_with_colour(&seed.name, seed.colour);
     }
 
+    /// The pointer to the last signed-in account, wherever that is.
+    ///
+    /// One function so no caller can quietly reach the real config directory
+    /// instead: this file is deleted on sign-out, and a test that signs out
+    /// should be deleting its own.
+    fn account_pointer(&self) -> Option<nori_gmail::LastAccount> {
+        match &self.account_pointer {
+            Some(path) => Some(nori_gmail::LastAccount::new(path.clone())),
+            None => nori_gmail::LastAccount::with_config_dir().ok(),
+        }
+    }
+
     /// Forget the account: the token, the synced mail, and the state.
     fn sign_out(&mut self, cx: &mut Context<Self>) {
         let address = self.account.address().map(str::to_string);
@@ -1122,7 +1241,7 @@ impl MailApp {
         // The synced mail goes with the token: leaving it behind would show a
         // mailbox belonging to an account that is no longer connected.
         self.store.clear();
-        if let Ok(pointer) = nori_gmail::LastAccount::with_config_dir() {
+        if let Some(pointer) = self.account_pointer() {
             pointer.clear();
         }
         if let Some(address) = &address
@@ -1130,7 +1249,7 @@ impl MailApp {
         {
             cache.clear();
         }
-        self.account = AccountState::Disconnected;
+        self.set_account(AccountState::Disconnected, cx);
         cx.notify();
     }
 
@@ -1184,7 +1303,7 @@ impl MailApp {
         // exit from here leaves the list either holding the user's own mail or
         // empty on purpose.
         self.store.clear();
-        let Ok(pointer) = nori_gmail::LastAccount::with_config_dir() else {
+        let Some(pointer) = self.account_pointer() else {
             cx.notify();
             return;
         };
@@ -1205,9 +1324,12 @@ impl MailApp {
                 cx.notify();
             }
             Err(error) => {
-                self.account = AccountState::Failed {
-                    reason: format!("could not read the saved token: {error}"),
-                };
+                self.set_account(
+                    AccountState::Failed {
+                        reason: format!("could not read the saved token: {error}"),
+                    },
+                    cx,
+                );
                 cx.notify();
             }
         }
@@ -1237,12 +1359,15 @@ impl MailApp {
             }
         };
 
-        self.account = AccountState::Connected {
-            address: address.to_string(),
-            mail,
-            labels,
-            counts: None,
-        };
+        self.set_account(
+            AccountState::Connected {
+                address: address.to_string(),
+                mail,
+                labels,
+                counts: None,
+            },
+            cx,
+        );
         // The Inbox is on screen without anyone having opened it, and both
         // branches above put its mail in the store: either from the index on
         // disk, or a moment from now when the sync lands. Marking it loaded
@@ -1323,8 +1448,7 @@ impl MailApp {
         // sidebar, so it should not be open here at all, but if it is, it is
         // dismissed rather than left stranded.
         if self.search.take().is_some() {
-            self.store
-                .set_overlay(self.compose.as_ref().map(|_| Overlay::Compose));
+            self.sync_overlay();
         }
         self.store.select_mailbox(mailbox);
         self.ensure_mailbox_fetched(mailbox, cx);
@@ -1621,9 +1745,9 @@ impl MailApp {
                 // `invalid_grant` is the expected weekly end of a Testing-mode
                 // app's grant, so it is a state and not an error toast.
                 if text.contains("no longer valid") || text.contains("sign in again") {
-                    this.account = AccountState::NeedsReauth { address: account };
+                    this.set_account(AccountState::NeedsReauth { address: account }, cx);
                 } else if !matches!(this.account, AccountState::Disconnected) {
-                    this.account = AccountState::Failed { reason: text };
+                    this.set_account(AccountState::Failed { reason: text }, cx);
                 }
                 cx.notify();
             });
@@ -1635,23 +1759,94 @@ impl MailApp {
         if self.compose.is_some() {
             return;
         }
-        self.previous_focus = window.focused(cx);
+        // The compose pane is a workspace sibling, so it cannot appear while
+        // settings is holding the workspace. Asking to compose from settings
+        // therefore means leaving settings, showing the mailbox, and opening
+        // there — otherwise it is a no-op behind a pane the user cannot see.
+        //
+        // Only that case moves the workspace. Composing from an open message
+        // deliberately keeps the message on screen beside the pane, which is
+        // the whole point of the divider.
+        let from_settings = self.take_settings();
+        if from_settings {
+            // Focus is going to the compose pane, not back to wherever settings
+            // was opened from.
+            self.settings_previous_focus = None;
+            if !matches!(self.store.workspace_view(), WorkspaceView::Mailbox) {
+                // Same mailbox, list view: leaving settings for a compose pane
+                // should not also move the user to a different folder.
+                let mailbox = self.store.selected_mailbox();
+                self.select_mailbox(mailbox, window, cx);
+            }
+        }
+        // A blank seed is just "open a compose pane", so a draft parked by a
+        // previous close comes back. A real seed — a reply, a forward — always
+        // wins and retires the parked draft, because the user asked for that
+        // mail specifically.
+        let seed = if seed.is_blank() && self.compose_draft.is_some() {
+            self.compose_draft.take().unwrap_or_default()
+        } else {
+            self.compose_draft = None;
+            seed
+        };
+        // Where closing the pane should send focus. Normally whatever held it
+        // beforehand — but coming from settings that handle belongs to a view
+        // we just discarded, so restoring it would focus a dead element and
+        // leave the pane's close button unreachable by keyboard. The list is
+        // the only sensible exit from that route.
+        self.compose_previous_focus = if from_settings {
+            Some(self.inbox_focus.clone())
+        } else {
+            window.focused(cx)
+        };
         let compose = cx.new(|cx| ComposeView::new(seed, window, cx));
         let subscription =
             cx.subscribe_in(&compose, window, |this, _, event, window, cx| match event {
-                ComposeEvent::Dismiss => this.close_overlay(window, cx),
+                ComposeEvent::Dismiss => this.close_compose(window, cx),
             });
-        self.store.set_overlay(Some(Overlay::Compose));
         self.compose = Some(compose);
-        self.overlay_subscription = Some(subscription);
+        self.compose_subscription = Some(subscription);
+        self.sync_overlay();
         cx.notify();
+    }
+
+    /// Put the compose pane away, keeping whatever was in it.
+    ///
+    /// Only the pane goes. The draft is lifted out first, because the fields
+    /// live in the entity and the entity is what is being dropped — closing the
+    /// pane used to take the half-written mail with it.
+    fn close_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compose) = self.compose.take() else {
+            return;
+        };
+        let draft = compose.read(cx).draft(cx);
+        if !draft.is_blank() {
+            self.compose_draft = Some(draft);
+        }
+        self.compose_subscription = None;
+        self.sync_overlay();
+        if let Some(previous) = self.compose_previous_focus.take() {
+            window.focus(&previous, cx);
+        }
+        cx.notify();
+    }
+
+    /// Re-derive the store's single overlay flag from what is actually open.
+    /// Search wins the slot because it is the popup and sits on top.
+    fn sync_overlay(&mut self) {
+        self.store.set_overlay(
+            self.search
+                .as_ref()
+                .map(|_| Overlay::Search)
+                .or(self.compose.as_ref().map(|_| Overlay::Compose)),
+        );
     }
 
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.is_some() {
             return;
         }
-        self.previous_focus = window.focused(cx);
+        self.search_previous_focus = window.focused(cx);
         let emails = self.store.emails().to_vec();
         // With an account connected, the answer comes from Gmail, which knows
         // about all of it. Nori only holds the tail it has synced, and
@@ -1671,15 +1866,30 @@ impl MailApp {
                     {
                         this.store.upsert(email);
                     }
-                    this.close_overlay(window, cx);
+                    this.close_search(window, cx);
                     this.open_email(id.clone(), window, cx);
                 }
-                SearchEvent::Dismiss => this.close_overlay(window, cx),
+                SearchEvent::Dismiss => this.close_search(window, cx),
                 SearchEvent::QueryChanged(query) => this.search_gmail(query.clone(), cx),
             });
-        self.store.set_overlay(Some(Overlay::Search));
         self.search = Some(search);
-        self.overlay_subscription = Some(subscription);
+        self.search_subscription = Some(subscription);
+        self.sync_overlay();
+        cx.notify();
+    }
+
+    /// Put the search popup away. The compose pane underneath is untouched —
+    /// they are separate layers, and dismissing a popup that was opened over it
+    /// used to take the draft with it.
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_none() {
+            return;
+        }
+        self.search_subscription = None;
+        self.sync_overlay();
+        if let Some(previous) = self.search_previous_focus.take() {
+            window.focus(&previous, cx);
+        }
         cx.notify();
     }
 
@@ -1748,17 +1958,6 @@ impl MailApp {
             });
         })
         .detach();
-    }
-
-    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.compose = None;
-        self.search = None;
-        self.overlay_subscription = None;
-        self.store.set_overlay(None);
-        if let Some(previous) = self.previous_focus.take() {
-            window.focus(&previous, cx);
-        }
-        cx.notify();
     }
 
     fn reply_seed(email: &Email, reply_all: bool, forward: bool) -> DraftSeed {
@@ -1887,7 +2086,7 @@ impl MailApp {
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
-                        this.close_overlay(window, cx);
+                        this.close_search(window, cx);
                     }),
                 )
                 .child(
@@ -1932,6 +2131,23 @@ impl MailApp {
         self.sidebar_resize = None;
         window.focus(&self.inbox_focus, cx);
         cx.notify();
+    }
+
+    /// Show or hide the sidebar's shortcut hints, following the modifier.
+    /// Only repaints on a change, so sliding other modifiers around does not
+    /// churn the sidebar.
+    fn set_shortcuts_visible(&mut self, showing: bool, cx: &mut Context<Self>) {
+        if self.shortcuts_visible != showing {
+            self.shortcuts_visible = showing;
+            cx.notify();
+        }
+    }
+
+    /// The `Ctrl+1`..`Ctrl+6` shortcuts. Each names its mailbox at compile
+    /// time because a gpui action carries no payload, so this is six
+    /// one-liners rather than one handler with an argument.
+    fn go_mailbox(&mut self, mailbox: Mailbox, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_mailbox(mailbox, window, cx);
     }
 
     fn toggle_mailboxes(&mut self, cx: &mut Context<Self>) {
@@ -2058,14 +2274,23 @@ impl MailApp {
         }
     }
 
+    /// `Ctrl+N` toggles the compose pane. Reopening it brings back whatever
+    /// was last in it, so a half-written mail survives being put away.
     fn compose_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.store.overlay().is_none() {
+        if self.compose.is_some() {
+            self.close_compose(window, cx);
+        } else if self.search.is_none() {
             self.open_compose(DraftSeed::default(), window, cx);
         }
     }
 
+    /// `Ctrl+S` toggles the search popup. It is a popup, so it opens over
+    /// whatever else is showing — the compose pane, or the settings pane — and
+    /// closing it hands focus back to the layer underneath.
     fn search_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.store.overlay().is_none() {
+        if self.search.is_some() {
+            self.close_search(window, cx);
+        } else {
             self.open_search(window, cx);
         }
     }
@@ -2142,6 +2367,14 @@ impl MailApp {
     }
 
     /// Retrace the previous view, the way the sidebar's back chevron does.
+    fn go_back_action(&mut self, _: &GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_back(window, cx);
+    }
+
+    fn go_forward_action(&mut self, _: &GoForward, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_forward(window, cx);
+    }
+
     fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Settings first: it is the most recent thing the user did, and closing
         // it is what brings the composer back into view. The chevron is the
@@ -2461,6 +2694,7 @@ impl Render for MailApp {
             self.sidebar_width,
             self.sidebar_visible,
             self.mailboxes_collapsed,
+            self.shortcuts_visible,
             move |mailbox, window, cx| {
                 sidebar_entity.update(cx, |this, cx| this.select_mailbox(mailbox, window, cx));
             },
@@ -2521,6 +2755,7 @@ impl Render for MailApp {
             },
         );
         let top_entity = cx.entity();
+        let modifiers_entity = top_entity.clone();
         let top_toggle_entity = top_entity.clone();
         // An open email reads as `Mailbox / Subject`; the mailbox view is the
         // bare label. Settings borrows the same bar, so it reads as
@@ -2745,8 +2980,40 @@ impl Render for MailApp {
             .relative()
             .size_full()
             .flex()
+            // Fires on the modifier going down as well as coming up, so the
+            // sidebar hint needs no timer and no polling. `control` and
+            // `platform` are both watched because the shortcuts are bound
+            // against Ctrl and Cmd alike.
+            .on_modifiers_changed(move |event, _window, cx| {
+                modifiers_entity.update(cx, |this, cx| {
+                    this.set_shortcuts_visible(
+                        event.modifiers.control || event.modifiers.platform,
+                        cx,
+                    )
+                });
+            })
             .bg(theme.canvas)
             .on_action(cx.listener(Self::open_settings_action))
+            .on_action(cx.listener(|this, _: &GoInbox, window, cx| {
+                this.go_mailbox(Mailbox::Inbox, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GoStarred, window, cx| {
+                this.go_mailbox(Mailbox::Starred, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GoSent, window, cx| {
+                this.go_mailbox(Mailbox::Sent, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GoDrafts, window, cx| {
+                this.go_mailbox(Mailbox::Drafts, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GoArchive, window, cx| {
+                this.go_mailbox(Mailbox::Archive, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GoTrash, window, cx| {
+                this.go_mailbox(Mailbox::Trash, window, cx)
+            }))
+            .on_action(cx.listener(Self::go_back_action))
+            .on_action(cx.listener(Self::go_forward_action))
             .on_action(cx.listener(Self::move_selection_down))
             .on_action(cx.listener(Self::move_selection_up))
             .on_action(cx.listener(Self::open_selected_shortcut_action))
@@ -2829,9 +3096,12 @@ impl Render for MailApp {
                         ),
                 ),
             )
-            .when(!settings_open, |this| {
-                this.when_some(overlay, |this, overlay| this.child(overlay))
-            })
+            // Not gated on settings. The popup is `absolute().inset_0()` and
+            // mounts above everything, which is the whole reason it is a popup
+            // rather than a workspace pane: it can sit over the settings
+            // without settings having to close first. Gating it here meant
+            // `Ctrl+S` in settings set the state and drew nothing at all.
+            .when_some(overlay, |this, overlay| this.child(overlay))
             .when_some(label_menu, |this, menu| this.child(menu))
             // Mounted last, so it sits above every other surface, and only
             // while a divider is actually being dragged. The root's own
@@ -4209,6 +4479,168 @@ mod tests {
         assert!(
             cx.debug_bounds("empty-sign-in").is_none(),
             "nor after the grant lands, while mail is still arriving"
+        );
+    }
+
+    /// A test must not be able to reach the real account pointer.
+    ///
+    /// Signing out deletes that file, and the disconnect test presses the real
+    /// Disconnect button — so with the pointer left pointing at the config
+    /// directory, running the suite deleted the account the person running it
+    /// was signed in to. It happened twice before this was noticed.
+    ///
+    /// The assertion is on where the pointer resolves, not on what sign-out
+    /// does, because that is the part that can silently regress: remove the
+    /// test-only path and this fails, rather than the suite quietly eating
+    /// someone's account again.
+    #[gpui::test]
+    fn a_test_never_resolves_the_real_account_pointer(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        let resolved = app.read_with(&cx, |app, _| {
+            app.account_pointer()
+                .map(|pointer| pointer.path().to_path_buf())
+        });
+        let resolved = resolved.expect("the pointer always resolves to something");
+        let real = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        if let Some(home) = real {
+            assert!(
+                !resolved.starts_with(home.join(".config")),
+                "a test resolved the pointer to {} — inside the real config \
+                 directory, so signing out in a test would delete it",
+                resolved.display()
+            );
+        }
+    }
+
+    /// The account page must follow the app, not a snapshot of it.
+    ///
+    /// It used to hold the account state as it was when Settings opened, so
+    /// Disconnect left the page still offering Disconnect over an account that
+    /// had already been forgotten. Driving the real sign-out through the real
+    /// button is the only way to catch that: a test on the page alone would
+    /// never notice it was reading a copy.
+    #[gpui::test]
+    fn disconnecting_turns_the_account_page_into_a_sign_in_prompt(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+
+        // Connected, with the settings page open on Account.
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.account = AccountState::Connected {
+                    address: "me@example.com".to_string(),
+                    mail: 335,
+                    labels: 2,
+                    counts: None,
+                };
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| focus.dispatch_action(&OpenSettings, window, cx));
+        cx.run_until_parked();
+        // Settings opens on General, so walk to Account the way a person would.
+        let account_nav = cx
+            .debug_bounds(SettingsPage::Account.nav_id())
+            .expect("the Account page is in the nav");
+        cx.simulate_click(account_nav.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(&cx, |app, _| app.settings_page),
+            SettingsPage::Account,
+            "and the account page is what carries this"
+        );
+        assert!(
+            cx.debug_bounds("account-sign-out").is_some(),
+            "a connected account offers Disconnect"
+        );
+
+        // Press it, the way a person would.
+        let out = cx
+            .debug_bounds("account-sign-out")
+            .expect("the Disconnect button");
+        cx.simulate_click(out.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(&cx, |app, _| app.account.is_usable()),
+            "the app must have forgotten the account"
+        );
+        assert!(
+            cx.debug_bounds("account-sign-out").is_none(),
+            "and the page must stop offering Disconnect, not keep it on screen"
+        );
+        assert!(
+            cx.debug_bounds("account-sign-in").is_some(),
+            "offering the way back in instead"
+        );
+    }
+
+    /// The account page repaints when the account changes on its own.
+    ///
+    /// The click test next door passes with or without the repaint, because
+    /// clicking a button redraws that button's row anyway — which is exactly
+    /// why it cannot be trusted to cover this. Nothing here is clicked: the
+    /// account is moved underneath the open page, the way a background sync
+    /// landing an expired grant does. Before, the page sat on "Disconnect"
+    /// over an account that needed signing in again.
+    #[gpui::test]
+    fn the_account_page_follows_a_change_nobody_clicked(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.set_account(
+                    AccountState::Connected {
+                        address: "me@example.com".to_string(),
+                        mail: 335,
+                        labels: 2,
+                        counts: None,
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.update(|window, cx| focus.dispatch_action(&OpenSettings, window, cx));
+        cx.run_until_parked();
+        let nav = cx
+            .debug_bounds(SettingsPage::Account.nav_id())
+            .expect("the Account page is in the nav");
+        cx.simulate_click(nav.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("account-sign-out").is_some(),
+            "premise: a live account offers Disconnect"
+        );
+
+        // The grant expired mid-sync. No click, no focus change, no settings
+        // navigation: just the state moving underneath the open page.
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.set_account(
+                    AccountState::NeedsReauth {
+                        address: "me@example.com".to_string(),
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("account-sign-out").is_none(),
+            "an account that needs signing in again must not still offer Disconnect"
+        );
+        assert!(
+            cx.debug_bounds("account-sign-in").is_some(),
+            "and must offer the way back in"
         );
     }
 

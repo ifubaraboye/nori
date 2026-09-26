@@ -8,6 +8,27 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
 
+# Runs like release, builds like dev.
+#
+# GPUI is large enough that a plain `release` is a long build, and the default
+# dev build leaves far too much on the table for something that spends its life
+# scrolling and painting. This is the middle: real optimisation and thin LTO so
+# the hot paths are not left boxed and monomorphised, but a line-tables-only
+# debug level, which keeps backtraces and profilers pointed at the right line
+# while costing a fraction of what full debuginfo would.
+#
+# `codegen-units` is left above 1 on purpose. It is the single biggest lever on
+# link time here, and going to 1 buys a few percent of runtime for a
+# substantially worse build.
+#
+# Build it with `--profile optimized`; the binary lands in `target/optimized/`.
+[profile.optimized]
+inherits = "dev"
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = 1
+
 [workspace.dependencies]
 anyhow = "1.0"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "f8f0a28508393b2620d2a7cead470d9cc11fdf4d", default-features = false, features = ["wayland", "x11"] }

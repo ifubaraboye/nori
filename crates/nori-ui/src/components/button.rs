@@ -22,6 +22,11 @@ pub struct Button {
     style: ButtonStyle,
     disabled: bool,
     dense: bool,
+    /// Multiplies every metric — height, padding, icon and text. The default
+    /// of 1.0 keeps the shared dense size; a button that wants to read as
+    /// slightly more substantial than its neighbours scales itself rather than
+    /// making every other dense button grow with it.
+    size_scale: f32,
     padding: Option<gpui::Pixels>,
     aria_label: Option<SharedString>,
     focus_ring: bool,
@@ -38,6 +43,7 @@ impl Button {
             style: ButtonStyle::Ghost,
             disabled: false,
             dense: false,
+            size_scale: 1.,
             padding: None,
             aria_label: None,
             focus_ring: true,
@@ -94,6 +100,12 @@ impl Button {
         self
     }
 
+    /// Scale the whole button. `1.05` is a 5% larger button, gaps included.
+    pub fn scaled(mut self, scale: f32) -> Self {
+        self.size_scale = scale;
+        self
+    }
+
     pub fn on_click(
         mut self,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -140,26 +152,40 @@ impl RenderOnce for Button {
                 (theme.accent, lifted, sunk, theme.on_accent, theme.accent)
             }
         };
-        let height = if self.dense { px(22.) } else { px(28.) };
-        let horizontal_padding = if self.dense { px(5.) } else { px(8.) };
-        let icon_size = if self.dense { 12. } else { 14. };
+        let scale = self.size_scale;
+        let height = px(if self.dense { 22. } else { 28. } * scale);
+        let horizontal_padding = px(if self.dense { 5. } else { 8. } * scale);
+        let icon_size = (if self.dense { 12. } else { 14. }) * scale;
         let padding = self.padding.unwrap_or(horizontal_padding);
 
+        // `id` is `Copy`, but it is moved into the builder below, so read it
+        // first for the selector.
+        let debug_id = self.id.to_string();
         let mut element: Stateful<gpui::Div> = div()
             .id(self.id)
+            // Every other element in the app exposes a debug selector, so a
+            // button is findable by name in a visual test like the rest.
+            .debug_selector(move || debug_id.clone())
             .h(height)
             .px(padding)
             .flex()
             .items_center()
-            .gap(px(if self.dense { 4. } else { 6. }))
+            .gap(px((if self.dense { 4. } else { 6. }) * scale))
             .border_1()
-            .border_color(border)
+            // A disabled button drops its border too, not just its fill. The
+            // accent style's border *is* the accent, so a disabled accent
+            // button was left wearing a bright outline around a muted label.
+            .border_color(if self.disabled {
+                transparent_black()
+            } else {
+                border
+            })
             .bg(if self.disabled {
                 theme.surface
             } else {
                 background
             })
-            .text_size(px(if self.dense { 11. } else { 12. }))
+            .text_size(px((if self.dense { 11. } else { 12. }) * scale))
             .text_color(if self.disabled {
                 theme.faint
             } else {

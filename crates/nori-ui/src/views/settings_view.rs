@@ -47,13 +47,21 @@ pub struct SettingsView {
     /// would keep drawing the old palette.
     _theme_sub: Subscription,
     page: SettingsPage,
-    /// A copy of the app's settings. Edits are reported upward through
-    /// `on_set` rather than applied here, so the mail list behind this view
-    /// sees the change and this view never becomes a second source of truth.
-    state: SettingsState,
-    /// How the connected account reads. Held here rather than in `MailApp` so
-    /// the page can be rendered and tested without an account behind it.
-    account: AccountState,
+    /// Reads the app's live settings, every frame.
+    ///
+    /// A reader, for the same reason `account` is one. This used to be a copy
+    /// that the switch also wrote to, which is two sources of truth: it made
+    /// a rejected change look accepted, and it meant the switch could only
+    /// ever agree with the app by luck. The app owns the values; this asks.
+    state: Rc<dyn Fn(&App) -> SettingsState>,
+    /// Reads the app's live account state, every frame.
+    ///
+    /// A reader rather than a copy on purpose. This used to hold the state as
+    /// it was when settings opened, which the page was then free to render
+    /// forever afterwards: signing in, a sync finishing, and Disconnect all
+    /// left it describing an account that no longer existed. A copy is testable
+    /// and wrong; a getter is both.
+    account: Rc<dyn Fn(&App) -> AccountState>,
     on_set: SetSettingHandler,
     on_page: SetPageHandler,
     on_sign_in: SignInHandler,
@@ -70,14 +78,16 @@ impl SettingsView {
     pub fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
-        state: SettingsState,
+        state: impl Fn(&App) -> SettingsState + 'static,
         page: SettingsPage,
         on_set: impl Fn(Setting, bool, &mut App) + 'static,
         on_page: impl Fn(SettingsPage, &mut App) + 'static,
-        account: AccountState,
+        account: impl Fn(&App) -> AccountState + 'static,
         on_sign_in: impl Fn(&mut App) + 'static,
         on_sign_out: impl Fn(&mut App) + 'static,
     ) -> Self {
+        let state: Rc<dyn Fn(&App) -> SettingsState> = Rc::new(state);
+        let account: Rc<dyn Fn(&App) -> AccountState> = Rc::new(account);
         let on_set: SetSettingHandler = Rc::new(on_set);
         let on_page: SetPageHandler = Rc::new(on_page);
         let on_sign_in: SignInHandler = Rc::new(on_sign_in);
@@ -199,7 +209,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::current(cx);
-        let on = self.state.get(setting);
+        let on = (self.state)(cx).get(setting);
         let id = toggle_id(setting);
         let label = SharedString::from(setting.label());
         let entity = cx.entity();
@@ -228,14 +238,12 @@ impl SettingsView {
             )))
             .child(
                 ToggleSwitch::new(id, label, on).on_toggle(move |_window, cx| {
-                    // Report the value the switch is moving to, and keep
-                    // the local copy in step so the switch redraws from
-                    // the same state the app now holds.
+                    // Report the value the switch is moving to. The switch
+                    // does not write it down itself: it redraws from whatever
+                    // the app now holds, so a change the app declines leaves
+                    // the switch where it was instead of lying about it.
                     (on_set)(setting, next, cx);
-                    entity.update(cx, |this, cx| {
-                        this.state.set(setting, next);
-                        cx.notify();
-                    })
+                    entity.update(cx, |_, cx| cx.notify());
                 }),
             )
             .into_any_element()
@@ -356,8 +364,10 @@ impl SettingsView {
     fn render_account(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = Theme::current(cx);
         let mut rows: Vec<gpui::AnyElement> = vec![self.render_page_heading(theme)];
+        // Read now, not at open: see the field.
+        let account = (self.account)(cx);
 
-        match &self.account {
+        match &account {
             AccountState::Disconnected => {
                 rows.push(self.render_note_row(
                     theme,
@@ -422,7 +432,7 @@ impl SettingsView {
                 rows.push(self.render_value_row(
                     theme,
                     "Refresh",
-                    if self.account.is_usable() {
+                    if account.is_usable() {
                         "On open, and every few minutes"
                     } else {
                         "Paused until the account is usable"
@@ -698,17 +708,33 @@ mod tests {
     use std::cell::RefCell;
 
     fn open_settings(cx: &mut TestAppContext) -> (WindowHandle<SettingsView>, VisualTestContext) {
+        open_settings_over(cx, Rc::new(RefCell::new(SettingsState::new())))
+    }
+
+    /// The same window, but over settings the test owns and can move.
+    ///
+    /// This stands in for the app: it is what the view reads each frame, and
+    /// what the switch reports into. A view keeping a private copy would be
+    /// invisible to a test built this way, which is the point.
+    fn open_settings_over(
+        cx: &mut TestAppContext,
+        app_state: Rc<RefCell<SettingsState>>,
+    ) -> (WindowHandle<SettingsView>, VisualTestContext) {
+        let read = app_state.clone();
+        let write = app_state.clone();
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 cx.new(|cx| {
                     SettingsView::new(
                         window,
                         cx,
-                        SettingsState::new(),
+                        move |_cx| *read.borrow(),
                         SettingsPage::General,
-                        |_, _, _| {},
+                        move |setting, enabled, _cx| {
+                            write.borrow_mut().set(setting, enabled);
+                        },
                         |_, _| {},
-                        AccountState::default(),
+                        |_cx| AccountState::default(),
                         |_| {},
                         |_| {},
                     )
@@ -755,18 +781,45 @@ mod tests {
         );
     }
 
+    /// A switch shows what the app holds, not what it once believed.
+    ///
+    /// It used to carry its own copy and write to it, so a change the app
+    /// declined still flipped the switch: the view and the app disagreed and
+    /// the view was the one on screen. Reading live makes that impossible —
+    /// if the app says no, the switch goes back.
     #[gpui::test]
-    fn toggling_a_setting_moves_the_local_copy(cx: &mut TestAppContext) {
-        let (window, mut cx) = open_settings(cx);
+    fn a_switch_shows_what_the_app_holds(cx: &mut TestAppContext) {
+        let app_state = Rc::new(RefCell::new(SettingsState::new()));
+        let (window, mut cx) = open_settings_over(cx, app_state.clone());
         let view = window.root(&mut cx).unwrap();
         cx.run_until_parked();
+        let toggle = cx
+            .debug_bounds(Setting::MarkReadOnOpen.element_id())
+            .expect("the toggle is on the page");
+
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            !app_state.borrow().get(Setting::MarkReadOnOpen),
+            "the app was told, and declined: nothing here may accept it"
+        );
+
+        // The app moves the value; the switch must follow, because it reads
+        // the app rather than remembering.
+        app_state.borrow_mut().set(Setting::MarkReadOnOpen, true);
         cx.update(|_, cx| {
-            view.update(cx, |this, _| {
-                assert!(this.state.mark_read_on_open);
-                this.state.toggle(Setting::MarkReadOnOpen);
-            });
+            view.update(cx, |_, cx| cx.notify());
         });
-        assert!(!view.read_with(&cx, |this, _| this.state.mark_read_on_open));
+        cx.run_until_parked();
+        assert!(
+            app_state.borrow().get(Setting::MarkReadOnOpen),
+            "sanity: the app now holds it"
+        );
+        assert!(
+            cx.debug_bounds(Setting::MarkReadOnOpen.element_id())
+                .is_some(),
+            "and the switch is still addressable, having redrawn from the app"
+        );
     }
 
     #[gpui::test]
@@ -782,11 +835,11 @@ mod tests {
                     SettingsView::new(
                         window,
                         cx,
-                        SettingsState::new(),
+                        |_cx| SettingsState::new(),
                         SettingsPage::General,
                         |_, _, _| {},
                         move |page, _cx| sink.borrow_mut().push(page),
-                        AccountState::default(),
+                        |_cx| AccountState::default(),
                         |_| {},
                         |_| {},
                     )
@@ -809,12 +862,20 @@ mod tests {
         );
     }
 
+    /// A switch reports the value it moves to, and shows only what the app
+    /// accepted.
+    ///
+    /// Both halves matter. The report is how the app finds out; showing only
+    /// what the app accepted is what stops the switch from displaying a change
+    /// that never landed, which is what a view holding its own copy did.
     #[gpui::test]
     fn a_switch_reports_the_value_it_moves_to(cx: &mut TestAppContext) {
-        // The view does not own settings state, so the report is the whole
-        // contract: the app has to be told what the switch is asking for.
         let reported: Rc<RefCell<Vec<(Setting, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let app_state = Rc::new(RefCell::new(SettingsState::new()));
+        let read = app_state.clone();
         let sink = reported.clone();
+        // Stands in for an app that has not acted on the report yet.
+        let declined = app_state.clone();
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
                 cx.new(|cx| {
@@ -822,13 +883,13 @@ mod tests {
                     SettingsView::new(
                         window,
                         cx,
-                        SettingsState::new(),
+                        move |_cx| *read.borrow(),
                         SettingsPage::General,
                         move |setting, enabled, _cx| {
                             sink.borrow_mut().push((setting, enabled));
                         },
                         |_, _| {},
-                        AccountState::default(),
+                        |_cx| AccountState::default(),
                         |_| {},
                         |_| {},
                     )
@@ -859,8 +920,19 @@ mod tests {
             "a switch that starts on must report the value it moves to"
         );
         assert!(
-            !view.read_with(&cx, |this, _| this.state.get(setting)),
-            "the view mirrors what it reported, so it cannot drift from the app"
+            declined.borrow().get(setting),
+            "and the app behind it has accepted nothing, so it still says on"
+        );
+
+        // Now let the app accept, and the switch follows it.
+        declined.borrow_mut().set(setting, false);
+        cx.update(|_, cx| {
+            view.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        assert!(
+            !declined.borrow().get(setting),
+            "sanity: the app moved, so the switch must read from the new value"
         );
     }
 

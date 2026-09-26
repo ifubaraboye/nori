@@ -1,7 +1,5 @@
-#[cfg(test)]
-use gpui::App;
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, Render, Role, Subscription, Window, div,
+    App, Context, Entity, EventEmitter, IntoElement, Render, Role, Subscription, Window, div,
     prelude::*, px,
 };
 
@@ -48,6 +46,20 @@ impl ComposeView {
         }
     }
 
+    /// Everything currently typed.
+    ///
+    /// The fields are private and the entity is dropped when the pane closes,
+    /// so the contents go with it. A closed pane has to lift the draft out
+    /// first, or reopening it loses whatever was half-written.
+    pub fn draft(&self, cx: &App) -> DraftSeed {
+        let read = |field: &Entity<TextField>| field.read_with(cx, |f, _| f.content().to_string());
+        DraftSeed {
+            to: read(&self.to),
+            subject: read(&self.subject),
+            body: read(&self.message),
+        }
+    }
+
     /// What has been typed into the body, and a way to put something there.
     ///
     /// Test-only today: they exist so the draft-survival test can stand in for a
@@ -88,10 +100,21 @@ impl Render for ComposeView {
             .flex()
             .flex_col()
             .bg(theme.surface)
+            // An actual edge, because the pane's surface and the list's canvas
+            // are one value apart in the light palette, so the split only
+            // *looked* divided in the dark one. The sidebar's own divider uses
+            // `border` for the same reason.
+            .border_l_1()
+            .border_color(theme.border)
             .on_action(cx.listener(Self::dismiss))
             .child(
                 div()
-                    .h(px(46.))
+                    // The same height as the mail tab strip above it, so the
+                    // pane's title line sits on the same rule as the list
+                    // instead of stepping down from it. Both headers own a row
+                    // of their own, and when they disagree the eye reads the
+                    // mismatch as the pane being the odd one out.
+                    .h(px(40.))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -160,14 +183,16 @@ impl Render for ComposeView {
                     .child(
                         Button::new("compose-attach", "Attach")
                             .dense()
+                            .scaled(1.05)
                             .icon(Icon::new("icons/paperclip.svg", 13., theme.faint))
                             .style(ButtonStyle::Ghost)
                             .disabled(true),
                     )
                     .child(div().flex_1())
                     .child(
-                        Button::new("compose-send", "Send ↗")
+                        Button::new("compose-send", "Send")
                             .dense()
+                            .scaled(1.05)
                             .icon(Icon::new("icons/send.svg", 13., theme.faint))
                             .style(ButtonStyle::Accent)
                             .disabled(true),

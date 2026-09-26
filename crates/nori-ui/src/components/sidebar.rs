@@ -26,6 +26,45 @@ type LabelIdHandler = Rc<dyn Fn(LabelId, &mut Window, &mut App) + 'static>;
 type CreateLabelHandler = Rc<dyn Fn(String, &mut Window, &mut App) + 'static>;
 type RenameLabelHandler = Rc<dyn Fn(LabelId, String, &mut Window, &mut App) + 'static>;
 
+/// The shortcut shown for a mailbox while the modifier is held, derived from
+/// its position in `Mailbox::NAV_ITEMS` so the digit and the row's place in
+/// the sidebar cannot drift apart.
+pub fn mailbox_shortcut(mailbox: Mailbox) -> &'static str {
+    const ALL: [&str; 6] = ["Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6"];
+    let index = Mailbox::NAV_ITEMS
+        .iter()
+        .position(|candidate| *candidate == mailbox)
+        .unwrap_or(0);
+    ALL[index]
+}
+
+/// The right-hand slot of a sidebar row.
+///
+/// Normally the unread count. While the modifier is held it shows the row's
+/// shortcut instead, which is the point of the hint: the count is what you
+/// read, so it is what has to get out of the way for the shortcut to be
+/// readable. The slot is laid out even when it has nothing to say, so nothing
+/// shifts sideways as the modifier goes down.
+fn sidebar_trailing(
+    theme: Theme,
+    count: usize,
+    shortcut: &'static str,
+    showing_shortcuts: bool,
+) -> impl IntoElement {
+    let text = if showing_shortcuts {
+        shortcut.to_string()
+    } else if count > 0 {
+        count.to_string()
+    } else {
+        String::new()
+    };
+    div()
+        .flex_none()
+        .text_size(px(11.5))
+        .text_color(theme.faint)
+        .child(text)
+}
+
 /// What the labels section can ask the app to do.
 ///
 /// The section is `RenderOnce`, so it holds no state of its own: collapsing
@@ -317,6 +356,10 @@ pub struct Sidebar {
     width: f32,
     visible: bool,
     mailboxes_collapsed: bool,
+    /// Whether a modifier is held, in which case the rows show their shortcuts
+    /// in place of their counts. The app owns this because it is the thing that
+    /// sees the modifier change.
+    shortcuts_visible: bool,
     on_mailbox: MailboxHandler,
     on_search: SidebarActionHandler,
     on_compose: SidebarActionHandler,
@@ -350,6 +393,7 @@ impl Sidebar {
         width: f32,
         visible: bool,
         mailboxes_collapsed: bool,
+        shortcuts_visible: bool,
         on_mailbox: impl Fn(Mailbox, &mut Window, &mut App) + 'static,
         on_search: impl Fn(&mut Window, &mut App) + 'static,
         on_compose: impl Fn(&mut Window, &mut App) + 'static,
@@ -380,6 +424,7 @@ impl Sidebar {
             width,
             visible,
             mailboxes_collapsed,
+            shortcuts_visible,
             on_mailbox: Rc::new(on_mailbox),
             on_search: Rc::new(on_search),
             on_compose: Rc::new(on_compose),
@@ -475,6 +520,7 @@ impl RenderOnce for Sidebar {
             )
             .child(div().flex_1());
 
+        let shortcuts = self.shortcuts_visible;
         let compose = div().px(px(10.)).pt(px(10.)).pb(px(1.)).child(
             div()
                 .id("sidebar-compose")
@@ -509,7 +555,8 @@ impl RenderOnce for Sidebar {
                         .text_size(px(13.))
                         .truncate()
                         .child("Compose"),
-                ),
+                )
+                .child(sidebar_trailing(theme, 0, "Ctrl+N", shortcuts)),
         );
 
         let on_search = self.on_search.clone();
@@ -558,7 +605,8 @@ impl RenderOnce for Sidebar {
                                 .text_size(px(13.))
                                 .truncate()
                                 .child("Search"),
-                        ),
+                        )
+                        .child(sidebar_trailing(theme, 0, "Ctrl+S", shortcuts)),
                 ),
             )
             .child(div().h(px(10.)).flex_none())
@@ -595,7 +643,11 @@ impl RenderOnce for Sidebar {
                             .px(px(8.))
                             .cursor_pointer()
                             .role(Role::Button)
-                            .aria_label(format!("{} ({} messages)", mailbox.label(), count))
+                            .aria_label(if shortcuts {
+                                format!("{}, {}", mailbox.label(), mailbox_shortcut(mailbox))
+                            } else {
+                                format!("{} ({} messages)", mailbox.label(), count)
+                            })
                             .aria_selected(is_selected)
                             .focusable()
                             .tab_stop(true)
@@ -637,15 +689,12 @@ impl RenderOnce for Sidebar {
                                     .truncate()
                                     .child(mailbox.label()),
                             )
-                            .when(count > 0, |this| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(11.5))
-                                        .text_color(theme.faint)
-                                        .child(count.to_string()),
-                                )
-                            }),
+                            .child(sidebar_trailing(
+                                theme,
+                                count,
+                                mailbox_shortcut(mailbox),
+                                shortcuts,
+                            )),
                     )
                 }))
             })
