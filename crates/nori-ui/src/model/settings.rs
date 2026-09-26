@@ -1,9 +1,9 @@
-/// Settings page model.
-///
-/// The prototype has no persistence layer, so these values live in memory
-/// for the lifetime of the `SettingsView` that owns them. Layout and wording
-/// follow Waku's settings shell (nav column + capped, card-based content);
-/// the fields themselves are Nori's own mail settings.
+//! Settings page model, and the file it is kept in.
+//!
+//! Layout and wording follow Waku's settings shell (nav column + capped,
+//! card-based content); the fields themselves are Nori's own mail settings.
+//! They are written to disk on every change, so a switch flipped in Settings
+//! is still flipped the next time the app opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPage {
     General,
@@ -119,8 +119,8 @@ impl Setting {
             }
             Self::ShowSender => "Keep the sender line visible above the message body.",
             Self::LightMode => {
-                "Use the light palette. The switch takes effect immediately and lasts for \
-                 this session, since settings are not written to disk yet."
+                "Use the light palette. The switch takes effect immediately and is \
+                 remembered for next time."
             }
             Self::OpenInTab => "Keep a tab for every opened message so you can jump back.",
             Self::GroupConversations => "Thread replies together under the most recent message.",
@@ -131,9 +131,13 @@ impl Setting {
     }
 }
 
-/// In-memory settings. Every value is a prototype default; nothing here is
-/// written to disk yet.
-#[derive(Clone, Copy, Debug)]
+/// Every setting, and what it defaults to.
+///
+/// `Default` is `new()` on purpose. It is what a missing field in an older or
+/// partial settings file falls back to, so the defaults in one place are also
+/// the defaults for anything added later.
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SettingsState {
     pub mark_read_on_open: bool,
     pub unread_badges: bool,
@@ -159,8 +163,9 @@ impl SettingsState {
             // around.
             compact_rows: true,
             show_sender: true,
-            // Dark is the default palette. Nothing is persisted, so this is
-            // also what every launch starts from.
+            // Dark is the default palette, and what a launch with no
+            // settings file — or one written before this setting existed —
+            // starts from.
             light_mode: false,
             open_in_tab: true,
             group_conversations: false,
@@ -169,7 +174,9 @@ impl SettingsState {
             read_receipts: false,
         }
     }
+}
 
+impl SettingsState {
     pub fn get(self, setting: Setting) -> bool {
         match setting {
             Setting::MarkReadOnOpen => self.mark_read_on_open,
@@ -219,9 +226,79 @@ impl SettingsState {
     }
 }
 
+/// The defaults, by another name.
+///
+/// `serde` needs this: a field absent from a settings file written by an
+/// older version falls back to `Default`, so this is also how a setting added
+/// in a later release behaves for someone who already had a file. Routing it
+/// through `new()` keeps the two from drifting apart.
 impl Default for SettingsState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The settings file, beside the account files in the config directory.
+///
+/// Named once and not per account: these are preferences, not mail, so they
+/// follow the person rather than the mailbox.
+pub struct SettingsStore {
+    path: std::path::PathBuf,
+}
+
+impl SettingsStore {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// The default location, honouring `XDG_CONFIG_HOME` the way the token and
+    /// index files already do, so settings are not the one thing living
+    /// somewhere else.
+    ///
+    /// Not compiled into tests: a test builds its store with [`Self::new`] and
+    /// a path of its own, so nothing here can be talked into writing over the
+    /// settings of whoever is running the suite.
+    #[cfg(not(test))]
+    pub fn with_config_dir() -> anyhow::Result<Self> {
+        let base = match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+            _ => {
+                let home =
+                    std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+                std::path::PathBuf::from(home).join(".config")
+            }
+        };
+        Ok(Self::new(base.join("nori").join("settings.json")))
+    }
+
+    /// The stored settings, or `None` on a first run.
+    ///
+    /// A file that will not parse is treated as absent rather than fatal, for
+    /// the same reason the mail index does it: losing a settings file costs the
+    /// defaults, and refusing to start would cost the user their mailbox.
+    pub fn load(&self) -> Option<SettingsState> {
+        let contents = std::fs::read_to_string(&self.path).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+
+    /// Write the settings, atomically.
+    ///
+    /// Written to a sibling and renamed, so an interrupted write cannot leave
+    /// a truncated file that fails to parse on the next launch and silently
+    /// resets every switch the user had flipped.
+    pub fn save(&self, state: &SettingsState) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let Some(parent) = self.path.parent() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        let temporary = self.path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec_pretty(state)?)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        std::fs::rename(&temporary, &self.path)
+            .with_context(|| format!("replacing {}", self.path.display()))
     }
 }
 
@@ -257,9 +334,89 @@ mod tests {
         assert!(SettingsState::new().compact_rows);
     }
 
+    /// A switch flipped in Settings has to still be flipped next launch.
+    ///
+    /// The whole point of the file: without it every launch started from
+    /// `new()` and the user's choices were gone.
+    #[test]
+    fn a_flipped_setting_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("nori-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        // First run: defaults, nothing on disk.
+        assert!(store.load().is_none(), "a first run has no settings file");
+
+        // Flip two settings and write them out.
+        let mut state = SettingsState::new();
+        assert!(state.set(Setting::LightMode, true));
+        assert!(state.set(Setting::CompactRows, false));
+        store.save(&state).expect("save");
+
+        // Next launch.
+        let reloaded = store.load().expect("the file is there");
+        assert!(reloaded.get(Setting::LightMode), "light mode must persist");
+        assert!(
+            !reloaded.get(Setting::CompactRows),
+            "and so must the row density"
+        );
+        // Untouched settings keep their defaults rather than becoming false.
+        assert!(
+            reloaded.get(Setting::UnreadBadges),
+            "a setting nobody touched must come back at its default, not false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file written before a setting existed must still load, with the new
+    /// one at its default rather than refusing the whole file.
+    #[test]
+    fn a_file_from_an_older_version_still_loads() {
+        let dir = std::env::temp_dir().join(format!("nori-settings-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("settings.json");
+
+        // One field, as if only that setting had been written back then.
+        std::fs::write(&path, r#"{"lightMode":true}"#).expect("write");
+        let state: SettingsState = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+            .expect("a partial file must still parse");
+        assert!(
+            state.get(Setting::LightMode),
+            "the field that is there is read"
+        );
+        assert!(
+            state.get(Setting::MarkReadOnOpen),
+            "and the ones that are not fall back to the defaults"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A truncated or hand-edited file must not stop the app starting.
+    #[test]
+    fn an_unreadable_file_falls_back_to_the_defaults() {
+        let dir = std::env::temp_dir().join(format!("nori-settings-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("settings.json");
+
+        std::fs::write(&path, "{ not json").expect("write");
+        let store = SettingsStore::new(&path);
+        assert!(
+            store.load().is_none(),
+            "a corrupt file reads as a first run, not a failure to start"
+        );
+        assert!(
+            SettingsState::default().get(Setting::UnreadBadges),
+            "and the defaults a first run falls back to are the real ones"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn light_mode_is_off_out_of_the_box() {
-        // Nothing is persisted, so every launch starts on the dark palette.
+        // Dark out of the box: there is no settings file on a first run.
         let mut state = SettingsState::new();
         assert!(!state.get(Setting::LightMode));
         assert!(state.toggle(Setting::LightMode));

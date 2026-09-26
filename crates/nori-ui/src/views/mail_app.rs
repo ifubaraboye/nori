@@ -22,8 +22,8 @@ use crate::components::{
 };
 use crate::model::{
     AccountState, Density, DraftSeed, Email, EmailId, Index, IndexCache, Label, LabelId,
-    LabelStore, MailStore, Mailbox, Overlay, Setting, SettingsPage, SettingsState, WorkspaceView,
-    gmail_query, may_replace_index, mock::mock_emails, to_email,
+    LabelStore, MailStore, Mailbox, Overlay, Setting, SettingsPage, SettingsState, SettingsStore,
+    WorkspaceView, gmail_query, may_replace_index, mock::mock_emails, to_email,
 };
 use crate::theme::Theme;
 
@@ -230,6 +230,10 @@ pub struct MailApp {
     /// while settings is closed, and the view that edits them is discarded
     /// on close. Copying ten bools per frame is cheaper than a global.
     settings_state: SettingsState,
+    /// Where the settings are written. A field rather than a path looked up on
+    /// every save, so the destination is part of the app's state and a test can
+    /// put it somewhere of its own instead of over the user's real settings.
+    settings_store: SettingsStore,
     /// How the connected account reads, for the settings page and the top bar.
     /// `MailApp` owns it because the token store and the sync both live here,
     /// and the settings view is discarded on close.
@@ -304,6 +308,31 @@ impl MailApp {
         // The theme is published as a global, so subscribing is what repaints
         // this view when the light mode switch flips it.
         let theme_subscription = cx.observe_global::<Theme>(|_, cx| cx.notify());
+        // Settings come off disk before the first frame, not during it: a
+        // remembered light mode has to be the palette the window opens with,
+        // or the app flashes dark and then corrects itself.
+        // Where settings live. Production resolves the real config directory.
+        // A test gets a throwaway file of its own, because `set_setting` saves
+        // on every change and a test that flipped a switch would otherwise
+        // write over the settings of whoever is running the suite — which is
+        // exactly what happened the first time this was wired up.
+        #[cfg(not(test))]
+        let settings_store = SettingsStore::with_config_dir()
+            // No config directory means nowhere to keep preferences. The temp
+            // directory is worse than the config directory and better than
+            // dropping them on every change, and it only happens when the
+            // environment has no home to speak of.
+            .unwrap_or_else(|_| {
+                SettingsStore::new(std::env::temp_dir().join("nori").join("settings.json"))
+            });
+        #[cfg(test)]
+        let settings_store = SettingsStore::new(std::env::temp_dir().join(format!(
+            "nori-settings-test-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        let settings_state = settings_store.load().unwrap_or_default();
+        cx.set_global(Theme::for_light_mode(settings_state.light_mode));
         Self {
             store,
             labels,
@@ -329,7 +358,8 @@ impl MailApp {
             search: None,
             settings: None,
             settings_page: SettingsPage::General,
-            settings_state: SettingsState::new(),
+            settings_state,
+            settings_store,
             account: AccountState::default(),
             loaded_mailboxes: HashSet::new(),
             exhausted_mailboxes: HashSet::new(),
@@ -504,8 +534,25 @@ impl MailApp {
             if setting == Setting::CheckForMail && enabled {
                 self.sync(cx);
             }
+            // Written on every change, not on the way out: there is no way out.
+            // A switch that only survived a clean exit is a switch the user
+            // cannot rely on.
+            self.persist_settings();
             cx.notify();
         }
+    }
+
+    /// Write the settings out. Best effort — a read-only config directory
+    /// should not stop someone flipping a switch, it should only mean the
+    /// choice does not outlive the session.
+    fn persist_settings(&self) {
+        self.write_settings(&self.settings_store);
+    }
+
+    /// The write itself, given a store, so a test can point it somewhere of
+    /// its own instead of over the user's real settings.
+    fn write_settings(&self, store: &SettingsStore) {
+        let _ = store.save(&self.settings_state);
     }
 
     /// The single writer for the open settings page, for the same reason
@@ -4122,6 +4169,49 @@ mod tests {
             cx.debug_bounds("empty-sign-in").is_none(),
             "nor after the grant lands, while mail is still arriving"
         );
+    }
+
+    /// Flipping a switch writes it out, which is the only reason persistence is
+    /// worth having.
+    ///
+    /// Driven through `write_settings` with a store of the test's own: the
+    /// failure being ruled out is a switch that flips on screen and is quietly
+    /// not saved, and the last version of this test proved nothing except that
+    /// it could overwrite the user's real settings.
+    #[gpui::test]
+    fn flipping_a_switch_writes_the_settings_file(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        let dir = std::env::temp_dir().join(format!("nori-settings-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = SettingsStore::new(dir.join("settings.json"));
+
+        // Point the app at a store of this test's own first: `set_setting`
+        // saves on every change, so without this the test writes over the
+        // settings of whoever is running it.
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.settings_store = SettingsStore::new(dir.join("settings.json"));
+                this.set_setting(Setting::LightMode, true, cx);
+                this.set_setting(Setting::CompactRows, false, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(&cx, |app, _| app.settings_state.get(Setting::LightMode)),
+            "the switch reads on"
+        );
+        let reloaded = store.load().expect("the file was written");
+        assert!(
+            reloaded.get(Setting::LightMode),
+            "and it was written out, not just held in memory"
+        );
+        assert!(!reloaded.get(Setting::CompactRows));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A successful sign-in must record which account it connected.

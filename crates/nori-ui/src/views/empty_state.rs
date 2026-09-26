@@ -54,8 +54,8 @@ pub fn render(
         Empty::FetchingMail(name) => (
             "Fetching your mail…".into(),
             format!(
-                "Signed in as {name}. Reading your mailbox now — this takes a \
-                 minute on a large one, and your mail appears as it arrives."
+                "Signed in as {name}. Reading your mailbox now, this may take \
+                 a while. Your mail appears as it arrives."
             )
             .into(),
         ),

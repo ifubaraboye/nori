@@ -13,4 +13,4 @@ pub use labels::{Label, LabelId, LabelStore};
 pub use mail::{
     DraftSeed, Email, EmailId, EmailSummary, MailStore, Mailbox, Origin, Overlay, WorkspaceView,
 };
-pub use settings::{Setting, SettingsPage, SettingsState};
+pub use settings::{Setting, SettingsPage, SettingsState, SettingsStore};
