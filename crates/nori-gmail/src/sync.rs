@@ -67,7 +67,8 @@ const _: () = assert!(SELF_LIMIT_UNITS_PER_MINUTE <= QUOTA_UNITS_PER_MINUTE);
 /// that neither budget is on its own too big, which is what an oversized
 /// `METADATA_BUDGET` looks like.
 const _: () = assert!(METADATA_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
-const _: () = assert!(MAILBOX_FETCH_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
+const _: () =
+    assert!(MAILBOX_FETCH_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
 const _: () = assert!(SEARCH_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
 /// Nori must never budget for more than Google allows. If Google lowers the
 /// limit, this is where it should fail.
@@ -363,12 +364,7 @@ impl<'a> Sync<'a> {
     /// twenty for the metadata of a single one. So the pages already held are
     /// walked again and dropped, and the next page always starts from the
     /// truth rather than from a guess.
-    fn list_ids(
-        &self,
-        query: &str,
-        budget: usize,
-        held: &HashSet<String>,
-    ) -> Result<Vec<String>> {
+    fn list_ids(&self, query: &str, budget: usize, held: &HashSet<String>) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut page_token: Option<String> = None;
         let limiter = RateLimiter::new(SELF_LIMIT_UNITS_PER_MINUTE);

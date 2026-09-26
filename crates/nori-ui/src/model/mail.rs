@@ -418,7 +418,19 @@ impl MailStore {
     pub fn restore(&mut self, emails: Vec<Email>, history_id: Option<String>) {
         self.emails = emails;
         self.synced_history_id = history_id;
-        self.tabs.clear();
+        // The tabs come back, rebuilt from what is pinned rather than dropped.
+        // A pin is Nori's own state and the only thing that gives a mail a
+        // tab, so a launch that cleared them reopened every pinned mail as
+        // unpinned: the pin was in the file, and the tab strip came up empty
+        // anyway. Nothing is activated — the mailbox is what a launch should
+        // show, and auto-opening the last read mail would be a worse surprise
+        // than an inactive tab.
+        self.tabs = self
+            .emails
+            .iter()
+            .filter(|email| email.pinned)
+            .map(|email| email.id.clone())
+            .collect();
         self.active_tab = None;
         self.workspace_view = WorkspaceView::Mailbox;
         self.history_back.clear();
@@ -957,5 +969,91 @@ mod tests {
         assert!(store.tabs().is_empty());
         assert_eq!(store.workspace_view(), WorkspaceView::Mailbox);
         assert!(!store.can_go_back(), "history must not outlive the mail");
+    }
+
+    /// A pin has to outlive a restart, or pinning is a gesture that does
+    /// nothing.
+    ///
+    /// The full round trip: pin, snapshot to the index, read that index back
+    /// the way a launch does, and the tab is there. The middle step is the one
+    /// that matters — `pinned` was already in the file, so a test that only
+    /// checked the store would have passed while the app dropped the tabs on
+    /// the way back in.
+    #[test]
+    fn a_pin_survives_the_index_round_trip() {
+        let mut store = store();
+        let pinned = store.visible_emails()[0].id.clone();
+        let left_alone = store.visible_emails()[1].id.clone();
+        store.toggle_pin(pinned.clone());
+
+        // What goes to disk.
+        let written = serde_json::to_string(&store.snapshot()).expect("the index serialises");
+
+        // What a launch reads.
+        let read_back: Vec<Email> = serde_json::from_str(&written).expect("the index loads");
+
+        let mut reopened = MailStore::new(Vec::new());
+        reopened.restore(read_back, Some("cursor".to_string()));
+
+        assert_eq!(
+            reopened.tabs(),
+            std::slice::from_ref(&pinned),
+            "the pinned mail keeps its tab across a restart"
+        );
+        assert!(
+            reopened.email(&pinned).is_some_and(|email| email.pinned),
+            "and is still pinned"
+        );
+        assert!(
+            !reopened.tabs().contains(&left_alone),
+            "an unpinned mail earns no tab, however many times it is restored"
+        );
+    }
+
+    /// Restoring must not throw the user into a mail.
+    ///
+    /// Tabs coming back is the fix; auto-opening one is not. A launch that
+    /// dropped you into the last thing you were reading is a worse surprise
+    /// than an inactive tab, so the mailbox is what a launch shows.
+    #[test]
+    fn a_restored_pin_is_not_activated() {
+        let mut store = store();
+        let pinned = store.visible_emails()[0].id.clone();
+        store.toggle_pin(pinned.clone());
+
+        let restored = store.snapshot();
+        let mut reopened = MailStore::new(Vec::new());
+        reopened.restore(restored, None);
+
+        assert_eq!(reopened.tabs().len(), 1, "the tab is there");
+        assert_eq!(reopened.active_tab(), None, "but nothing is open");
+        assert_eq!(
+            reopened.workspace_view(),
+            WorkspaceView::Mailbox,
+            "a launch shows the mailbox"
+        );
+    }
+
+    /// Unpinning before a restart must not come back as pinned.
+    ///
+    /// The other direction of the same round trip: a restore that rebuilt tabs
+    /// from a stale pin would resurrect a tab the user had just closed.
+    #[test]
+    fn an_unpinned_mail_does_not_return_with_a_tab() {
+        let mut store = store();
+        let id = store.visible_emails()[0].id.clone();
+        store.toggle_pin(id.clone());
+        store.toggle_pin(id.clone());
+        assert!(store.tabs().is_empty(), "unpinning closed the tab");
+
+        let restored = store.snapshot();
+        let mut reopened = MailStore::new(Vec::new());
+        reopened.restore(restored, None);
+
+        assert!(
+            reopened.tabs().is_empty(),
+            "an unpin has to be as durable as a pin, or closing a tab is undone \
+             by quitting"
+        );
     }
 }

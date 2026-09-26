@@ -234,6 +234,16 @@ pub struct MailApp {
     /// every save, so the destination is part of the app's state and a test can
     /// put it somewhere of its own instead of over the user's real settings.
     settings_store: SettingsStore,
+    /// Sends index writes somewhere else, for a test. `None` in the app, which
+    /// resolves the real config directory per account.
+    ///
+    /// This exists because "pinning saves the index" is otherwise untestable
+    /// without writing over the index of whichever account the machine running
+    /// the suite happens to be signed in to. The first version of that test
+    /// sidestepped the problem by calling the write itself rather than the pin
+    /// that triggers it, which meant it passed whether or not pinning saved
+    /// anything — the exact bug it was written to catch.
+    index_cache_override: Option<IndexCache>,
     /// How the connected account reads, for the settings page and the top bar.
     /// `MailApp` owns it because the token store and the sync both live here,
     /// and the settings view is discarded on close.
@@ -360,6 +370,7 @@ impl MailApp {
             settings_page: SettingsPage::General,
             settings_state,
             settings_store,
+            index_cache_override: None,
             account: AccountState::default(),
             loaded_mailboxes: HashSet::new(),
             exhausted_mailboxes: HashSet::new(),
@@ -1248,9 +1259,19 @@ impl MailApp {
     /// fuller file — see [`may_replace_index`] — so a partial state can never
     /// strand the next launch on an empty list.
     fn save_index(&self, account: &str) {
-        let Ok(cache) = IndexCache::with_account(account) else {
-            return;
+        let cache = match self.index_cache_override.clone() {
+            Some(cache) => cache,
+            None => match IndexCache::with_account(account) {
+                Ok(cache) => cache,
+                Err(_) => return,
+            },
         };
+        self.write_index(account, &cache);
+    }
+
+    /// The write itself, given a cache, so a test can point it somewhere of its
+    /// own instead of over the index of the account it is really signed in to.
+    fn write_index(&self, account: &str, cache: &IndexCache) {
         let snapshot = self.store.snapshot();
         if let Some(current) = cache.load(account)
             && !may_replace_index(&current, snapshot.len())
@@ -1260,7 +1281,7 @@ impl MailApp {
         let (labels, assignments) = self.labels.snapshot();
         let _ = cache.save(&Index {
             account: account.to_string(),
-            emails: self.store.snapshot(),
+            emails: snapshot,
             labels,
             assignments,
             history_id: self.store.synced_history_id().map(str::to_string),
@@ -2095,9 +2116,29 @@ impl MailApp {
     }
 
     /// Pin or unpin the open mail. Unpinning also closes its tab.
+    ///
+    /// Written to the index immediately, the way a star is. A pin is Nori's own
+    /// state with no server equivalent, so there is nothing to write back and
+    /// the index file is the only place it can live — which means a pin that
+    /// was not saved was not kept. It was previously saved only as a side
+    /// effect of some later sync or body fetch happening to run, so pinning a
+    /// mail and quitting lost it.
     fn toggle_pin(&mut self, id: EmailId, cx: &mut Context<Self>) {
-        self.store.toggle_pin(id);
+        if !self.store.toggle_pin(id.clone()) {
+            return;
+        }
         cx.notify();
+
+        // `None` for sample mail, which has no index file to be written to.
+        let Some(account) = self
+            .store
+            .email(&id)
+            .and_then(|email| email.write_back_account())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.save_index(&account);
     }
 
     /// Retrace the previous view, the way the sidebar's back chevron does.
@@ -4469,6 +4510,87 @@ mod tests {
         let mail = &reloaded.emails[0];
         assert!(mail.body_loaded, "a cached body counts as loaded");
         assert_eq!(mail.body, blocks);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pinning has to reach the file, not just the store.
+    ///
+    /// `pinned` was already a serialised field, so the data reached disk
+    /// eventually — but only as a side effect of some later sync or body fetch
+    /// happening to run. Pin a mail and quit, and the file still said unpinned.
+    ///
+    /// Nothing here calls the write itself: the only thing driven is
+    /// `toggle_pin`, so if pinning stops saving, this fails. An earlier version
+    /// of this test called `write_index` by hand and passed with the save
+    /// deleted, having proved only that a write writes.
+    #[gpui::test]
+    fn pinning_writes_the_pin_to_the_index(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        let dir = std::env::temp_dir().join(format!("nori-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cache = IndexCache::new(dir.join("account.index.json"));
+        let account = "me@example.com";
+
+        // Real mail with a real origin, so `toggle_pin` takes the save path
+        // rather than stopping at the sample-mail early return, and its writes
+        // land in this test's file rather than the account's real index.
+        let pinned = EmailId("pin-1".to_string());
+        cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                this.index_cache_override = Some(IndexCache::new(dir.join("account.index.json")));
+                this.store.restore(
+                    vec![crate::model::Email {
+                        id: pinned.clone(),
+                        sender: "Sender".to_string(),
+                        subject: "Worth keeping".to_string(),
+                        mailbox: Mailbox::Inbox,
+                        origin: crate::model::Origin::Remote {
+                            account: account.to_string(),
+                        },
+                        ..Default::default()
+                    }],
+                    None,
+                );
+            });
+        });
+
+        // The pin, and nothing else.
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| this.toggle_pin(pinned.clone(), cx));
+        });
+        cx.run_until_parked();
+
+        let written = cache
+            .load(account)
+            .expect("pinning writes the index on its own");
+        assert!(
+            written.emails[0].pinned,
+            "the pin must be in the file: quitting right after a pin must not lose it"
+        );
+
+        // And a launch reading that file gets the tab back.
+        let mut reopened = crate::model::MailStore::new(Vec::new());
+        reopened.restore(written.emails, written.history_id);
+        assert_eq!(
+            reopened.tabs(),
+            std::slice::from_ref(&pinned),
+            "a pinned mail has its tab again on the next launch"
+        );
+
+        // Unpinning is as durable as pinning.
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| this.toggle_pin(pinned.clone(), cx));
+        });
+        cx.run_until_parked();
+        let cleared = cache.load(account).expect("unpinning writes the index");
+        assert!(
+            !cleared.emails[0].pinned,
+            "an unpin has to be written too, or quitting resurrects the tab"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

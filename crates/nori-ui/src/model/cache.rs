@@ -64,6 +64,7 @@ pub fn may_replace_index(current: &Index, mail_count: usize) -> bool {
 }
 
 /// Reads and writes an [`Index`] beside the account's token.
+#[derive(Clone)]
 pub struct IndexCache {
     path: PathBuf,
 }

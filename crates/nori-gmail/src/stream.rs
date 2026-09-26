@@ -77,5 +77,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A poisoned lock means a worker panicked mid-send. The mail that was in
     // flight is one message the user can fetch again, so there is nothing to
     // salvage by refusing to continue.
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
