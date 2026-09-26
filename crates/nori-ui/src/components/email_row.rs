@@ -379,11 +379,7 @@ impl RenderOnce for EmailRow {
             .items_stretch()
             .border_b_1()
             .border_color(theme.hairline)
-            .bg(if std::env::var_os("NORI_ROW_PROBE").is_some() {
-                gpui::green()
-            } else {
-                row_background
-            })
+            .bg(row_background)
             .hover(|style| {
                 style.bg(if selected {
                     theme.selected_layer

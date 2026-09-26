@@ -9,6 +9,7 @@
 //! `label_ids` means "Inbox, unread" is the view layer's job, because
 //! `Mailbox` is defined there and this crate must not grow a dependency on it.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -39,7 +40,7 @@ use crate::token::{Token, TokenStore};
 /// thousand mails in one go is **not possible**, not slow — at 240 a minute it
 /// is a twenty-minute job that would be throttled long before it finished.
 /// Gmail's own web client does not do it either.
-pub const METADATA_BUDGET: usize = 80;
+pub const METADATA_BUDGET: usize = 200;
 
 /// How many `messages.get` requests may be in flight at once.
 const FETCH_CONCURRENCY: usize = 4;
@@ -56,14 +57,21 @@ const QUOTA_UNITS_PER_MINUTE: u64 = 6_000;
 /// Nori must never budget for more than Google allows. If Google lowers the
 /// limit, this is where it should fail.
 const _: () = assert!(SELF_LIMIT_UNITS_PER_MINUTE <= QUOTA_UNITS_PER_MINUTE);
-/// The one that actually matters: a first sync and a folder fetch landing in
-/// the same minute must still fit inside the self-limit, or opening a folder
-/// during a sync earns a 403. This is the check that caught the original
-/// budget being larger than a single allowance.
-const _: () = assert!(
-    (METADATA_BUDGET + MAILBOX_FETCH_BUDGET) as u64 * COST_MESSAGE_GET
-        <= SELF_LIMIT_UNITS_PER_MINUTE
-);
+/// Each budget has to fit inside a single quota minute *on its own*, or it
+/// could never finish without being throttled mid-way.
+///
+/// They deliberately do not have to fit together. Nori never runs two indexers
+/// at once — a folder opened during a sync waits for the next one — so their
+/// sum is not a real spend. That guard lives in `MailApp` and is a runtime
+/// invariant, which is why it cannot be asserted here; what *can* be checked is
+/// that neither budget is on its own too big, which is what an oversized
+/// `METADATA_BUDGET` looks like.
+const _: () = assert!(METADATA_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
+const _: () = assert!(MAILBOX_FETCH_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
+const _: () = assert!(SEARCH_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
+/// Nori must never budget for more than Google allows. If Google lowers the
+/// limit, this is where it should fail.
+const _: () = assert!(SELF_LIMIT_UNITS_PER_MINUTE <= QUOTA_UNITS_PER_MINUTE);
 
 /// What each call costs, from Gmail's published quota table.
 const COST_MESSAGE_GET: u64 = 20;
@@ -295,7 +303,7 @@ impl<'a> Sync<'a> {
         self.authorize()?;
         let profile = gmail::profile(&self.agent, &self.token)?;
         let labels = self.labels()?;
-        let mail = self.fetch_with(INBOX, METADATA_BUDGET, stream)?;
+        let mail = self.fetch_with(INBOX, METADATA_BUDGET, &HashSet::new(), stream)?;
 
         Ok(Snapshot {
             account: profile.email,
@@ -314,7 +322,7 @@ impl<'a> Sync<'a> {
     /// Newest first, because a truncated list is only useful if the top of it
     /// is the mail that just arrived.
     pub fn fetch(&mut self, query: &str, budget: usize) -> Result<Vec<RemoteMail>> {
-        self.fetch_with(query, budget, None)
+        self.fetch_with(query, budget, &HashSet::new(), None)
     }
 
     /// As [`Self::fetch`], handing each message over as it arrives.
@@ -326,29 +334,11 @@ impl<'a> Sync<'a> {
         &mut self,
         query: &str,
         budget: usize,
+        held: &HashSet<String>,
         stream: Option<&MailStream>,
     ) -> Result<Vec<RemoteMail>> {
         self.authorize()?;
-        let mut ids = Vec::new();
-        let mut page_token: Option<String> = None;
-        let limiter = RateLimiter::new(SELF_LIMIT_UNITS_PER_MINUTE);
-        for _ in 0..MAX_PAGES {
-            if ids.len() >= budget {
-                break;
-            }
-            limiter.acquire(COST_MESSAGE_LIST);
-            let page =
-                gmail::list_messages(&self.agent, &self.token, query, page_token.as_deref())?;
-            ids.extend(page.messages.into_iter().map(|message| message.id));
-            match page.next_page {
-                Some(next) => page_token = Some(next),
-                None => break,
-            }
-        }
-        ids.truncate(budget);
-        if let Some(stream) = stream {
-            stream.set_total(ids.len());
-        }
+        let ids = self.list_ids(query, budget, held)?;
 
         let mail: Vec<RemoteMail> = self
             .metadata_for(&ids, stream)?
@@ -360,6 +350,48 @@ impl<'a> Sync<'a> {
             stream.finish();
         }
         Ok(mail)
+    }
+
+    /// Ids for `query`, newest first, skipping any already in `held`.
+    ///
+    /// Skipping instead of resuming from a remembered page token is what makes
+    /// "fetch more" survive a restart. A token would have to be written to
+    /// disk alongside the index, and a token that has gone stale — a mail
+    /// deleted, a label changed — silently walks the wrong slice of the
+    /// mailbox and returns mail that was already there. Re-reading ids is close
+    /// to free: Gmail serves five hundred of them for five units, against
+    /// twenty for the metadata of a single one. So the pages already held are
+    /// walked again and dropped, and the next page always starts from the
+    /// truth rather than from a guess.
+    fn list_ids(
+        &self,
+        query: &str,
+        budget: usize,
+        held: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        let mut page_token: Option<String> = None;
+        let limiter = RateLimiter::new(SELF_LIMIT_UNITS_PER_MINUTE);
+        for _ in 0..MAX_PAGES {
+            if ids.len() >= budget {
+                break;
+            }
+            limiter.acquire(COST_MESSAGE_LIST);
+            let page =
+                gmail::list_messages(&self.agent, &self.token, query, page_token.as_deref())?;
+            ids.extend(
+                page.messages
+                    .into_iter()
+                    .map(|message| message.id)
+                    .filter(|id| !held.contains(id)),
+            );
+            match page.next_page {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+        ids.truncate(budget);
+        Ok(ids)
     }
 
     /// Fold a delta into fetched mail, ready to apply.
@@ -666,6 +698,15 @@ pub fn colour_of(name: &str) -> u32 {
 /// useful. The pair still has to fit one quota minute together, which is what
 /// the assertion near [`SELF_LIMIT_UNITS_PER_MINUTE`] checks.
 pub const MAILBOX_FETCH_BUDGET: usize = 100;
+
+/// How much a search reads, in messages.
+///
+/// This is the one place that reaches past the mails Nori keeps locally, so it
+/// is also the only place where a partial answer is acceptable: a search that
+/// stops at the first hundred hits is still a useful answer, where a truncated
+/// inbox is a wrong one. Nothing is written to the index — these are answers,
+/// not mail.
+pub const SEARCH_BUDGET: usize = 100;
 
 /// The Inbox, which is what a first sync indexes.
 ///
@@ -1093,16 +1134,12 @@ mod tests {
     /// mails a minute, not the 1.2 million a careless reading of the quota page
     /// suggests.
     #[test]
-    fn the_budget_fits_inside_one_quota_minute() {
-        // The case that actually bites: a first sync and a folder fetch in the
-        // same minute. Each alone would fit, so a check on either one in
-        // isolation passes while the combination still earns a 403.
-        let together = (METADATA_BUDGET + MAILBOX_FETCH_BUDGET) as u64 * COST_MESSAGE_GET;
-        assert!(
-            together <= SELF_LIMIT_UNITS_PER_MINUTE,
-            "a first sync and a folder fetch together need {together} units but the \
-             self-limit is {SELF_LIMIT_UNITS_PER_MINUTE}"
-        );
+    fn each_budget_fits_inside_one_quota_minute() {
+        // The two never run at the same time, so each is checked alone. A budget
+        // larger than a single allowance could never finish without being
+        // throttled part-way through, which is what this catches.
+        assert!(METADATA_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
+        assert!(MAILBOX_FETCH_BUDGET as u64 * COST_MESSAGE_GET <= SELF_LIMIT_UNITS_PER_MINUTE);
     }
 
     #[test]

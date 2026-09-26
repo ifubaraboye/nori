@@ -237,6 +237,12 @@ pub struct MailApp {
     /// Which mailboxes have had their mail fetched, so a folder is indexed once
     /// rather than on every visit.
     loaded_mailboxes: HashSet<Mailbox>,
+    /// Folders a fetch came back empty from, so the control asking for more
+    /// has nothing left to offer and stops being drawn.
+    exhausted_mailboxes: HashSet<Mailbox>,
+    /// Whether the scroll watcher is already running, so `render` can ask for one
+    /// on every frame without starting a second.
+    watching_more: bool,
     /// Whether a sync is in flight. A first sync takes about a minute — the
     /// quota allows only 300 mails a minute — so without this the list is just
     /// empty for a while, which reads as a broken app rather than a slow one.
@@ -245,6 +251,14 @@ pub struct MailApp {
     /// and is moved into the list by `pump_incoming`, so the inbox fills in
     /// while the fetch is still running rather than appearing all at once.
     sync_stream: Option<Arc<nori_gmail::MailStream>>,
+    /// The open search's own stream. Kept apart from the inbox's because its
+    /// mail is an answer to a question, not something the folder views should
+    /// start showing: a search hit is not necessarily in the Inbox.
+    search_stream: Option<Arc<nori_gmail::MailStream>>,
+    /// Bumped on every keystroke. A request that finds its number stale has
+    /// been superseded and drops its results instead of answering a question
+    /// the user has already typed past.
+    search_generation: u64,
     subscriptions: Vec<Subscription>,
     previous_focus: Option<FocusHandle>,
 }
@@ -308,8 +322,12 @@ impl MailApp {
             settings_state: SettingsState::new(),
             account: AccountState::default(),
             loaded_mailboxes: HashSet::new(),
+            exhausted_mailboxes: HashSet::new(),
+            watching_more: false,
             syncing: false,
             sync_stream: None,
+            search_stream: None,
+            search_generation: 0,
             subscriptions,
             previous_focus: None,
         }
@@ -528,8 +546,8 @@ impl MailApp {
             nori_gmail::TokenStore::save(&store, &token)?;
 
             let mut sync = nori_gmail::Sync::new(agent, &credentials, &store)?;
-            // Before the mail, so the sidebar's folder counts are right the
-            // moment the account appears. One unit.
+            // One label read, so the sidebar's badges are right the moment the
+            // account appears. Cheap next to the mail it sits beside.
             let counts = sync.folder_counts().ok();
             let snapshot = sync.full()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((profile.email, snapshot, counts))
@@ -599,8 +617,6 @@ impl MailApp {
         self.pump_incoming(incoming, cx);
         let task = cx.background_executor().spawn(async move {
             let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
-            // One unit, and it makes every folder's count right even for the
-            // folders whose mail Nori has not downloaded.
             let counts = sync.folder_counts().ok();
             let outcome = match since.as_deref() {
                 // `None` here means the cursor aged out, and a full sync is
@@ -616,7 +632,14 @@ impl MailApp {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                // The in-flight guard's own flag, cleared on every exit. Leaving
+                // it set on the error path is a trap for whatever reads it next:
+                // a failed sync would wedge the app into refusing to fetch
+                // anything again, and the guard would be reporting a fetch that
+                // finished minutes ago as though it were still running.
+                this.syncing = false;
                 let Ok((account, outcome, counts)) = result else {
+                    cx.notify();
                     return;
                 };
                 if let AccountState::Connected { counts: slot, .. } = &mut this.account {
@@ -635,6 +658,7 @@ impl MailApp {
                         this.save_index(&account);
                     }
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -696,17 +720,123 @@ impl MailApp {
     /// a limitation into the right behaviour: a folder nobody opens costs
     /// nothing, and the one they open is populated within a second or so.
     ///
-    /// Refuses to fetch the Starred view, which is a filter over mail already
-    /// indexed from elsewhere rather than a folder with its own contents.
+    /// Populate a folder the first time it is opened.
     fn ensure_mailbox_fetched(&mut self, mailbox: Mailbox, cx: &mut Context<Self>) {
-        if mailbox == Mailbox::Starred || !self.loaded_mailboxes.insert(mailbox) {
+        if self.loaded_mailboxes.contains(&mailbox) {
             return;
         }
+        // Already in the index from an earlier session. Having rows on disk is
+        // not the same as having nothing, so opening the folder should draw
+        // them rather than spend a fetch to redraw the same mail. Mail still
+        // arrives: the poll sync upserts changes whichever folder they land in,
+        // and `fetch_more` pages deeper once the list runs out.
+        if self.store.count(mailbox) > 0 {
+            self.loaded_mailboxes.insert(mailbox);
+            return;
+        }
+        self.fetch_folder(mailbox, false, cx);
+    }
+
+    /// Fetch the next page of the folder on screen, because the user has
+    /// scrolled to the end of it.
+    ///
+    /// Nori holds a window of each folder rather than all of it, and the window
+    /// follows the user down the list rather than sitting behind a control they
+    /// have to find. A row of text at the foot of the list was the alternative
+    /// and it was worse on both counts: it told the user their mail was
+    /// incomplete before they had scrolled far enough to notice, and it put a
+    /// permanent bar under a list that is otherwise just mail.
+    ///
+    /// Two things keep this from spending quota on a runaway. Only one fetch runs
+    /// at a time, and a folder that gives up nothing new is marked exhausted and
+    /// never asked again.
+    fn fetch_more(&mut self, cx: &mut Context<Self>) {
+        let mailbox = self.store.selected_mailbox();
+        if self.syncing || self.exhausted_mailboxes.contains(&mailbox) {
+            return;
+        }
+        self.fetch_folder(mailbox, true, cx);
+    }
+
+    /// Watch the list's scroll position and fetch when it runs out of rows.
+    ///
+    /// Started from `render` rather than from a folder switch, so it comes back
+    /// on its own after the reading view has been opened and closed, and it ends
+    /// when the list is no longer what is on screen. A watcher that outlived the
+    /// list would be a timer running for the rest of the session to poll a scroll
+    /// position nobody is looking at.
+    ///
+    /// This GPUI revision's scroll handle cannot be observed, only read, so it is
+    /// polled. At a quarter of a second that is under the threshold where reading
+    /// a number feels like lag, and it costs nothing when the answer is the same
+    /// one it was a quarter of a second ago.
+    fn watch_for_more(&mut self, cx: &mut Context<Self>) {
+        if self.watching_more || !self.account.is_usable() {
+            return;
+        }
+        self.watching_more = true;
+        let handle = self.inbox_scroll.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                // `true` means this watcher is done and the flag is released, so
+                // the next `render` starts another if the list is still on
+                // screen. The flag is deliberately left *set* on every other
+                // path: clearing it in passing would let a frame start a second
+                // watcher beside this one, and two watchers polling the same
+                // scroll position is how a page gets fetched twice.
+                let stop = this
+                    .update(cx, |this, cx| {
+                        if !matches!(this.store.workspace_view(), WorkspaceView::Mailbox) {
+                            return true;
+                        }
+                        let mailbox = this.store.selected_mailbox();
+                        if this.syncing || this.exhausted_mailboxes.contains(&mailbox) {
+                            return false;
+                        }
+                        // Four rows of slack, so the next page is already on its
+                        // way by the time the last of this one is in view. Waiting
+                        // for the exact final row means the fetch always begins
+                        // after the user has hit the end and stopped.
+                        let held = this.store.count(mailbox);
+                        let last = handle.0.borrow().base_handle.bottom_item();
+                        if held == 0 || last + 4 < held {
+                            return false;
+                        }
+                        this.fetch_more(cx);
+                        false
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    let _ = this.update(cx, |this, _| this.watching_more = false);
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Fetch a folder's mail: its first page when it is opened, the next one
+    /// when the user asks for more.
+    ///
+    /// The two are the same work. What changes is only whether it happens by
+    /// itself, and the skip-what-is-held rule inside `fetch_with` is what makes
+    /// asking twice return mail that is new rather than the same hundred
+    /// again — which is why no page cursor has to be kept, and why this keeps
+    /// working after a restart.
+    ///
+    /// Starred is fetched like any other folder. It used to be skipped on the
+    /// reasoning that it is a filter over mail indexed elsewhere, but with only
+    /// the newest two hundred held that reasoning is wrong: a star put on a
+    /// three-year-old mail is in a folder Nori never fetched, so Starred came
+    /// up empty. Gmail answers `is:starred` the same as any other query, at the
+    /// same cost, so there is nothing to be saved by not asking.
+    fn fetch_folder(&mut self, mailbox: Mailbox, more: bool, cx: &mut Context<Self>) {
         // Same reason as `sync`: two indexers at once overspend the quota
-        // minute. The folder is un-marked so the next visit retries, rather than
-        // being remembered as loaded and never fetched at all.
+        // minute.
         if self.syncing {
-            self.loaded_mailboxes.remove(&mailbox);
             return;
         }
         let Some(address) = self.account.address().map(str::to_string) else {
@@ -715,17 +845,38 @@ impl MailApp {
         let Ok(credentials) = nori_gmail::credentials() else {
             return;
         };
+        // Marked only now that a fetch is genuinely on its way. Doing it before
+        // these checks left a folder looking loaded when nothing was ever
+        // requested, so it was never retried.
+        if !more {
+            self.loaded_mailboxes.insert(mailbox);
+        }
         let Ok(store) = nori_gmail::FileTokenStore::with_account(&address) else {
             return;
         };
         let query = gmail_query(mailbox);
+        // Everything Nori holds, so the fetch walks past it to mail that is not
+        // here yet. Skipping on id rather than on folder is deliberate: a mail
+        // that moved folders is still held, and asking for it again would only
+        // cost quota.
+        let held: std::collections::HashSet<String> = self
+            .store
+            .emails()
+            .iter()
+            .map(|email| email.id.0.clone())
+            .collect();
         let (stream, incoming) = nori_gmail::mail_stream();
         self.sync_stream = Some(stream.clone());
         self.syncing = true;
         self.pump_incoming(incoming, cx);
         let task = cx.background_executor().spawn(async move {
             let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
-            sync.fetch_with(query, nori_gmail::sync::MAILBOX_FETCH_BUDGET, Some(&stream))
+            sync.fetch_with(
+                query,
+                nori_gmail::sync::MAILBOX_FETCH_BUDGET,
+                &held,
+                Some(&stream),
+            )
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -738,9 +889,23 @@ impl MailApp {
                     cx.notify();
                     return;
                 };
+                // Nothing came back, so this folder has given up everything it
+                // has. Saying so by hiding the control is the honest end of it:
+                // there is no page left to ask for. This holds for a first fetch
+                // too, which is how an empty folder stops offering more.
+                if mail.is_empty() {
+                    this.exhausted_mailboxes.insert(mailbox);
+                } else {
+                    this.exhausted_mailboxes.remove(&mailbox);
+                }
                 for remote in &mail {
                     this.store.upsert(to_email(remote, &address));
                 }
+                // Persist the folder, same as a body and a sync. `loaded_mailboxes`
+                // is in-memory only, so a folder that is never written out is
+                // refetched from scratch on every launch — which is why opening
+                // Drafts cost a full ~20s fetch each time instead of nothing.
+                this.save_index(&address);
                 cx.notify();
             });
         })
@@ -880,6 +1045,13 @@ impl MailApp {
             labels,
             counts: None,
         };
+        // The Inbox is on screen without anyone having opened it, and both
+        // branches above put its mail in the store: either from the index on
+        // disk, or a moment from now when the sync lands. Marking it loaded
+        // here is what keeps the first visit to the Inbox from quietly fetching
+        // another page the user never asked for — the control at the foot of the
+        // list is for asking, not for arriving.
+        self.loaded_mailboxes.insert(Mailbox::Inbox);
         cx.notify();
         self.sync(cx);
     }
@@ -1056,6 +1228,9 @@ impl MailApp {
         let Ok(store) = nori_gmail::FileTokenStore::with_account(&account) else {
             return;
         };
+        // The worker only needs the id; this copy is for writing the index back
+        // once the bodies land.
+        let account_for_save = account.clone();
         let task = cx.background_executor().spawn(async move {
             let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
             let bodies = sync.bodies(&[id])?;
@@ -1071,6 +1246,11 @@ impl MailApp {
                         this.store.set_body(&EmailId::from(id.as_str()), body);
                         this.fetch_images_for(&EmailId::from(id.as_str()), cx);
                     }
+                    // Write the index here too. Bodies are part of the cached
+                    // record, so without this the mail you just read is fetched
+                    // again on every launch — the store had it, the file never
+                    // learned that.
+                    this.save_index(&account_for_save);
                     cx.notify();
                 }
             });
@@ -1255,19 +1435,101 @@ impl MailApp {
         }
         self.previous_focus = window.focused(cx);
         let emails = self.store.emails().to_vec();
-        let search = cx.new(|cx| SearchView::new(emails, window, cx));
+        // With an account connected, the answer comes from Gmail, which knows
+        // about all of it. Nori only holds the tail it has synced, and
+        // searching that alone would quietly report "no match" for mail that
+        // exists.
+        let remote = self.account.address().is_some();
+        let search = cx.new(|cx| SearchView::new(emails, remote, window, cx));
         let subscription =
             cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
                 SearchEvent::Open(id) => {
+                    // A hit from Gmail is not in the store — only the folder
+                    // fetches were written there — so bring it across before
+                    // opening, or the reading view has nothing to show.
+                    if this.store.email(id).is_none()
+                        && let Some(view) = &this.search
+                        && let Some(email) = view.read(cx).email(id)
+                    {
+                        this.store.upsert(email);
+                    }
                     this.close_overlay(window, cx);
                     this.open_email(id.clone(), window, cx);
                 }
                 SearchEvent::Dismiss => this.close_overlay(window, cx),
+                SearchEvent::QueryChanged(query) => this.search_gmail(query.clone(), cx),
             });
         self.store.set_overlay(Some(Overlay::Search));
         self.search = Some(search);
         self.subscriptions.push(subscription);
         cx.notify();
+    }
+
+    /// Ask Gmail what matches, once the typing has settled.
+    ///
+    /// The pause is the point: a search costs 20 units per message, and one per
+    /// keystroke would burn the quota on prefixes nobody meant to search for.
+    fn search_gmail(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        let Some(address) = self.account.address().map(str::to_string) else {
+            return;
+        };
+        let Ok(credentials) = nori_gmail::credentials() else {
+            return;
+        };
+        let Ok(store) = nori_gmail::FileTokenStore::with_account(&address) else {
+            return;
+        };
+        let (stream, incoming) = nori_gmail::mail_stream();
+        self.search_stream = Some(stream.clone());
+        // The raw text goes straight through: Gmail's own search operators
+        // (`from:`, `after:`, `has:attachment`) are worth having, and Nori has
+        // no business second-guessing a query the user can see.
+        let trimmed = query.trim().to_string();
+        self.pump_search_results(incoming, query, generation, cx);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(350))
+                .await;
+            // The wait is over; if the user typed on, this is an answer to a
+            // question they have already moved past.
+            let superseded = this
+                .update(cx, |this, _| this.search_generation != generation)
+                .unwrap_or(true);
+            if superseded {
+                return;
+            }
+            let task = cx.background_executor().spawn(async move {
+                let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
+                sync.fetch_with(
+                    &trimmed,
+                    nori_gmail::sync::SEARCH_BUDGET,
+                    &std::collections::HashSet::new(),
+                    Some(&stream),
+                )
+            });
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                // Only the newest search is allowed to call it finished; an
+                // older one landing now would switch the line off while a newer
+                // request is still out.
+                if this.search_generation != generation {
+                    return;
+                }
+                this.search_stream = None;
+                if let Some(view) = &this.search {
+                    view.update(cx, |view, cx| match result {
+                        // A failed search says so. Falling through to "nothing
+                        // matches" would report a confident lie about the
+                        // user's own mail.
+                        Err(error) => view.set_error(error.to_string(), cx),
+                        Ok(_) => view.set_searching(false, cx),
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1759,19 +2021,32 @@ impl MailApp {
         .into_any_element()
     }
 
-    /// The list, with the fetch counter beneath it.
+    /// The list.
     ///
-    /// Nothing is drawn in place of the list while mail loads. Each message goes
-    /// into the store the moment it comes back from Gmail, so the inbox fills
-    /// in with real rows as the fetch runs.
+    /// Nothing is drawn in place of the list while mail loads, and nothing
+    /// is wrapped around it either. Each message goes into the store the
+    /// moment it comes back from Gmail, so the inbox fills in with real rows
+    /// as the fetch runs — the fetching is visible without a thing drawn
+    /// to say so. An earlier version wrapped the list in a column to carry a
+    /// progress counter, and the wrapper collapsed the list to zero height for
+    /// the whole length of every sync, blanking the inbox at exactly the
+    /// moment it was being waited on.
+    /// The list.
     ///
-    /// Deliberately returns the list with no wrapper. An earlier version
-    /// wrapped it in a column to carry the fetch counter, and that wrapper
-    /// collapsed the list to zero height for the whole length of every sync —
-    /// blanking the inbox at exactly the moment it was being waited on. The
-    /// counter is a sibling of the split instead, so nothing ever wraps the
-    /// list.
+    /// Nothing is drawn in place of the list while mail loads, and — just as
+    /// importantly — nothing is wrapped around it. Each message goes into the
+    /// store the moment it comes back from Gmail, so the inbox fills in with
+    /// real rows as the fetch runs; the fetching is visible without a thing
+    /// drawn to say so.
+    ///
+    /// A wrapper here is a trap worth recording, because it has been built
+    /// twice. Putting the list inside a column to carry something beneath it
+    /// collapses the list to zero height for the whole length of every sync, so
+    /// the affordance is bought with a blank inbox at the exact moment the
+    /// inbox is being waited on. Whatever belongs below the list belongs below
+    /// the split that contains it; see the call in `render`.
     fn render_list(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.watch_for_more(cx);
         self.render_inbox(cx)
     }
 
@@ -1795,16 +2070,27 @@ impl MailApp {
                 batch.clear();
                 let open = nori_gmail::drain(&mut incoming, &mut batch);
                 let arrived = !batch.is_empty();
-                let _ = this.update(cx, |this, cx| {
-                    for remote in batch.drain(..) {
-                        this.store
-                            .upsert(crate::model::to_email(&remote, this.fetch_account()));
-                    }
-                    if arrived {
-                        cx.notify();
-                    }
-                });
-                if !open && !arrived {
+                // Two ways out, and both are needed. A full fetch closes the
+                // stream, so the channel reports disconnected. An incremental one
+                // never does — it is a handful of ids already known, and there
+                // is nothing to hand over as it arrives — so the only signal
+                // that it has finished is `syncing` going false. Watching the
+                // channel alone leaves this loop waking sixteen times a second
+                // for the rest of the session, which is not a crash but is a
+                // background timer that can never be idle and never stops.
+                let finished = this
+                    .update(cx, |this, cx| {
+                        if arrived {
+                            for remote in batch.drain(..) {
+                                this.store
+                                    .upsert(crate::model::to_email(&remote, this.fetch_account()));
+                            }
+                            cx.notify();
+                        }
+                        !this.syncing
+                    })
+                    .unwrap_or(true);
+                if finished || (!open && !arrived) {
                     break;
                 }
             }
@@ -1818,15 +2104,53 @@ impl MailApp {
         self.account.address().unwrap_or_default()
     }
 
-    /// The "34 of 80" line, only while a fetch is running.
-    fn render_sync_counter(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if !self.syncing {
-            return None;
-        }
-        Some(crate::views::syncing::counter(
-            Theme::current(cx),
-            self.sync_stream.as_ref().and_then(|stream| stream.label()),
-        ))
+    /// Move search hits from the request into the dialog, as they arrive.
+    ///
+    /// Separate from [`Self::pump_incoming`] because search mail must not land
+    /// in the store: a hit may be from a folder Nori has never opened, and
+    /// writing it in would have the sidebar claim a message the Inbox does not
+    /// hold. So the results go to the dialog and nowhere else, and the reading
+    /// view is handed the one that gets opened.
+    fn pump_search_results(
+        &self,
+        mut incoming: nori_gmail::IncomingMail,
+        query: String,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let account = self.fetch_account().to_string();
+        cx.spawn(async move |this, cx| {
+            let mut batch = Vec::new();
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(60))
+                    .await;
+                batch.clear();
+                let open = nori_gmail::drain(&mut incoming, &mut batch);
+                let arrived = !batch.is_empty();
+                let account = account.clone();
+                let query = query.clone();
+                let _ = this.update(cx, |this, cx| {
+                    if this.search_generation != generation {
+                        return;
+                    }
+                    if !arrived {
+                        return;
+                    }
+                    let found: Vec<_> = batch
+                        .drain(..)
+                        .map(|remote| crate::model::to_email(&remote, &account))
+                        .collect();
+                    if let Some(view) = &this.search {
+                        view.update(cx, |view, cx| view.add_results(&query, found, cx));
+                    }
+                });
+                if !open && !arrived {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -1849,13 +2173,10 @@ impl Render for MailApp {
         let create_label_entity = entity.clone();
         let delete_label_entity = entity.clone();
         let rename_label_entity = entity.clone();
-        // From the server when the account is connected, so a folder Nori has
-        // not downloaded yet still shows what it holds rather than a zero that
-        // reads as lost mail. Falls back to the local index otherwise, which is
-        // what sample mail needs.
         let counts: [usize; 6] = std::array::from_fn(|index| {
             let mailbox = Mailbox::NAV_ITEMS[index];
-            self.account.count_of(mailbox, self.store.count(mailbox))
+            self.account
+                .count_of(mailbox, self.store.unread_count(mailbox))
         });
         let sidebar = Sidebar::new(
             self.store.selected_mailbox(),
@@ -2228,13 +2549,7 @@ impl Render for MailApp {
                                     compose_pane.filter(|_| !settings_open),
                                     |this, pane| this.child(pane),
                                 ),
-                        )
-                        // The fetch counter, below the split rather than around
-                        // the list: it sizes to its own text and the list keeps
-                        // the full height of whatever is left.
-                        .when_some(self.render_sync_counter(cx), |this, counter| {
-                            this.child(div().flex_none().child(counter))
-                        }),
+                        ),
                 ),
             )
             .when(!settings_open, |this| {
@@ -3318,6 +3633,171 @@ mod tests {
             chip.size.width > gpui::px(0.),
             "the chip must have a real width: {chip:?}"
         );
+    }
+
+    /// A folder that is already in the index must not be fetched again.
+    ///
+    /// `loaded_mailboxes` lives in memory, so after a restart every folder looks
+    /// unvisited and costs a full fetch. Having rows on disk is the difference
+    /// between opening Drafts instantly and waiting out a page of Gmail.
+    #[gpui::test]
+    fn a_folder_already_in_the_index_is_not_refetched(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        // A cold start: nothing fetched, no account, so any fetch would be a no-op
+        // we can still observe via the loaded set.
+        assert!(!app.read_with(&cx, |app, _| {
+            app.loaded_mailboxes.contains(&Mailbox::Drafts)
+        }));
+
+        // Launch state: the index handed us five drafts.
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                let drafts: Vec<crate::model::Email> = (0..5)
+                    .map(|n| crate::model::Email {
+                        id: EmailId(format!("d{n}").leak().to_string()),
+                        sender: "Me".to_string(),
+                        subject: format!("Draft {n}"),
+                        mailbox: Mailbox::Drafts,
+                        ..Default::default()
+                    })
+                    .collect();
+                this.store.restore(drafts, None);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.ensure_mailbox_fetched(Mailbox::Drafts, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(&cx, |app, _| app
+                .loaded_mailboxes
+                .contains(&Mailbox::Drafts)),
+            "a folder with mail on disk counts as loaded"
+        );
+        assert!(
+            !app.read_with(&cx, |app, _| app.syncing),
+            "no fetch should have been started for a folder already held"
+        );
+    }
+
+    /// An empty folder still fetches: nothing on disk means nothing to draw.
+    #[gpui::test]
+    fn an_empty_folder_still_fetches(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        // Sample mail ships drafts, so start from a genuinely empty store.
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.store.restore(Vec::new(), None);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            app.read_with(&cx, |app, _| app.store.count(Mailbox::Drafts)),
+            0,
+            "the store must be empty for this test to mean anything"
+        );
+
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.ensure_mailbox_fetched(Mailbox::Drafts, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !app.read_with(&cx, |app, _| app
+                .loaded_mailboxes
+                .contains(&Mailbox::Drafts)),
+            "a folder with nothing cached must still be fetched"
+        );
+    }
+
+    /// A body that has been read must reach the index file, or the next launch
+    /// fetches it again. The store had it; the cache is the part that was
+    /// being dropped.
+    #[gpui::test]
+    fn a_fetched_body_is_written_to_the_index(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        let dir = std::env::temp_dir().join(format!("nori-index-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("account.index.json");
+        let cache = IndexCache::new(&path);
+
+        let blocks = nori_gmail::text_blocks(vec!["A body that was fetched.".to_string()]);
+
+        // What the fetch path does: attach the body, then persist.
+        cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                this.store.restore(
+                    vec![crate::model::Email {
+                        id: EmailId("cached-1".to_string()),
+                        sender: "Sender".to_string(),
+                        subject: "Subject".to_string(),
+                        mailbox: Mailbox::Inbox,
+                        ..Default::default()
+                    }],
+                    Some("cursor".to_string()),
+                );
+                this.store
+                    .set_body(&EmailId::from("cached-1"), blocks.clone());
+                let _ = cache.save(&crate::model::Index {
+                    account: "me@example.com".to_string(),
+                    emails: this.store.snapshot(),
+                    labels: Vec::new(),
+                    assignments: Vec::new(),
+                    history_id: this.store.synced_history_id().map(str::to_string),
+                });
+            });
+        });
+
+        let written = std::fs::read_to_string(&path).expect("index written");
+        assert!(
+            written.contains("A body that was fetched."),
+            "the fetched body must be in the file, not just in memory: {written}"
+        );
+
+        // And it must read back as a loaded body, so no fetch is needed.
+        let reloaded = cache
+            .load("me@example.com")
+            .expect("index loads for this account");
+        let mail = &reloaded.emails[0];
+        assert!(mail.body_loaded, "a cached body counts as loaded");
+        assert_eq!(mail.body, blocks);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The list must draw rows both when idle and while a sync is in flight.

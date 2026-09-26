@@ -23,10 +23,9 @@ pub enum AccountState {
         /// Mails in the local index, for the pane's summary.
         mail: usize,
         labels: usize,
-        /// What each folder holds on the server. Shown in the sidebar in place
-        /// of counting the local index, because a folder Nori has not
-        /// downloaded yet would otherwise read as empty — which is not the same
-        /// thing as holding nothing, and looks like lost mail.
+        /// What each folder holds on the server. The sidebar's badge for every
+        /// folder but the Inbox, which counts what Nori holds instead — see
+        /// [`AccountState::count_of`].
         counts: Option<nori_gmail::FolderCounts>,
     },
     /// The grant is no longer valid. Expected in a Testing-mode app every
@@ -54,17 +53,28 @@ impl AccountState {
         matches!(self, Self::Connected { .. })
     }
 
-    /// How many mails a folder holds, for the sidebar.
+    /// The badge beside a folder in the sidebar.
     ///
-    /// Falls back to counting the local index when the server's figures are not
-    /// to hand, which is the right answer for sample mail and the only one
-    /// available before the first label read.
-    pub fn count_of(&self, mailbox: Mailbox, local: usize) -> usize {
+    /// The Inbox is the exception, and it is the exception because of what its
+    /// number is for. Six thousand unread is not a figure anyone acts on, and
+    /// Nori cannot stand behind it either: only the tail of the Inbox is held,
+    /// so the badge would be advertising mail that cannot be opened, scrolled to
+    /// or searched. Unread-and-held is a number the list can keep.
+    ///
+    /// Every other folder is the opposite case, which is why it is the opposite
+    /// case. They are small, they are fetched whole when opened, and their count
+    /// is an honest measure of how much is left below the fold — so they say
+    /// it. Before the folders were fetched this way they had nothing to show at
+    /// all, and a blank sidebar next to a full mailbox read as lost mail.
+    pub fn count_of(&self, mailbox: Mailbox, unread_held: usize) -> usize {
+        if mailbox == Mailbox::Inbox {
+            return unread_held;
+        }
         let Some(counts) = self.folder_counts() else {
-            return local;
+            return unread_held;
         };
         let count = match mailbox {
-            Mailbox::Inbox => counts.inbox,
+            Mailbox::Inbox => unreachable!("handled above"),
             Mailbox::Starred => counts.starred,
             Mailbox::Sent => counts.sent,
             Mailbox::Drafts => counts.drafts,

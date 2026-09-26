@@ -338,15 +338,34 @@ impl MailStore {
             .collect()
     }
 
+    /// Mail Nori holds in a folder, read or not.
     pub fn count(&self, mailbox: Mailbox) -> usize {
         self.emails
             .iter()
-            .filter(|email| match mailbox {
-                Mailbox::Inbox => email.mailbox == Mailbox::Inbox,
-                Mailbox::Starred => email.starred,
-                mailbox => email.mailbox == mailbox,
-            })
+            .filter(|email| Self::in_folder(email, mailbox))
             .count()
+    }
+
+    /// Unread mail Nori actually holds in a folder.
+    ///
+    /// This is what the sidebar badge counts, deliberately. Gmail will happily
+    /// report that an Inbox holds six thousand messages, and a badge saying so
+    /// is worse than useless here: Nori has only synced the tail of it, so the
+    /// number advertises mail that cannot be opened, scrolled to, or searched.
+    /// Counting what is held makes the badge a promise Nori can keep.
+    pub fn unread_count(&self, mailbox: Mailbox) -> usize {
+        self.emails
+            .iter()
+            .filter(|email| email.unread && Self::in_folder(email, mailbox))
+            .count()
+    }
+
+    fn in_folder(email: &Email, mailbox: Mailbox) -> bool {
+        match mailbox {
+            Mailbox::Inbox => email.mailbox == Mailbox::Inbox,
+            Mailbox::Starred => email.starred,
+            mailbox => email.mailbox == mailbox,
+        }
     }
 
     pub fn visible_summaries(&self) -> Vec<EmailSummary> {
