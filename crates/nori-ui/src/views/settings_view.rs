@@ -1,13 +1,13 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, IntoElement, ParentElement, Render, Role,
-    ScrollHandle, SharedString, Window, div, prelude::*, px, transparent_black,
+    App, Context, EventEmitter, FocusHandle, IntoElement, ParentElement, Render, Role,
+    ScrollHandle, SharedString, Subscription, Window, div, prelude::*, px, transparent_black,
 };
 
 use crate::actions::{Dismiss, SETTINGS_NAV_CONTEXT, SelectNextSection, SelectPreviousSection};
-use crate::components::{Icon, TextField, ToggleSwitch};
-use crate::model::{Setting, SettingsPage, SettingsState};
+use crate::components::{Button, Icon, ToggleSwitch};
+use crate::model::{AccountState, Setting, SettingsPage, SettingsState};
 use crate::theme::Theme;
 
 /// Reports one setting's intended value to the app that owns the state.
@@ -15,6 +15,12 @@ type SetSettingHandler = Rc<dyn Fn(Setting, bool, &mut App) + 'static>;
 /// Reports the page the user picked to the app that owns the state, which is
 /// also the app that names it in the top bar.
 type SetPageHandler = Rc<dyn Fn(SettingsPage, &mut App) + 'static>;
+/// Asks the app to begin an OAuth sign-in. The app owns the browser, the
+/// loopback listener and the token store; this view only reports the intent,
+/// the same way a setting reports its value rather than applying it.
+type SignInHandler = Rc<dyn Fn(&mut App) + 'static>;
+/// Asks the app to forget the account.
+type SignOutHandler = Rc<dyn Fn(&mut App) + 'static>;
 
 /// The page column sits beside the mail sidebar rather than replacing it, so
 /// it is narrower than a sidebar and carries no back row.
@@ -36,20 +42,31 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 /// neighbours rather than things it hides. The pages, rows, and defaults are
 /// Nori's own.
 pub struct SettingsView {
-    theme: Theme,
+    /// Kept so a change to the theme global repaints this view. The light mode
+    /// switch lives on this page, so without it the row that was just flipped
+    /// would keep drawing the old palette.
+    _theme_sub: Subscription,
     page: SettingsPage,
     /// A copy of the app's settings. Edits are reported upward through
     /// `on_set` rather than applied here, so the mail list behind this view
     /// sees the change and this view never becomes a second source of truth.
     state: SettingsState,
+    /// How the connected account reads. Held here rather than in `MailApp` so
+    /// the page can be rendered and tested without an account behind it.
+    account: AccountState,
     on_set: SetSettingHandler,
     on_page: SetPageHandler,
-    search: Entity<TextField>,
+    on_sign_in: SignInHandler,
+    on_sign_out: SignOutHandler,
     nav_focus: FocusHandle,
     scroll: ScrollHandle,
 }
 
 impl SettingsView {
+    // The view reports intent upward rather than owning it, so the app stays
+    // the single writer. That means a callback per concern, and this is the
+    // fourth; grouping them would only move the list somewhere else.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -57,19 +74,29 @@ impl SettingsView {
         page: SettingsPage,
         on_set: impl Fn(Setting, bool, &mut App) + 'static,
         on_page: impl Fn(SettingsPage, &mut App) + 'static,
+        account: AccountState,
+        on_sign_in: impl Fn(&mut App) + 'static,
+        on_sign_out: impl Fn(&mut App) + 'static,
     ) -> Self {
         let on_set: SetSettingHandler = Rc::new(on_set);
         let on_page: SetPageHandler = Rc::new(on_page);
-        let search = cx.new(|cx| TextField::new("settings-search", "Settings", "", true, 1, cx));
+        let on_sign_in: SignInHandler = Rc::new(on_sign_in);
+        let on_sign_out: SignOutHandler = Rc::new(on_sign_out);
         let nav_focus = cx.focus_handle().tab_index(0).tab_stop(true);
-        window.focus(&search.read(cx).focus_handle(), cx);
+        // The page column takes focus, not a text field: with no search to type
+        // into, the column itself is the only thing here that wants keyboard
+        // focus, and it is what the arrow keys drive.
+        window.focus(&nav_focus, cx);
+        let theme_sub = cx.observe_global::<Theme>(|_, cx| cx.notify());
         Self {
-            theme: Theme::dark(),
+            _theme_sub: theme_sub,
             page,
             state,
+            account,
             on_set,
             on_page,
-            search,
+            on_sign_in,
+            on_sign_out,
             nav_focus,
             scroll: ScrollHandle::new(),
         }
@@ -82,23 +109,9 @@ impl SettingsView {
         self.nav_focus.clone()
     }
 
-    /// The page list narrowed by the nav search, trimmed and lowercased.
-    fn query(&self, cx: &App) -> String {
-        self.search.read(cx).content().trim().to_lowercase()
-    }
-
-    fn visible_pages(&self, cx: &App) -> Vec<SettingsPage> {
-        SettingsPage::visible(&self.query(cx))
-    }
-
-    /// Step the selected page through the rows the search leaves visible,
-    /// wrapping at both ends. A page filtered out by the query re-enters the
-    /// list from whichever end the key came from.
+    /// Step the selected page through the list, wrapping at both ends.
     fn cycle_page(&mut self, direction: i32, cx: &mut Context<Self>) {
-        let pages = self.visible_pages(cx);
-        if pages.is_empty() {
-            return;
-        }
+        let pages = SettingsPage::ALL;
         let current = pages.iter().position(|page| *page == self.page);
         let next = match current {
             Some(index) => (index as i32 + direction).rem_euclid(pages.len() as i32) as usize,
@@ -129,10 +142,10 @@ impl SettingsView {
     /// switch on the trailing edge stays put however wide the window gets.
     fn render_row_text(
         &self,
+        theme: Theme,
         title: impl Into<SharedString>,
         description: impl Into<SharedString>,
     ) -> gpui::AnyElement {
-        let theme = self.theme;
         div()
             .max_w(px(DESCRIPTION_MAX_WIDTH))
             .min_w_0()
@@ -154,11 +167,11 @@ impl SettingsView {
     /// A note-only row: label and description, no control.
     fn render_note_row(
         &self,
+        theme: Theme,
         title: impl Into<SharedString>,
         description: impl Into<SharedString>,
         is_last: bool,
     ) -> gpui::AnyElement {
-        let theme = self.theme;
         div()
             .w_full()
             .flex_none()
@@ -174,7 +187,7 @@ impl SettingsView {
             } else {
                 theme.hairline
             })
-            .child(self.render_row_text(title, description))
+            .child(self.render_row_text(theme, title, description))
             .into_any_element()
     }
 
@@ -185,7 +198,7 @@ impl SettingsView {
         is_last: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = self.theme;
+        let theme = Theme::current(cx);
         let on = self.state.get(setting);
         let id = toggle_id(setting);
         let label = SharedString::from(setting.label());
@@ -208,32 +221,34 @@ impl SettingsView {
             } else {
                 theme.hairline
             })
+            .child(div().flex_1().min_w_0().child(self.render_row_text(
+                theme,
+                setting.label(),
+                setting.description(),
+            )))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(self.render_row_text(setting.label(), setting.description())),
-            )
-            .child(
-                ToggleSwitch::new(id, label, on)
-                    .theme(theme)
-                    .on_toggle(move |_window, cx| {
-                        // Report the value the switch is moving to, and keep
-                        // the local copy in step so the switch redraws from
-                        // the same state the app now holds.
-                        (on_set)(setting, next, cx);
-                        entity.update(cx, |this, cx| {
-                            this.state.set(setting, next);
-                            cx.notify();
-                        })
-                    }),
+                ToggleSwitch::new(id, label, on).on_toggle(move |_window, cx| {
+                    // Report the value the switch is moving to, and keep
+                    // the local copy in step so the switch redraws from
+                    // the same state the app now holds.
+                    (on_set)(setting, next, cx);
+                    entity.update(cx, |this, cx| {
+                        this.state.set(setting, next);
+                        cx.notify();
+                    })
+                }),
             )
             .into_any_element()
     }
 
     /// A read-only key/value line, for facts rather than controls.
-    fn render_value_row(&self, key: &'static str, value: &str, is_last: bool) -> gpui::AnyElement {
-        let theme = self.theme;
+    fn render_value_row(
+        &self,
+        theme: Theme,
+        key: &'static str,
+        value: &str,
+        is_last: bool,
+    ) -> gpui::AnyElement {
         div()
             .px(px(24.))
             .py(px(10.))
@@ -269,8 +284,7 @@ impl SettingsView {
     /// A page heading, so the content still names itself now that its own
     /// header bar is gone. The page column already shows which page is
     /// selected; this is the anchor for the eye when reading the rows.
-    fn render_page_heading(&self) -> gpui::AnyElement {
-        let theme = self.theme;
+    fn render_page_heading(&self, theme: Theme) -> gpui::AnyElement {
         div()
             .w_full()
             .flex_none()
@@ -285,9 +299,11 @@ impl SettingsView {
     }
 
     fn render_general(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::current(cx);
         div()
-            .child(self.render_page_heading())
+            .child(self.render_page_heading(theme))
             .child(self.render_note_row(
+                theme,
                 "Local by default",
                 "Nori keeps your mail on this machine. Nothing is uploaded, and this \
                  prototype ships with a bundled set of sample messages rather than a \
@@ -301,12 +317,18 @@ impl SettingsView {
     }
 
     fn render_appearance(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::current(cx);
         div()
-            .child(self.render_page_heading())
+            .child(self.render_page_heading(theme))
+            // First on the page because it is the one setting here that
+            // changes every other row on screen.
+            .child(self.render_toggle_row(Setting::LightMode, false, cx))
             .child(self.render_note_row(
-                "One palette today",
-                "Nori ships a single dark palette. The tokens live in theme.rs, so a \
-                 second palette is a matter of adding one alongside it.",
+                theme,
+                "Two palettes",
+                "Both palettes live side by side in theme.rs. The switch republishes \
+                 the theme global, so every open view redraws from the new tokens \
+                 rather than from a copy it was handed earlier.",
                 false,
             ))
             .child(self.render_toggle_row(Setting::CompactRows, false, cx))
@@ -315,50 +337,197 @@ impl SettingsView {
     }
 
     fn render_mail(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::current(cx);
         div()
-            .child(self.render_page_heading())
+            .child(self.render_page_heading(theme))
             .child(self.render_toggle_row(Setting::OpenInTab, false, cx))
             .child(self.render_toggle_row(Setting::GroupConversations, false, cx))
             .child(self.render_toggle_row(Setting::ShowAttachments, true, cx))
             .into_any_element()
     }
 
+    /// The account page.
+    ///
+    /// The rows say what is actually connected and where the token lives,
+    /// rather than describing a sign-in that does not exist. `Storage` naming
+    /// "in memory, resets on quit" was true only while the prototype read
+    /// sample mail, and leaving it there next to a real account would be a lie
+    /// about where a refresh token is kept.
     fn render_account(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::current(cx);
+        let mut rows: Vec<gpui::AnyElement> = vec![self.render_page_heading(theme)];
+
+        match &self.account {
+            AccountState::Disconnected => {
+                rows.push(self.render_note_row(
+                    theme,
+                    "No account connected",
+                    "Sign in to sync a Gmail mailbox. Nori reads mail on your own \
+                     machine and sends nothing to any server of ours.",
+                    false,
+                ));
+                rows.push(self.render_value_row(theme, "Address", "Not connected", false));
+                rows.push(self.render_value_row(
+                    theme,
+                    "Storage",
+                    "Token file, created on first sign-in",
+                    false,
+                ));
+                rows.push(self.render_sign_in_button("Sign in with Gmail"));
+            }
+            AccountState::Connecting => {
+                rows.push(self.render_note_row(
+                    theme,
+                    "Waiting for the browser",
+                    "Finish signing in the tab that just opened, then come back \
+                     here. Nori is listening for the redirect.",
+                    false,
+                ));
+            }
+            AccountState::Connected {
+                address,
+                mail,
+                labels,
+                ..
+            } => {
+                rows.push(self.render_note_row(
+                    theme,
+                    address.clone(),
+                    "Synced. Mail and labels are read on demand, and read state \
+                     and stars are written back.",
+                    false,
+                ));
+                rows.push(self.render_value_row(
+                    theme,
+                    "Synced",
+                    &format!("{mail} messages, {labels} labels"),
+                    false,
+                ));
+                rows.push(self.render_value_row(
+                    theme,
+                    "Refresh",
+                    if self.account.is_usable() {
+                        "On open, and every few minutes"
+                    } else {
+                        "Paused until the account is usable"
+                    },
+                    false,
+                ));
+                rows.push(self.render_sign_out_button());
+            }
+            AccountState::NeedsReauth { address } => {
+                // Expected, not exceptional: an app in Google's "Testing"
+                // publishing status has its refresh tokens expire after seven
+                // days by design.
+                rows.push(self.render_note_row(
+                    theme,
+                    format!("{address} needs to sign in again"),
+                    "Google expires the token after about a week while the app is \
+                     unverified. Nothing was lost — signing in again picks up where \
+                     it left off.",
+                    false,
+                ));
+                rows.push(self.render_sign_in_button("Sign in again"));
+            }
+            AccountState::Failed { reason } => {
+                rows.push(self.render_note_row(theme, "Could not connect", reason.clone(), false));
+                rows.push(self.render_sign_in_button("Try again"));
+            }
+        }
+
+        rows.push(self.render_toggle_row(Setting::CheckForMail, false, cx));
+        rows.push(self.render_toggle_row(Setting::ReadReceipts, true, cx));
+        div().children(rows).into_any_element()
+    }
+
+    /// Square and flush left, matching the rows above it rather than sitting
+    /// in a card of its own.
+    fn render_sign_in_button(&self, label: &'static str) -> gpui::AnyElement {
+        let on_sign_in = self.on_sign_in.clone();
         div()
-            .child(self.render_page_heading())
-            .child(self.render_note_row(
-                "No account connected",
-                "The prototype reads its sample messages from memory, so there is no \
-                 sign-in to configure yet.",
-                false,
-            ))
-            .child(self.render_value_row("Address", "me@example.com", false))
-            .child(self.render_value_row("Storage", "In memory, resets on quit", false))
-            .child(self.render_toggle_row(Setting::CheckForMail, false, cx))
-            .child(self.render_toggle_row(Setting::ReadReceipts, true, cx))
+            .px(px(24.))
+            // The same height as a toggle row, with the button centred in it.
+            // At its own padding the row was 48px next to a 74px toggle row
+            // whose label sits centred, so the button looked pinned to the row
+            // above with a void under it. Matching the height puts equal space
+            // above and below the button and keeps the page's rhythm even.
+            .min_h(px(60.))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .debug_selector(|| "account-sign-in".to_string())
+                    // A flex row, so the button becomes a flex *item* and
+                    // shrinks to its label. Left as a block box the button is
+                    // block-level too and fills the whole content pane, which
+                    // is what turned a primary action into a full-width slab.
+                    .flex()
+                    .child(
+                        Button::new("account-sign-in", label)
+                            .style(crate::components::ButtonStyle::Accent)
+                            .on_click(move |_event, _window, cx| on_sign_in(cx)),
+                    )
+                    .id("account-sign-in-wrap"),
+            )
+            .id("account-sign-in-row")
             .into_any_element()
     }
 
-    fn render_about(&mut self) -> gpui::AnyElement {
+    fn render_sign_out_button(&self) -> gpui::AnyElement {
+        let on_sign_out = self.on_sign_out.clone();
         div()
-            .child(self.render_page_heading())
+            .px(px(24.))
+            .min_h(px(60.))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .debug_selector(|| "account-sign-out".to_string())
+                    .flex()
+                    .child(
+                        Button::new("account-sign-out", "Disconnect")
+                            // `Subtle`, not the `Ghost` default. A ghost button
+                            // is a transparent background, a transparent border
+                            // and muted text, which reads as a label rather than
+                            // something you can press. `Subtle` gives it a
+                            // surface and a real border, and keeps the sign-in
+                            // button as the only filled `Accent` on the page.
+                            .style(crate::components::ButtonStyle::Subtle)
+                            .on_click(move |_event, _window, cx| on_sign_out(cx)),
+                    )
+                    .id("account-sign-out-wrap"),
+            )
+            .id("account-sign-out-row")
+            .into_any_element()
+    }
+
+    fn render_about(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::current(cx);
+        div()
+            .child(self.render_page_heading(theme))
             .child(self.render_note_row(
+                theme,
                 "Nori",
                 "A native mail client prototype built with GPUI. The sample mail, the \
                  settings above, and these facts are all part of the prototype.",
                 false,
             ))
-            .child(self.render_value_row("Version", env!("CARGO_PKG_VERSION"), false))
-            .child(self.render_value_row("Interface", "GPUI (Rust)", false))
-            .child(self.render_value_row("Source", "crates/nori-ui, crates/nori-desktop", true))
+            .child(self.render_value_row(theme, "Version", env!("CARGO_PKG_VERSION"), false))
+            .child(self.render_value_row(theme, "Interface", "GPUI (Rust)", false))
+            .child(self.render_value_row(
+                theme,
+                "Source",
+                "crates/nori-ui, crates/nori-desktop",
+                true,
+            ))
             .into_any_element()
     }
 
     // ----- columns --------------------------------------------------------
 
     fn render_nav(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = self.theme;
-        let pages = self.visible_pages(cx);
+        let theme = Theme::current(cx);
+        let pages = SettingsPage::ALL;
         let current = self.page;
 
         div()
@@ -373,13 +542,9 @@ impl SettingsView {
             .bg(theme.chrome)
             .border_r_1()
             .border_color(theme.border)
-            .child(
-                // No back row and no heading: the mail sidebar sits right next
-                // to this column and any mailbox is a way out, as is Escape.
-                // The field's own placeholder names what the column holds.
-                div().px(px(10.)).pt(px(10.)).child(self.search.clone()),
-            )
-            .child(div().h(px(12.)).flex_none())
+            // Just the page list. There is no search field and no heading: the
+            // mail sidebar sits right next to this column, so any mailbox is a
+            // way out, as is Escape, and the column needs no label of its own.
             .child(
                 div()
                     .id("settings-nav-list")
@@ -390,17 +555,11 @@ impl SettingsView {
                     // hover wash run the full width of the column, edge to
                     // edge. The rows carry their own inner padding, so the
                     // labels stay inset while the highlight does not.
+                    //
+                    // No top pad either: the column has no header of its own,
+                    // so a pad here would just push the first page down from
+                    // the top bar.
                     .pb(px(10.))
-                    .when(pages.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .px(px(11.))
-                                .py(px(8.))
-                                .text_size(px(12.5))
-                                .text_color(theme.faint)
-                                .child("No settings match"),
-                        )
-                    })
                     .children(pages.into_iter().map(|page| {
                         let selected = page == current;
                         div()
@@ -448,13 +607,13 @@ impl SettingsView {
     }
 
     fn render_content(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = self.theme;
+        let theme = Theme::current(cx);
         let body: gpui::AnyElement = match self.page {
             SettingsPage::General => self.render_general(cx),
             SettingsPage::Appearance => self.render_appearance(cx),
             SettingsPage::Mail => self.render_mail(cx),
             SettingsPage::Account => self.render_account(cx),
-            SettingsPage::About => self.render_about(),
+            SettingsPage::About => self.render_about(cx),
         };
 
         div()
@@ -486,7 +645,7 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = Theme::current(cx);
         let entity = cx.entity();
         div()
             .id("settings")
@@ -533,6 +692,9 @@ mod tests {
                         SettingsPage::General,
                         |_, _, _| {},
                         |_, _| {},
+                        AccountState::default(),
+                        |_| {},
+                        |_| {},
                     )
                 })
             })
@@ -608,6 +770,9 @@ mod tests {
                         SettingsPage::General,
                         |_, _, _| {},
                         move |page, _cx| sink.borrow_mut().push(page),
+                        AccountState::default(),
+                        |_| {},
+                        |_| {},
                     )
                 })
             })
@@ -647,6 +812,9 @@ mod tests {
                             sink.borrow_mut().push((setting, enabled));
                         },
                         |_, _| {},
+                        AccountState::default(),
+                        |_| {},
+                        |_| {},
                     )
                 })
             })

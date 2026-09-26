@@ -1,5 +1,5 @@
 use gpui::{
-    App, ClickEvent, IntoElement, RenderOnce, Role, SharedString, Stateful, Window, div,
+    App, ClickEvent, Hsla, IntoElement, RenderOnce, Role, SharedString, Stateful, Window, div,
     prelude::*, px, transparent_black,
 };
 
@@ -104,8 +104,8 @@ impl Button {
 }
 
 impl RenderOnce for Button {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let theme = Theme::dark();
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = Theme::current(cx);
         let aria_label = self.aria_label.unwrap_or_else(|| self.label.clone());
         let (background, hover, active, foreground, border) = match self.style {
             ButtonStyle::Ghost => (
@@ -122,7 +122,23 @@ impl RenderOnce for Button {
                 theme.text,
                 theme.hairline_strong,
             ),
-            ButtonStyle::Accent => (theme.text, theme.text, theme.text, theme.canvas, theme.text),
+            ButtonStyle::Accent => {
+                // A filled accent button. The base is the accent itself, which
+                // is what the name always implied — it used to fill with
+                // `text` instead, which painted a near-white slab in dark mode
+                // and a near-black one in light.
+                // Hover and press step the accent's lightness so the button
+                // still answers the pointer, which a same-colour pair would not.
+                let lifted = Hsla {
+                    l: (theme.accent.l * 1.08).min(1.),
+                    ..theme.accent
+                };
+                let sunk = Hsla {
+                    l: theme.accent.l * 0.92,
+                    ..theme.accent
+                };
+                (theme.accent, lifted, sunk, theme.on_accent, theme.accent)
+            }
         };
         let height = if self.dense { px(22.) } else { px(28.) };
         let horizontal_padding = if self.dense { px(5.) } else { px(8.) };

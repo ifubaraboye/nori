@@ -53,30 +53,6 @@ impl SettingsPage {
             Self::About => "settings-nav-page-about",
         }
     }
-
-    /// Extra terms the nav search matches on, beyond the label itself.
-    pub fn keywords(self) -> &'static str {
-        match self {
-            Self::General => "general notifications unread badges privacy read confirm",
-            Self::Appearance => "appearance theme dark rows density compact contrast",
-            Self::Mail => "mail tabs conversation threads preview attachments",
-            Self::Account => "account email address imap sync receipts signature",
-            Self::About => "about version build gpui license",
-        }
-    }
-
-    /// The pages a nav query leaves visible, in nav order. `query` must
-    /// already be trimmed and lowercased; an empty query keeps every page.
-    pub fn visible(query: &str) -> Vec<Self> {
-        Self::ALL
-            .into_iter()
-            .filter(|page| {
-                query.is_empty()
-                    || page.label().to_lowercase().contains(query)
-                    || page.keywords().contains(query)
-            })
-            .collect()
-    }
 }
 
 /// One toggle row on a settings page.
@@ -87,6 +63,7 @@ pub enum Setting {
     ConfirmBeforeArchive,
     CompactRows,
     ShowSender,
+    LightMode,
     OpenInTab,
     GroupConversations,
     ShowAttachments,
@@ -102,6 +79,7 @@ impl Setting {
             Self::ConfirmBeforeArchive => "Confirm before archiving",
             Self::CompactRows => "Tighten the mail list to one line per message",
             Self::ShowSender => "Show sender in message view",
+            Self::LightMode => "Light mode",
             Self::OpenInTab => "Open messages in a tab",
             Self::GroupConversations => "Group conversations",
             Self::ShowAttachments => "Show attachments inline",
@@ -119,6 +97,7 @@ impl Setting {
             Self::ConfirmBeforeArchive => "settings-toggle-confirm-before-archive",
             Self::CompactRows => "settings-toggle-compact-rows",
             Self::ShowSender => "settings-toggle-show-sender",
+            Self::LightMode => "settings-toggle-light-mode",
             Self::OpenInTab => "settings-toggle-open-in-tab",
             Self::GroupConversations => "settings-toggle-group-conversations",
             Self::ShowAttachments => "settings-toggle-show-attachments",
@@ -139,6 +118,10 @@ impl Setting {
                  roughly twice as many messages fit on screen."
             }
             Self::ShowSender => "Keep the sender line visible above the message body.",
+            Self::LightMode => {
+                "Use the light palette. The switch takes effect immediately and lasts for \
+                 this session, since settings are not written to disk yet."
+            }
             Self::OpenInTab => "Keep a tab for every opened message so you can jump back.",
             Self::GroupConversations => "Thread replies together under the most recent message.",
             Self::ShowAttachments => "Render attachment chips inline instead of a footer list.",
@@ -157,6 +140,7 @@ pub struct SettingsState {
     pub confirm_before_archive: bool,
     pub compact_rows: bool,
     pub show_sender: bool,
+    pub light_mode: bool,
     pub open_in_tab: bool,
     pub group_conversations: bool,
     pub show_attachments: bool,
@@ -175,6 +159,9 @@ impl SettingsState {
             // around.
             compact_rows: true,
             show_sender: true,
+            // Dark is the default palette. Nothing is persisted, so this is
+            // also what every launch starts from.
+            light_mode: false,
             open_in_tab: true,
             group_conversations: false,
             show_attachments: false,
@@ -190,6 +177,7 @@ impl SettingsState {
             Setting::ConfirmBeforeArchive => self.confirm_before_archive,
             Setting::CompactRows => self.compact_rows,
             Setting::ShowSender => self.show_sender,
+            Setting::LightMode => self.light_mode,
             Setting::OpenInTab => self.open_in_tab,
             Setting::GroupConversations => self.group_conversations,
             Setting::ShowAttachments => self.show_attachments,
@@ -220,6 +208,7 @@ impl SettingsState {
             Setting::ConfirmBeforeArchive => self.confirm_before_archive = next,
             Setting::CompactRows => self.compact_rows = next,
             Setting::ShowSender => self.show_sender = next,
+            Setting::LightMode => self.light_mode = next,
             Setting::OpenInTab => self.open_in_tab = next,
             Setting::GroupConversations => self.group_conversations = next,
             Setting::ShowAttachments => self.show_attachments = next,
@@ -239,19 +228,6 @@ impl Default for SettingsState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn empty_query_keeps_every_page() {
-        assert_eq!(SettingsPage::visible(""), SettingsPage::ALL.to_vec());
-    }
-
-    #[test]
-    fn query_matches_label_or_keywords() {
-        let matched = SettingsPage::visible("thread");
-        assert_eq!(matched, vec![SettingsPage::Mail]);
-        assert_eq!(SettingsPage::visible("version"), vec![SettingsPage::About]);
-        assert!(SettingsPage::visible("nothing here").is_empty());
-    }
 
     #[test]
     fn toggling_flips_and_reports_the_new_value() {
@@ -279,5 +255,16 @@ mod tests {
     #[test]
     fn compact_rows_are_on_out_of_the_box() {
         assert!(SettingsState::new().compact_rows);
+    }
+
+    #[test]
+    fn light_mode_is_off_out_of_the_box() {
+        // Nothing is persisted, so every launch starts on the dark palette.
+        let mut state = SettingsState::new();
+        assert!(!state.get(Setting::LightMode));
+        assert!(state.toggle(Setting::LightMode));
+        assert!(state.get(Setting::LightMode));
+        assert!(state.set(Setting::LightMode, false));
+        assert!(!state.get(Setting::LightMode));
     }
 }

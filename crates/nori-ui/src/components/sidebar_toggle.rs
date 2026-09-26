@@ -15,27 +15,24 @@ type ToggleHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 #[derive(IntoElement)]
 pub struct SidebarToggle {
     id: SharedString,
-    theme: Theme,
     on_toggle: ToggleHandler,
 }
 
 impl SidebarToggle {
     pub fn new(
         id: impl Into<SharedString>,
-        theme: Theme,
         on_toggle: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
             id: id.into(),
-            theme,
             on_toggle: Rc::new(on_toggle),
         }
     }
 }
 
 impl RenderOnce for SidebarToggle {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let theme = self.theme;
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = Theme::current(cx);
         let on_toggle = self.on_toggle.clone();
         let on_toggle_key = self.on_toggle.clone();
         let id = self.id.clone();

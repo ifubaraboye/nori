@@ -140,7 +140,15 @@ fn open_main_window(cx: &mut App) {
             }),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| MailApp::new(window, cx)),
+        |window, cx| {
+            let app = cx.new(|cx| MailApp::new(window, cx));
+            // Loading the saved account needs a built app, so it happens here
+            // rather than inside `new` — which keeps `new` free of disk access
+            // for anyone who builds an app without one.
+            let resume = app.clone();
+            cx.defer(move |cx| resume.update(cx, |app, cx| app.resume(cx)));
+            app
+        },
     )
     .expect("failed to open Nori window");
 }

@@ -12,7 +12,7 @@ pub use button::{Button, ButtonStyle};
 pub use email_row::EmailRow;
 pub use email_tabs::EmailTabs;
 pub use icon::Icon;
-pub use sidebar::{SIDEBAR_DEFAULT_WIDTH, Sidebar, clamp_sidebar_width};
+pub use sidebar::{LabelsAction, SIDEBAR_DEFAULT_WIDTH, Sidebar, clamp_sidebar_width};
 pub use sidebar_toggle::SidebarToggle;
 pub use text_field::TextField;
 pub(crate) use text_field::register_bindings as register_text_field_bindings;

@@ -6,6 +6,13 @@ rust-version.workspace = true
 
 [dependencies]
 gpui.workspace = true
+# The local index is written in the app's own model, so the model is what gets
+# serialised. Round-tripping through Gmail's shape instead would mean inventing
+# label ids and would drift.
+anyhow.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+nori-gmail.workspace = true
 unicode-segmentation.workspace = true
 
 [dev-dependencies]

@@ -1,0 +1,30 @@
+[package]
+name = "nori-gmail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Deliberately no `gpui` and no `nori-ui`.
+#
+# The Gmail client is blocking HTTP, so it has to be drivable from a plain
+# thread with no ambient context. Keeping gpui out is what makes the sync
+# testable headlessly, and it also means this crate cannot grow a dependency on
+# the view layer by accident: the compiler refuses.
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+# The response type is part of this crate's public signatures.
+http = "1"
+getrandom = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+# Lenient HTML parsing for ESP soup: nested tables, MSO conditionals,
+# unclosed cells. No CSS, no layout — structure only.
+tl = "0.7"
+sha2 = "0.10"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# Loopback TLS is not involved, so the OAuth tests bind a real socket and
+# assert on the request Nori would have sent.
+tempfile = "3"

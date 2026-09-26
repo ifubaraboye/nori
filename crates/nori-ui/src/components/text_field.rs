@@ -1,10 +1,11 @@
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Render, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
+    Render, SharedString, Style, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
     actions, div, fill, point, prelude::*, px, relative, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -51,6 +52,21 @@ pub struct TextField {
     is_selecting: bool,
     undo_stack: Vec<UndoSnapshot>,
     redo_stack: Vec<UndoSnapshot>,
+    /// Which half of the blink cycle the caret is in. Starts solid and is only
+    /// ever turned off by the running cycle, so the caret is guaranteed to be
+    /// visible at the moment you click into the field or move the caret.
+    caret_on: bool,
+    /// Focus as of the last render. The blink loop has no `Window` to ask, so
+    /// this is how it learns to stop; `render` is a reliable place to notice,
+    /// because the field tracks its own focus handle and is re-rendered when
+    /// that changes.
+    was_focused: bool,
+    /// Where the caret was last seen, so a move can restart the cycle. Mirrors
+    /// `was_focused`: the loop cannot see the caret, only the render can.
+    blink_cursor: usize,
+    /// The running blink cycle. Dropping it stops the loop, which is how
+    /// restarting replaces one.
+    blink: Option<Task<()>>,
 }
 
 /// One undo step: the full field state before a committed edit. Fields are
@@ -90,6 +106,10 @@ impl TextField {
             is_selecting: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            caret_on: true,
+            was_focused: false,
+            blink_cursor: 0,
+            blink: None,
         }
     }
 
@@ -553,7 +573,20 @@ impl Focusable for TextField {
 }
 
 impl Render for TextField {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::Theme::current(cx);
+
+        // The blink loop has no `Window` to ask about focus, so this is where
+        // focus changes and caret moves are noticed. The field tracks its own
+        // focus handle, so a focus change does bring us back here.
+        let focused = self.focus_handle.is_focused(window);
+        let cursor = self.cursor_offset();
+        if focused && (!self.was_focused || cursor != self.blink_cursor) {
+            self.restart_caret_blink(cx);
+        }
+        self.was_focused = focused;
+        self.blink_cursor = cursor;
+
         div()
             .id(self.id.clone())
             .key_context("NoriTextField")
@@ -565,7 +598,7 @@ impl Render for TextField {
             .cursor(CursorStyle::IBeam)
             .text_size(px(13.))
             .line_height(px(20.))
-            .text_color(crate::theme::Theme::dark().text)
+            .text_color(theme.text)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
@@ -587,8 +620,9 @@ impl Render for TextField {
             .child(TextElement {
                 input: cx.entity(),
                 placeholder: self.placeholder.clone(),
-                theme: crate::theme::Theme::dark(),
+                theme,
                 single_line: self.single_line,
+                caret_on: self.caret_on,
             })
     }
 }
@@ -598,6 +632,10 @@ struct TextElement {
     placeholder: SharedString,
     theme: crate::theme::Theme,
     single_line: bool,
+    /// The blink phase as of the render that built this element. Paint reads
+    /// it rather than the field, because the phase can only change with a
+    /// repaint.
+    caret_on: bool,
 }
 
 struct TextPrepaint {
@@ -729,10 +767,11 @@ impl Element for TextElement {
                 ));
             }
         }
-        if !is_placeholder
-            && input.focus_handle.is_focused(window)
-            && input.selected_range.is_empty()
-        {
+        if should_paint_caret(
+            input.focus_handle.is_focused(window),
+            input.selected_range.is_empty(),
+            self.caret_on,
+        ) {
             let (line_index, local) = input.line_index_for_offset(input.cursor_offset());
             if let Some(line) = lines.get(line_index) {
                 let x = bounds.left() + line.unwrapped_layout.x_for_index(local);
@@ -795,6 +834,62 @@ impl Element for TextElement {
             input.last_lines = lines;
             input.last_bounds = Some(bounds);
         });
+    }
+}
+
+/// Whether to paint the caret.
+///
+/// A focused field gets one even when it is still empty. It used to be
+/// suppressed while the placeholder was showing, to keep the caret out of the
+/// placeholder text — but that made a field you have just clicked into look
+/// inert, with nothing to say that keystrokes would land there. The placeholder
+/// is still drawn, so the caret simply sits at offset 0, just left of it, which
+/// is what every other text input does.
+///
+/// A non-empty selection paints a selection highlight instead, so the caret
+/// would only be a stray mark inside it.
+fn should_paint_caret(focused: bool, selection_is_empty: bool, blink_on: bool) -> bool {
+    focused && selection_is_empty && blink_on
+}
+
+/// Each half of the blink cycle. 530ms rather than a round 500 so the two
+/// halves do not land on the same frame at common refresh rates, which would
+/// make the caret look like it never blinks.
+const CARET_BLINK_HALF: Duration = Duration::from_millis(530);
+
+impl TextField {
+    /// Start the caret's blink again from its solid phase.
+    ///
+    /// Called whenever the caret moves or the field takes focus, so clicking
+    /// into a field or nudging the caret with an arrow key always leaves a
+    /// visible caret rather than one that may be mid-blink and therefore
+    /// invisible exactly when you are looking for it.
+    ///
+    /// The loop stops on its own once the field loses focus, so nothing ticks
+    /// for a field nobody is typing in.
+    fn restart_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self.caret_on = true;
+        // Dropping the previous task is what stops the old loop; the new one
+        // replaces it.
+        self.blink = None;
+        self.blink = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CARET_BLINK_HALF).await;
+                let keep_going = this
+                    .update(cx, |field, cx| {
+                        if !field.was_focused {
+                            return false;
+                        }
+                        field.caret_on = !field.caret_on;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
     }
 }
 

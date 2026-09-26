@@ -29,7 +29,6 @@ pub struct ToggleSwitch {
     debug_selector: SharedString,
     label: SharedString,
     on: bool,
-    theme: Theme,
     on_toggle: Option<ToggleHandler>,
 }
 
@@ -41,14 +40,8 @@ impl ToggleSwitch {
             id,
             label: label.into(),
             on,
-            theme: Theme::dark(),
             on_toggle: None,
         }
-    }
-
-    pub fn theme(mut self, theme: Theme) -> Self {
-        self.theme = theme;
-        self
     }
 
     pub fn on_toggle(mut self, on_toggle: impl Fn(&mut Window, &mut App) + 'static) -> Self {
@@ -58,8 +51,8 @@ impl ToggleSwitch {
 }
 
 impl RenderOnce for ToggleSwitch {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let theme = self.theme;
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = Theme::current(cx);
         let on = self.on;
         let on_toggle = self.on_toggle;
 

@@ -1,24 +1,29 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use crate::actions::{
     CloseTab, Compose, Dismiss, MoveSelectionDown, MoveSelectionUp, NextTab, OpenSearch,
     OpenSelected, OpenSettings, PreviousTab, ToggleSidebar, ToggleTabStrip,
 };
 use gpui::{
-    Context, CursorStyle, Entity, FocusHandle, IntoElement, MouseButton, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Render, Role, ScrollHandle, SharedString, Subscription,
-    UniformListScrollHandle, Window, div, prelude::*, px, transparent_black,
+    Context, CursorStyle, Entity, FocusHandle, ImageFormat, IntoElement, MouseButton,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Role, ScrollHandle,
+    SharedString, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
+    transparent_black,
 };
 
 use super::compose_view::{ComposeEvent, ComposeView};
-use super::email_view::EmailView;
+use super::email_view::{EmailView, ImageSlot};
 use super::inbox::{Inbox, scroll_selected_into_view};
 use super::search_view::{SearchEvent, SearchView};
 use super::settings_view::{SettingsEvent, SettingsView};
 use crate::components::{
-    EmailTabs, SIDEBAR_DEFAULT_WIDTH, Sidebar, TextField, TopBar, clamp_sidebar_width,
+    EmailTabs, LabelsAction, SIDEBAR_DEFAULT_WIDTH, Sidebar, TextField, TopBar, clamp_sidebar_width,
 };
 use crate::model::{
-    Density, DraftSeed, Email, EmailId, LabelId, LabelStore, MailStore, Mailbox, Overlay, Setting,
-    SettingsPage, SettingsState, WorkspaceView, mock::mock_emails,
+    AccountState, Density, DraftSeed, Email, EmailId, Index, IndexCache, Label, LabelId,
+    LabelStore, MailStore, Mailbox, Overlay, Setting, SettingsPage, SettingsState, WorkspaceView,
+    gmail_query, may_replace_index, mock::mock_emails, to_email,
 };
 use crate::theme::Theme;
 
@@ -30,10 +35,39 @@ struct SidebarResize {
 /// A drag of the compose divider. `start_x` is where the pointer went down,
 /// and the width is recomputed from the delta so the divider tracks the
 /// pointer exactly instead of jumping to the cursor.
+/// How often to ask Gmail what has changed.
+///
+/// Long on purpose. Each poll is one `history.list` at 2 units, so this costs
+/// almost nothing, and a mail client that syncs on a timer far more often than
+/// a person reads mail is just burning battery to reassure them.
+const POLL_INTERVAL_SECONDS: u64 = 180;
+
+/// Gmail's names for the two labels Nori writes back.
+const STARRED: &str = "STARRED";
+const UNREAD: &str = "UNREAD";
+
+/// One label change queued for the server.
+///
+/// `Send` because it crosses onto a background thread. It is a struct rather
+/// than a `Fn` closure so the work has a name in a stack trace and the
+/// credential never has to be captured.
+struct WriteBack {
+    id: String,
+    add: Vec<String>,
+    remove: Vec<String>,
+}
+
 struct ComposeResize {
     start_x: f32,
     start_width: f32,
 }
+
+/// Width of the row overflow menu.
+const LABEL_MENU_WIDTH: f32 = 200.;
+
+/// Assumed window width for the flip test. The menu flips to the button's left
+/// past this point rather than hanging off the right edge.
+const LABEL_MENU_EDGE_GUARD: f32 = 700.;
 
 /// How far below the top of the window an overlay panel sits.
 const OVERLAY_TOP_OFFSET: f32 = 52.;
@@ -42,25 +76,124 @@ const OVERLAY_TOP_OFFSET: f32 = 52.;
 /// that the list beside it stays scannable.
 const COMPOSE_PANE_WIDTH: f32 = 520.;
 
-/// The compose column is user-resizable, so it needs ends. Below the minimum
-/// the fields stop being usable; above the maximum the list beside it is gone.
-const COMPOSE_PANE_MIN: f32 = 340.;
-const COMPOSE_PANE_MAX: f32 = 960.;
+/// How many remote pictures one mail may trigger. Marketing mail sprinkles
+/// dozens of tiny icons; the hero and the product shots all sit in the
+/// first handful, so the tail never earns a connection.
+const MAX_IMAGES_PER_MAIL: usize = 24;
 
-pub fn clamp_compose_pane_width(width: f32) -> f32 {
-    width.clamp(COMPOSE_PANE_MIN, COMPOSE_PANE_MAX)
+/// Largest single picture Nori will hold: an 8MB hero is already generous,
+/// and anything bigger is a hostile or broken endpoint, not photography.
+const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Entries across all mails before the cache restarts. Pictures are small
+/// against a mailbox, but unbounded is unbounded.
+const MAX_CACHED_IMAGES: usize = 512;
+
+/// A picture URL Nori will actually fetch: absolute `https` with something
+/// after the scheme. The parser already enforces this; the fetch re-checks,
+/// because a URL that arrives by any other road gets the same answer.
+fn is_fetchable_image_url(url: &str) -> bool {
+    url.len() > "https://".len() && url.starts_with("https://")
+}
+
+/// The image format from its magic bytes, so fetching never trusts a
+/// `Content-Type` header or a file extension. Anything unrecognised —
+/// SVG included, which is XML that can carry scripts — refuses to load.
+fn sniff_image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some(ImageFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageFormat::Gif)
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else {
+        None
+    }
+}
+
+/// Download one picture off the UI thread: capped bytes, settled status,
+/// recognised bytes. Anything else — wrong status, wrong bytes, wrong
+/// format — is a `None`, and the reading view shows alt text instead.
+///
+/// Note what this request deliberately is not: no cookies, no auth, no
+/// referrer beyond what the transport sets. Loading the picture still tells
+/// the sender's server that somebody looked, which is inherent to remote
+/// images and exactly what the future per-sender content policy will govern.
+fn fetch_image_bytes(url: &str) -> Option<(ImageFormat, Vec<u8>)> {
+    if !is_fetchable_image_url(url) {
+        return None;
+    }
+    let mut response = nori_gmail::agent().get(url).call().ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_IMAGE_BYTES + 1)
+        .read_to_vec()
+        .ok()?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let format = sniff_image_format(&bytes)?;
+    Some((format, bytes))
+}
+
+/// The compose column is user-resizable, so it needs ends. Below the minimum
+/// the fields stop being usable.
+const COMPOSE_PANE_MIN: f32 = 340.;
+
+/// The mail pane has to survive beside the composer, or there is nothing left
+/// to read while writing.
+const MIN_READING_PANE_WIDTH: f32 = 420.;
+
+/// Absolute backstop, so an unusually wide display cannot let the composer
+/// swallow the whole window.
+const COMPOSE_PANE_CEILING: f32 = 1600.;
+
+/// Widest the compose column may get, given the window it shares with the
+/// sidebar and the reading pane.
+///
+/// This has to be derived from the window rather than fixed. A flat pixel cap
+/// is the reason the divider used to feel stuck in one direction: on a wide
+/// display 960px is already most of the workspace, so the composer sat pinned
+/// against its maximum and dragging the seam further left did nothing at all.
+pub fn compose_pane_max(window_width: f32, sidebar_width: f32) -> f32 {
+    (window_width - sidebar_width - MIN_READING_PANE_WIDTH)
+        .clamp(COMPOSE_PANE_MIN, COMPOSE_PANE_CEILING)
+}
+
+/// Clamp to a maximum the caller supplies, so the bound can follow the window.
+pub fn clamp_compose_pane_width(width: f32, max: f32) -> f32 {
+    width.clamp(COMPOSE_PANE_MIN, max.max(COMPOSE_PANE_MIN))
 }
 
 pub struct MailApp {
     store: MailStore,
+    /// The row overflow menu: which mail it belongs to, and where the button
+    /// was clicked. The position travels with the click because the list is
+    /// virtualized, so a row's bounds are only valid on the frame it was drawn.
+    label_menu: Option<(EmailId, Point<Pixels>)>,
     /// User-defined labels, kept beside the store so mailbox state and label
     /// state never disturb each other.
     labels: LabelStore,
     /// The label the list is filtered by, or `None` for no label filter.
     selected_label: Option<LabelId>,
-    /// The inline "new label" field in the sidebar.
+    /// The "new label" field in the sidebar. It is only mounted while
+    /// `label_composer_open`, and the `+` that opens it has its own focus
+    /// handle so the keyboard can reach it and so focus has somewhere to land
+    /// when the composer closes.
     new_label_field: Entity<TextField>,
-    theme: Theme,
+    new_label_focus: FocusHandle,
+    /// Whether the Labels group is collapsed, independent of the Mailboxes
+    /// group above it.
+    labels_collapsed: bool,
+    /// Whether the "new label" field is showing. The sidebar is `RenderOnce`
+    /// and holds no state, so this lives here.
+    label_composer_open: bool,
     inbox_focus: FocusHandle,
     workspace_focus: FocusHandle,
     tab_scroll: ScrollHandle,
@@ -78,6 +211,12 @@ pub struct MailApp {
     compose_pane_width: f32,
     compose_resize: Option<ComposeResize>,
     compose: Option<Entity<ComposeView>>,
+    /// Remote images by source URL, across every open mail: a logo repeated
+    /// in ten mails downloads once. Entries arrive as `Loading` and settle
+    /// to `Loaded` or `Failed`; the reading view renders alt text until
+    /// then. Bounded, because a mailbox that never forgets a picture is a
+    /// slow leak wearing a cache costume.
+    images: HashMap<String, ImageSlot>,
     search: Option<Entity<SearchView>>,
     /// Settings sits inside the mail shell rather than over it, so the mail
     /// sidebar and top bar stay on screen around it.
@@ -91,11 +230,33 @@ pub struct MailApp {
     /// while settings is closed, and the view that edits them is discarded
     /// on close. Copying ten bools per frame is cheaper than a global.
     settings_state: SettingsState,
+    /// How the connected account reads, for the settings page and the top bar.
+    /// `MailApp` owns it because the token store and the sync both live here,
+    /// and the settings view is discarded on close.
+    account: AccountState,
+    /// Which mailboxes have had their mail fetched, so a folder is indexed once
+    /// rather than on every visit.
+    loaded_mailboxes: HashSet<Mailbox>,
+    /// Whether a sync is in flight. A first sync takes about a minute — the
+    /// quota allows only 300 mails a minute — so without this the list is just
+    /// empty for a while, which reads as a broken app rather than a slow one.
+    syncing: bool,
+    /// The current fetch's stream. Mail arrives here from the worker threads
+    /// and is moved into the list by `pump_incoming`, so the inbox fills in
+    /// while the fetch is still running rather than appearing all at once.
+    sync_stream: Option<Arc<nori_gmail::MailStream>>,
     subscriptions: Vec<Subscription>,
     previous_focus: Option<FocusHandle>,
 }
 
 impl MailApp {
+    /// Build the app over the sample mail, touching nothing on disk.
+    ///
+    /// Deliberately free of I/O. Reading the saved account here would make a
+    /// test run depend on what happens to be signed in on the developer's
+    /// machine, and would load a real mailbox over the sample data those tests
+    /// assert against. The real app calls [`Self::resume`] once the window
+    /// exists; a test that wants the cache can call it too.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let inbox_focus = cx.focus_handle().tab_index(1).tab_stop(true);
         let workspace_focus = cx.focus_handle().tab_index(2).tab_stop(true);
@@ -107,20 +268,27 @@ impl MailApp {
         let work = labels.create("Work");
         let personal = labels.create("Personal");
         if let Some(work) = &work {
-            labels.set_for(EmailId(1), &[work.id]);
-            labels.set_for(EmailId(4), &[work.id]);
+            labels.set_for(EmailId::from(1), &[work.id]);
+            labels.set_for(EmailId::from(4), &[work.id]);
         }
         if let Some(personal) = &personal {
-            labels.set_for(EmailId(7), &[personal.id]);
+            labels.set_for(EmailId::from(7), &[personal.id]);
         }
         let new_label_field =
             cx.new(|cx| TextField::new("new-label", "New label", "", true, 3, cx));
+        let new_label_focus = cx.focus_handle().tab_index(4).tab_stop(true);
+        // The theme is published as a global, so subscribing is what repaints
+        // this view when the light mode switch flips it.
+        let subscriptions = vec![cx.observe_global::<Theme>(|_, cx| cx.notify())];
         Self {
             store,
             labels,
+            label_menu: None,
             selected_label: None,
             new_label_field,
-            theme: Theme::dark(),
+            new_label_focus,
+            labels_collapsed: false,
+            label_composer_open: false,
             inbox_focus,
             workspace_focus,
             tab_scroll: ScrollHandle::new(),
@@ -133,11 +301,16 @@ impl MailApp {
             compose_pane_width: COMPOSE_PANE_WIDTH,
             compose_resize: None,
             compose: None,
+            images: HashMap::new(),
             search: None,
             settings: None,
             settings_page: SettingsPage::General,
             settings_state: SettingsState::new(),
-            subscriptions: Vec::new(),
+            account: AccountState::default(),
+            loaded_mailboxes: HashSet::new(),
+            syncing: false,
+            sync_stream: None,
+            subscriptions,
             previous_focus: None,
         }
     }
@@ -170,7 +343,9 @@ impl MailApp {
     }
 
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.label_menu.is_some() {
+            self.close_label_menu(cx);
+        } else if self.settings.is_some() {
             self.close_settings(window, cx);
         } else if self.store.overlay().is_some() {
             self.close_overlay(window, cx);
@@ -196,8 +371,11 @@ impl MailApp {
         self.settings_page = SettingsPage::General;
         let settings_entity = cx.entity();
         let page_entity = cx.entity();
+        let sign_in_entity = cx.entity();
+        let sign_out_entity = cx.entity();
         let state = self.settings_state;
         let page = self.settings_page;
+        let account = self.account.clone();
         let settings = cx.new(|cx| {
             SettingsView::new(
                 window,
@@ -209,6 +387,13 @@ impl MailApp {
                 },
                 move |page, cx| {
                     page_entity.update(cx, |this, cx| this.set_settings_page(page, cx));
+                },
+                account,
+                move |cx| {
+                    sign_in_entity.update(cx, |this, cx| this.start_sign_in(cx));
+                },
+                move |cx| {
+                    sign_out_entity.update(cx, |this, cx| this.sign_out(cx));
                 },
             )
         });
@@ -266,6 +451,17 @@ impl MailApp {
     /// place the app decides what a setting means.
     fn set_setting(&mut self, setting: Setting, enabled: bool, cx: &mut Context<Self>) {
         if self.settings_state.set(setting, enabled) {
+            // The theme is the one setting that lives outside this struct: it
+            // is published as a global so every view repaints from one place
+            // instead of each one being handed a copy. This is the only writer.
+            if setting == Setting::LightMode {
+                cx.set_global(Theme::for_light_mode(self.settings_state.light_mode));
+            }
+            // The switch the account page carries, so a sync can be asked for
+            // without waiting for a timer that has no visible state.
+            if setting == Setting::CheckForMail && enabled {
+                self.sync(cx);
+            }
             cx.notify();
         }
     }
@@ -278,6 +474,438 @@ impl MailApp {
             self.settings_page = page;
             cx.notify();
         }
+    }
+
+    /// Begin an OAuth sign-in.
+    ///
+    /// Split deliberately. The listener is bound and the browser opened on the
+    /// main thread, because opening a URL needs an `App`; everything that can
+    /// block — waiting on the redirect, the token exchange, the first sync —
+    /// runs on a background thread, because all of it is network I/O and the
+    /// UI thread is where a dropped frame is visible.
+    fn start_sign_in(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.account, AccountState::Connecting) {
+            return;
+        }
+        let credentials = match nori_gmail::credentials() {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                self.account = AccountState::Failed {
+                    reason: format!("{error}"),
+                };
+                cx.notify();
+                return;
+            }
+        };
+        let request = match nori_gmail::oauth::begin(&credentials) {
+            Ok(request) => request,
+            Err(error) => {
+                self.account = AccountState::Failed {
+                    reason: format!("could not start the sign-in: {error}"),
+                };
+                cx.notify();
+                return;
+            }
+        };
+
+        // The user has to see this, so it is a state change rather than a
+        // silent wait on a browser that may never have opened.
+        self.account = AccountState::Connecting;
+        cx.notify();
+        cx.open_url(&request.url);
+
+        let (redirect_uri, verifier) =
+            (request.redirect_uri.clone(), request.verifier().to_owned());
+        let task = cx.background_executor().spawn(async move {
+            let code = request.await_callback()?;
+            let agent = nori_gmail::agent();
+            let token =
+                nori_gmail::oauth::exchange(&agent, &credentials, &redirect_uri, &code, &verifier)?;
+
+            // The account key is the address, which is only known now.
+            let profile = nori_gmail::gmail::profile(&agent, &token)?;
+            let store = nori_gmail::FileTokenStore::with_account(&profile.email)?;
+            nori_gmail::TokenStore::save(&store, &token)?;
+
+            let mut sync = nori_gmail::Sync::new(agent, &credentials, &store)?;
+            // Before the mail, so the sidebar's folder counts are right the
+            // moment the account appears. One unit.
+            let counts = sync.folder_counts().ok();
+            let snapshot = sync.full()?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((profile.email, snapshot, counts))
+        });
+
+        cx.spawn(async move |this, cx| {
+            // Every branch lands back on the main thread, so app state is only
+            // ever written here and never from the worker.
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok((address, snapshot, counts)) => {
+                    let mail = snapshot.mail.len();
+                    let labels = snapshot.labels.len();
+                    if !this.store.has_mail() {
+                        this.labels.clear();
+                    }
+                    this.absorb(snapshot, cx);
+                    this.account = AccountState::Connected {
+                        address,
+                        mail,
+                        labels,
+                        counts,
+                    };
+                }
+                Err(error) => {
+                    this.account = AccountState::Failed {
+                        reason: format!("{error}"),
+                    };
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Sync an already-connected account.
+    ///
+    /// Incremental when the stored cursor is still good, full when Gmail has
+    /// aged it out. That distinction is not an optimisation: a stale
+    /// `historyId` makes Gmail answer 404, and treating that as an error would
+    /// leave a mailbox that silently stopped updating, since the id never
+    /// becomes fresh again on its own.
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        if !self.account.is_usable() {
+            return;
+        }
+        // One *indexing* fetch at a time. The rate limiter is built per fetch,
+        // so two live fetches each pace at the self-limit and together exceed
+        // what Google allows — the budgets on their own do not prevent that.
+        // The flag doubles as the "fetching" state the empty list shows.
+        if self.syncing {
+            return;
+        }
+        let Some(address) = self.account.address().map(str::to_string) else {
+            return;
+        };
+        let Ok(credentials) = nori_gmail::credentials() else {
+            return;
+        };
+        let Ok(store) = nori_gmail::FileTokenStore::with_account(&address) else {
+            return;
+        };
+        let since = self.store.synced_history_id().map(str::to_string);
+        let account = address.clone();
+        self.syncing = true;
+        let (stream, incoming) = nori_gmail::mail_stream();
+        self.sync_stream = Some(stream.clone());
+        self.pump_incoming(incoming, cx);
+        let task = cx.background_executor().spawn(async move {
+            let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
+            // One unit, and it makes every folder's count right even for the
+            // folders whose mail Nori has not downloaded.
+            let counts = sync.folder_counts().ok();
+            let outcome = match since.as_deref() {
+                // `None` here means the cursor aged out, and a full sync is
+                // the documented recovery rather than a failure to report.
+                Some(since) => match sync.incremental(since)? {
+                    Some(delta) => nori_gmail::SyncOutcome::Changes(delta),
+                    None => nori_gmail::SyncOutcome::Full(sync.full_with(Some(&stream))?),
+                },
+                None => nori_gmail::SyncOutcome::Full(sync.full_with(Some(&stream))?),
+            };
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((account, outcome, counts))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Ok((account, outcome, counts)) = result else {
+                    return;
+                };
+                if let AccountState::Connected { counts: slot, .. } = &mut this.account {
+                    *slot = counts;
+                }
+                match outcome {
+                    nori_gmail::SyncOutcome::Full(snapshot) => {
+                        this.store
+                            .set_synced_history_id(snapshot.history_id.clone());
+                        this.absorb(snapshot, cx);
+                        this.save_index(&account);
+                    }
+                    nori_gmail::SyncOutcome::Changes(delta) => {
+                        this.store.set_synced_history_id(delta.history_id.clone());
+                        this.apply_delta(&delta, &account, cx);
+                        this.save_index(&account);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Apply an incremental pass. Each mail is merged rather than swapped, so
+    /// a pin survives, and a body already fetched is not thrown away and
+    /// re-downloaded.
+    fn apply_delta(
+        &mut self,
+        delta: &nori_gmail::Incremental,
+        account: &str,
+        cx: &mut Context<Self>,
+    ) {
+        for remote in &delta.changed {
+            let incoming = to_email(remote, account);
+            // A mail whose body is already loaded keeps it: `upsert` replaces
+            // the record wholesale, so the body has to be carried over or the
+            // reading pane would blank and re-fetch.
+            let body = self
+                .store
+                .email(&incoming.id)
+                .filter(|email| email.body_loaded)
+                .map(|email| (email.body.clone(), email.pinned));
+            let mut incoming = incoming;
+            if let Some((paragraphs, _)) = body {
+                incoming.body = paragraphs;
+                incoming.body_loaded = true;
+            }
+            self.store.upsert(incoming);
+        }
+        for id in &delta.deleted {
+            self.store.remove(&EmailId::from(id.as_str()));
+        }
+        cx.notify();
+    }
+
+    /// Fold a synced snapshot into the store.
+    ///
+    /// `replace_emails` rather than `upsert` per mail: a first sync has no
+    /// local mail worth keeping, and the two differ in what they preserve, so
+    /// the choice is made once, here.
+    fn absorb(&mut self, snapshot: nori_gmail::Snapshot, cx: &mut Context<Self>) {
+        let account = snapshot.account.clone();
+        for remote in &snapshot.labels {
+            self.seed_label(&crate::model::to_label_seed(remote));
+        }
+        for remote in &snapshot.mail {
+            self.store.upsert(crate::model::to_email(remote, &account));
+        }
+        cx.notify();
+    }
+
+    /// Fetch a mailbox's mail the first time it is opened.
+    ///
+    /// The quota is per minute per user, so the mailbox cannot be indexed in
+    /// advance — 6,000 units a minute is 300 mails, and a real mailbox holds
+    /// thousands. Fetching the folder the user actually opened turns that from
+    /// a limitation into the right behaviour: a folder nobody opens costs
+    /// nothing, and the one they open is populated within a second or so.
+    ///
+    /// Refuses to fetch the Starred view, which is a filter over mail already
+    /// indexed from elsewhere rather than a folder with its own contents.
+    fn ensure_mailbox_fetched(&mut self, mailbox: Mailbox, cx: &mut Context<Self>) {
+        if mailbox == Mailbox::Starred || !self.loaded_mailboxes.insert(mailbox) {
+            return;
+        }
+        // Same reason as `sync`: two indexers at once overspend the quota
+        // minute. The folder is un-marked so the next visit retries, rather than
+        // being remembered as loaded and never fetched at all.
+        if self.syncing {
+            self.loaded_mailboxes.remove(&mailbox);
+            return;
+        }
+        let Some(address) = self.account.address().map(str::to_string) else {
+            return;
+        };
+        let Ok(credentials) = nori_gmail::credentials() else {
+            return;
+        };
+        let Ok(store) = nori_gmail::FileTokenStore::with_account(&address) else {
+            return;
+        };
+        let query = gmail_query(mailbox);
+        let (stream, incoming) = nori_gmail::mail_stream();
+        self.sync_stream = Some(stream.clone());
+        self.syncing = true;
+        self.pump_incoming(incoming, cx);
+        let task = cx.background_executor().spawn(async move {
+            let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
+            sync.fetch_with(query, nori_gmail::sync::MAILBOX_FETCH_BUDGET, Some(&stream))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.syncing = false;
+                let Ok(mail) = result else {
+                    // Let a later attempt retry rather than remembering a
+                    // folder that failed as though it had been loaded.
+                    this.loaded_mailboxes.remove(&mailbox);
+                    cx.notify();
+                    return;
+                };
+                for remote in &mail {
+                    this.store.upsert(to_email(remote, &address));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Create a Nori label for a Gmail one, without duplicating it on every
+    /// sync.
+    fn seed_label(&mut self, seed: &crate::model::account::LabelSeed) {
+        if self
+            .labels
+            .labels()
+            .iter()
+            .any(|label| label.name == seed.name)
+        {
+            return;
+        }
+        self.labels.create_with_colour(&seed.name, seed.colour);
+    }
+
+    /// Forget the account: the token, the synced mail, and the state.
+    fn sign_out(&mut self, cx: &mut Context<Self>) {
+        let address = self.account.address().map(str::to_string);
+        if let Some(address) = &address
+            && let Ok(store) = nori_gmail::FileTokenStore::with_account(address)
+        {
+            let _ = nori_gmail::TokenStore::clear(&store);
+        }
+        // The synced mail goes with the token: leaving it behind would show a
+        // mailbox belonging to an account that is no longer connected.
+        self.store.clear();
+        if let Ok(pointer) = nori_gmail::LastAccount::with_config_dir() {
+            pointer.clear();
+        }
+        if let Some(address) = &address
+            && let Ok(cache) = IndexCache::with_account(address)
+        {
+            cache.clear();
+        }
+        self.account = AccountState::Disconnected;
+        cx.notify();
+    }
+
+    /// Poll for changes on a timer, for as long as the app is open.
+    ///
+    /// Cheap enough to be uninteresting: an incremental pass is one
+    /// `history.list` at 2 quota units, so a poll every few minutes costs
+    /// under a hundred units an hour against an allowance of 6,000 a minute.
+    /// The full sync is the expensive part and happens once, on launch or when
+    /// the stored cursor has aged out.
+    ///
+    /// Not a focus-based trigger, which would be the obvious choice, because
+    /// this GPUI revision has no window focus event to hang it on.
+    fn poll_for_changes(&self, cx: &mut Context<Self>) {
+        let interval = std::time::Duration::from_secs(POLL_INTERVAL_SECONDS);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(interval).await;
+                let _ = this.update(cx, |this, cx| {
+                    // A disconnected or half-signed-in account has nothing to
+                    // poll, and `sync` is a no-op there anyway; skipping it keeps
+                    // the timer from waking the UI for no reason.
+                    if this.account.is_usable() {
+                        this.sync(cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Resume the account that was connected last. Called by the binary, not by
+    /// [`Self::new`], because it reads `~/.config/nori`.
+    ///
+    /// The order here is the whole point. The local index is loaded and drawn
+    /// *first*, so the list is on screen in milliseconds, and only then does the
+    /// network get involved — and because the index carries a sync cursor, that
+    /// network call is an incremental pass costing a couple of quota units for
+    /// the handful of mails that arrived since, rather than a full re-read of
+    /// the mailbox at 300 mails a minute.
+    ///
+    /// With no index on disk this is a first run, and the prototype's sample
+    /// mail is discarded before the full fetch begins.
+    pub fn resume(&mut self, cx: &mut Context<Self>) {
+        self.poll_for_changes(cx);
+        let Ok(pointer) = nori_gmail::LastAccount::with_config_dir() else {
+            return;
+        };
+        let Some(address) = pointer.load() else {
+            return;
+        };
+        let Ok(store) = nori_gmail::FileTokenStore::with_account(&address) else {
+            return;
+        };
+        match nori_gmail::TokenStore::load(&store) {
+            Ok(Some(_)) => self.resume_with_index(&address, cx),
+            Ok(None) => {
+                // The token is gone but the pointer was not; the next sign-in
+                // will rewrite both, so this is not worth reporting.
+                pointer.clear();
+            }
+            Err(error) => {
+                self.account = AccountState::Failed {
+                    reason: format!("could not read the saved token: {error}"),
+                };
+            }
+        }
+    }
+
+    fn resume_with_index(&mut self, address: &str, cx: &mut Context<Self>) {
+        let cached = IndexCache::with_account(address)
+            .ok()
+            .and_then(|cache| cache.load(address))
+            .filter(|index| !index.is_empty());
+
+        let (mail, labels) = match &cached {
+            Some(index) => {
+                self.store
+                    .restore(index.emails.clone(), index.history_id.clone());
+                self.labels
+                    .restore(index.labels.clone(), index.assignments.clone());
+                (index.emails.len(), index.labels.len())
+            }
+            None => {
+                // First run: what is on screen is the prototype's sample data,
+                // which belongs to no account and should not sit in a list the
+                // user is trying to read.
+                self.store.clear();
+                self.labels.clear();
+                (0, 0)
+            }
+        };
+
+        self.account = AccountState::Connected {
+            address: address.to_string(),
+            mail,
+            labels,
+            counts: None,
+        };
+        cx.notify();
+        self.sync(cx);
+    }
+
+    /// Write the index out after a sync, so the next launch has something to
+    /// draw before it makes a request. Refuses to let a thin store clobber a
+    /// fuller file — see [`may_replace_index`] — so a partial state can never
+    /// strand the next launch on an empty list.
+    fn save_index(&self, account: &str) {
+        let Ok(cache) = IndexCache::with_account(account) else {
+            return;
+        };
+        let snapshot = self.store.snapshot();
+        if let Some(current) = cache.load(account)
+            && !may_replace_index(&current, snapshot.len())
+        {
+            return;
+        }
+        let (labels, assignments) = self.labels.snapshot();
+        let _ = cache.save(&Index {
+            account: account.to_string(),
+            emails: self.store.snapshot(),
+            labels,
+            assignments,
+            history_id: self.store.synced_history_id().map(str::to_string),
+        });
     }
 
     /// How tall the mail list rows are right now.
@@ -309,15 +937,145 @@ impl MailApp {
             self.close_overlay(window, cx);
         }
         self.store.select_mailbox(mailbox);
+        self.ensure_mailbox_fetched(mailbox, cx);
         window.focus(&self.inbox_focus, cx);
         cx.notify();
     }
 
+    /// Open a mail, and fetch its body if the list only ever had metadata.
+    ///
+    /// The reading pane opens immediately with the snippet and then fills in.
+    /// Waiting for the body first would put a network round trip between the
+    /// click and the pane appearing, which is the one thing that makes a mail
+    /// client feel slow.
     fn open_email(&mut self, id: EmailId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.store.open_email(id) {
+        let Some(email) = self.store.email(&id).cloned() else {
+            return;
+        };
+        if self.store.open_email(id.clone()) {
             window.focus(&self.workspace_focus, cx);
             cx.notify();
         }
+        // Read state has to round-trip. This is the reason the account asks for
+        // `gmail.modify` rather than `gmail.readonly`: without the write-back,
+        // Nori marks a mail read locally and Gmail still lists it as unread,
+        // so the two disagree and the next sync undoes the read. The gate is
+        // that it was unread *before*, so re-opening a read mail costs nothing
+        // — and the state was already in hand for the body check.
+        let was_unread = email.unread;
+        let account = email.write_back_account().map(str::to_string);
+        if was_unread && let Some(account) = account.clone() {
+            self.write_back(
+                account,
+                WriteBack {
+                    id: id.0.clone(),
+                    add: Vec::new(),
+                    remove: vec![UNREAD.to_string()],
+                },
+                cx,
+            );
+        }
+        if email.body_loaded {
+            // Pictures are not account-bound, so they load for sample mail
+            // too — or rather, they would, if sample mail had any.
+            self.fetch_images_for(&id, cx);
+            return;
+        }
+        let Some(account) = account else {
+            return;
+        };
+        self.fetch_body(account, id.0, cx);
+    }
+
+    /// Start fetching a mail's remote pictures, once each: repeats across
+    /// mails share the one entry, and settled entries are never re-fetched.
+    /// Runs both when a mail opens with its body already in hand and when a
+    /// fetched body lands, so neither path shows placeholders forever.
+    fn fetch_images_for(&mut self, id: &EmailId, cx: &mut Context<Self>) {
+        let Some(email) = self.store.email(id) else {
+            return;
+        };
+        let mut sources = nori_gmail::image_sources(&email.body);
+        sources.truncate(MAX_IMAGES_PER_MAIL);
+        let mut started = false;
+        for src in sources {
+            if self.images.contains_key(&src) || !is_fetchable_image_url(&src) {
+                continue;
+            }
+            self.insert_image_slot(src.clone(), ImageSlot::Loading);
+            started = true;
+            let for_fetch = src.clone();
+            let task = cx.background_executor().spawn(async move {
+                fetch_image_bytes(&for_fetch).map(|(format, bytes)| {
+                    (
+                        format,
+                        std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)),
+                    )
+                })
+            });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.insert_image_slot(
+                        src,
+                        match result {
+                            Some((_, image)) => ImageSlot::Loaded(image),
+                            None => ImageSlot::Failed,
+                        },
+                    );
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        if started {
+            cx.notify();
+        }
+    }
+
+    /// Insert a slot, keeping the cache bounded: finished pictures survive
+    /// eviction first, and when even those overflow the whole cache restarts
+    /// rather than growing without end. A cleared picture simply loads again
+    /// if its mail is still open.
+    fn insert_image_slot(&mut self, url: String, slot: ImageSlot) {
+        if self.images.len() >= MAX_CACHED_IMAGES {
+            self.images
+                .retain(|_, slot| matches!(slot, ImageSlot::Loaded(_)));
+            if self.images.len() >= MAX_CACHED_IMAGES {
+                self.images.clear();
+            }
+        }
+        self.images.insert(url, slot);
+    }
+
+    /// Pull one mail's body off the thread and hand it to the store.
+    fn fetch_body(&mut self, account: String, id: String, cx: &mut Context<Self>) {
+        let Ok(credentials) = nori_gmail::credentials() else {
+            return;
+        };
+        let Ok(store) = nori_gmail::FileTokenStore::with_account(&account) else {
+            return;
+        };
+        let task = cx.background_executor().spawn(async move {
+            let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
+            let bodies = sync.bodies(&[id])?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bodies)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                // A body that never arrives leaves `body_loaded` false, so the
+                // next open tries again rather than treating the mail as empty.
+                if let Ok(bodies) = result {
+                    for (id, body) in bodies {
+                        this.store.set_body(&EmailId::from(id.as_str()), body);
+                        this.fetch_images_for(&EmailId::from(id.as_str()), cx);
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -326,9 +1084,153 @@ impl MailApp {
         }
     }
 
-    fn toggle_star(&mut self, id: EmailId, cx: &mut Context<Self>) {
-        self.store.toggle_star(id);
+    /// Open the row's overflow menu under the button, or close it if this row
+    /// already has it open. Toggling on the same row keeps the menu from
+    /// stranding itself open with no way to dismiss.
+    fn open_label_menu(&mut self, id: EmailId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.label_menu = match self.label_menu.take() {
+            Some((open, _)) if open == id => None,
+            _ => Some((id, position)),
+        };
         cx.notify();
+    }
+
+    fn close_label_menu(&mut self, cx: &mut Context<Self>) {
+        if self.label_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// One label in the menu, filled when the mail carries it.
+    fn render_label_menu_item(
+        &self,
+        entity: Entity<Self>,
+        email: EmailId,
+        label: &Label,
+        theme: Theme,
+    ) -> impl IntoElement {
+        let (text, border, fill) = label.chip();
+        let is_on = self.labels.labels_for(&email).contains(&label.id);
+        let label_id = label.id;
+        div()
+            .id(format!("label-menu-item-{}", label.id))
+            .debug_selector(move || format!("label-menu-item-{}", label_id))
+            .w_full()
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(10.))
+            .cursor_pointer()
+            .role(Role::MenuItem)
+            .aria_label(format!(
+                "{} {}",
+                if is_on { "Remove" } else { "Add" },
+                label.name
+            ))
+            .aria_selected(is_on)
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(|style| style.border_color(theme.focus))
+            .hover(|style| style.bg(theme.hover))
+            // The menu stays open across a toggle: assigning one label is
+            // rarely the whole job, and closing under the pointer each time
+            // would make applying two feel like a chore.
+            .on_click({
+                let entity = entity.clone();
+                move |_event, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.toggle_label(label_id, email.clone(), cx)
+                    })
+                }
+            })
+            // A filled swatch rather than a tick: the label's own hue is what
+            // identifies it here and in the sidebar, and a tick would compete
+            // with it for the same slot.
+            .child(
+                div()
+                    .size(px(10.))
+                    .flex_none()
+                    .bg(if is_on { fill } else { transparent_black() })
+                    .border_1()
+                    .border_color(if is_on { border } else { theme.hairline_strong }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.5))
+                    .text_color(if is_on { text } else { theme.muted })
+                    .child(label.name.clone()),
+            )
+    }
+
+    /// Star or unstar a mail, and write the change back when the mail is real.
+    ///
+    /// The local change lands first so the star moves under the pointer, and
+    /// the request follows. A write-back that fails is reported rather than
+    /// retried silently: a star that disagrees between Nori and Gmail is worse
+    /// than one the user was told did not save.
+    fn toggle_star(&mut self, id: EmailId, cx: &mut Context<Self>) {
+        let Some(email) = self.store.email(&id).cloned() else {
+            return;
+        };
+        self.store.toggle_star(id.clone());
+        let starred = self.store.email(&id).is_some_and(|email| email.starred);
+
+        // `None` for sample mail, which has no server to tell.
+        let Some(account) = email.write_back_account().map(str::to_string) else {
+            return;
+        };
+        self.save_index(&account);
+        self.write_back(
+            account,
+            WriteBack {
+                id: id.0,
+                add: starred.then(|| STARRED.to_string()).into_iter().collect(),
+                remove: (!starred)
+                    .then(|| STARRED.to_string())
+                    .into_iter()
+                    .collect(),
+            },
+            cx,
+        );
+    }
+
+    /// Send a label change to Gmail, off the main thread.
+    ///
+    /// Taking the account by value keeps the error path able to name it: a
+    /// failed write-back has to say *which* account needs re-authorising.
+    fn write_back(&mut self, account: String, change: WriteBack, cx: &mut Context<Self>) {
+        let Ok(credentials) = nori_gmail::credentials() else {
+            return;
+        };
+        let Ok(store) = nori_gmail::FileTokenStore::with_account(&account) else {
+            return;
+        };
+        let task = cx.background_executor().spawn(async move {
+            let mut sync = nori_gmail::Sync::new(nori_gmail::agent(), &credentials, &store)?;
+            let add: Vec<&str> = change.add.iter().map(String::as_str).collect();
+            let remove: Vec<&str> = change.remove.iter().map(String::as_str).collect();
+            sync.modify(&change.id, &add, &remove)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Err(error) = result else { return };
+                let text = format!("{error}");
+                // `invalid_grant` is the expected weekly end of a Testing-mode
+                // app's grant, so it is a state and not an error toast.
+                if text.contains("no longer valid") || text.contains("sign in again") {
+                    this.account = AccountState::NeedsReauth { address: account };
+                } else if !matches!(this.account, AccountState::Disconnected) {
+                    this.account = AccountState::Failed { reason: text };
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_compose(&mut self, seed: DraftSeed, window: &mut Window, cx: &mut Context<Self>) {
@@ -358,7 +1260,7 @@ impl MailApp {
             cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
                 SearchEvent::Open(id) => {
                     this.close_overlay(window, cx);
-                    this.open_email(*id, window, cx);
+                    this.open_email(id.clone(), window, cx);
                 }
                 SearchEvent::Dismiss => this.close_overlay(window, cx),
             });
@@ -403,18 +1305,94 @@ impl MailApp {
                 "\n\n--- Forwarded message ---\nFrom: {} <{}>\n\n{}",
                 email.sender,
                 email.address,
-                email.body.join("\n\n")
+                nori_gmail::plain_text(&email.body)
             )
         } else {
-            format!("\n\nOn {}:\n{}", email.full_date, email.body.join("\n\n"))
+            format!(
+                "\n\nOn {}:\n{}",
+                email.full_date,
+                nori_gmail::plain_text(&email.body)
+            )
         };
         DraftSeed { to, subject, body }
+    }
+
+    /// The row overflow menu, drawn as a layer above the mail shell.
+    ///
+    /// Absolutely positioned from the click point rather than from the row's
+    /// own box, for two reasons: the list is virtualized, so a row's y is only
+    /// valid on the frame it was drawn and the menu would drift if the list
+    /// scrolled; and a menu inside a list row would be clipped by the list's
+    /// overflow, cutting off the bottom of the menu on the last visible row.
+    fn render_label_menu(
+        &mut self,
+        entity: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let theme = Theme::current(cx);
+        let (email, position) = self.label_menu.clone()?;
+        let labels = self.labels.labels().to_vec();
+        let width = px(LABEL_MENU_WIDTH);
+        // Flip to the other side of the button rather than running off the
+        // right edge of a narrow window.
+        let width_offset = if position.x + width + px(16.) > px(LABEL_MENU_EDGE_GUARD) {
+            -width - px(8.)
+        } else {
+            px(8.)
+        };
+
+        Some(
+            div()
+                .id("label-menu-layer")
+                .absolute()
+                .inset_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_label_menu(cx)),
+                )
+                .child(
+                    div()
+                        .id("label-menu")
+                        .debug_selector(|| "label-menu".into())
+                        .absolute()
+                        .left(position.x + width_offset)
+                        .top(position.y)
+                        .w(width)
+                        .max_h(px(320.))
+                        .overflow_y_scroll()
+                        .p(px(5.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .bg(theme.raised)
+                        .border_1()
+                        .border_color(theme.strong_border)
+                        .shadow_lg()
+                        // Clicks inside must not reach the dismiss layer.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .children(labels.iter().map(|label| {
+                            self.render_label_menu_item(entity.clone(), email.clone(), label, theme)
+                        }))
+                        .when(labels.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .px(px(10.))
+                                    .py(px(8.))
+                                    .text_size(px(12.))
+                                    .text_color(theme.faint)
+                                    .child("No labels yet — create one in the sidebar"),
+                            )
+                        })
+                        .into_any_element(),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Search only. Compose is not an overlay: it is a second column in the
     /// workspace, so the mail list stays visible while you write.
     fn render_overlay(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let theme = self.theme;
+        let theme = Theme::current(cx);
         let child: gpui::AnyElement = if let Some(search) = &self.search {
             search.clone().into_any_element()
         } else {
@@ -481,6 +1459,50 @@ impl MailApp {
         cx.notify();
     }
 
+    /// Everything the sidebar's Labels section can ask for. The section is
+    /// `RenderOnce`, so the group state and the composer state both live here.
+    fn labels_action(&mut self, action: LabelsAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            LabelsAction::ToggleCollapsed => {
+                self.labels_collapsed = !self.labels_collapsed;
+                // Collapsing out from under a live field would leave the
+                // composer open and invisible, so expanding again would bring
+                // back a field the user thought they had dismissed.
+                if self.labels_collapsed {
+                    self.label_composer_open = false;
+                }
+            }
+            LabelsAction::ToggleComposer => {
+                if self.label_composer_open {
+                    self.close_label_composer(window, cx);
+                    return;
+                }
+                // Opening the composer from a collapsed group has to expand it,
+                // or the `+` would appear to do nothing.
+                self.labels_collapsed = false;
+                self.label_composer_open = true;
+                let field = self.new_label_field.clone();
+                window.focus(&field.read(cx).focus_handle(), cx);
+            }
+            LabelsAction::CloseComposer => {
+                if !self.label_composer_open {
+                    return;
+                }
+                self.close_label_composer(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Put the composer away and hand focus back to the `+`, so the keyboard
+    /// can open it again without reaching for the mouse.
+    fn close_label_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.label_composer_open = false;
+        self.new_label_field
+            .update(cx, |this, cx| this.set_content("", cx));
+        window.focus(&self.new_label_focus, cx);
+    }
+
     fn set_sidebar_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let next = clamp_sidebar_width(width);
         if next != self.sidebar_width {
@@ -504,8 +1526,11 @@ impl MailApp {
         }
     }
 
-    fn set_compose_pane_width(&mut self, width: f32, cx: &mut Context<Self>) {
-        let next = clamp_compose_pane_width(width);
+    /// The bound comes from the window, so widening the composer never depends
+    /// on a constant that a large display has already exhausted.
+    fn set_compose_pane_width(&mut self, width: f32, window: &Window, cx: &mut Context<Self>) {
+        let max = compose_pane_max(f32::from(window.viewport_size().width), self.sidebar_width);
+        let next = clamp_compose_pane_width(width, max);
         if next != self.compose_pane_width {
             self.compose_pane_width = next;
             cx.notify();
@@ -520,12 +1545,13 @@ impl MailApp {
         cx.notify();
     }
 
-    /// The divider sits on the pane's left edge, so dragging right *widens*
-    /// the pane: the width moves opposite to the pointer's x.
-    fn update_compose_resize(&mut self, cursor_x: f32, cx: &mut Context<Self>) {
+    /// The divider sits on the pane's left edge, so the width moves opposite
+    /// to the pointer: dragging left widens the pane, dragging right narrows
+    /// it. Both ends are clamped, and the upper clamp scales with the window.
+    fn update_compose_resize(&mut self, cursor_x: f32, window: &Window, cx: &mut Context<Self>) {
         if let Some(resize) = &self.compose_resize {
             let width = resize.start_width - (cursor_x - resize.start_x);
-            self.set_compose_pane_width(width, cx);
+            self.set_compose_pane_width(width, window, cx);
         }
     }
 
@@ -536,8 +1562,8 @@ impl MailApp {
     }
 
     /// Keyboard equivalent of the drag, so the divider is not pointer-only.
-    fn nudge_compose_pane(&mut self, step: f32, cx: &mut Context<Self>) {
-        self.set_compose_pane_width(self.compose_pane_width + step, cx);
+    fn nudge_compose_pane(&mut self, step: f32, window: &Window, cx: &mut Context<Self>) {
+        self.set_compose_pane_width(self.compose_pane_width + step, window, cx);
     }
 
     fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
@@ -648,13 +1674,13 @@ impl MailApp {
     /// Create a label from the sidebar's inline field, then clear the field.
     fn create_label(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(label) = self.labels.create(&name) else {
-            // Blank or duplicate: leave the text so it can be corrected.
+            // Blank or duplicate: leave the text and the composer open so it
+            // can be corrected.
             return;
         };
-        let field = self.new_label_field.clone();
-        self.new_label_field
-            .update(cx, |this, cx| this.set_content("", cx));
-        window.focus(&field.read(cx).focus_handle(), cx);
+        // One label per visit: the composer closes and the `+` takes focus
+        // back, rather than leaving a cleared field waiting for the next one.
+        self.close_label_composer(window, cx);
         self.selected_label = Some(label.id);
         cx.notify();
     }
@@ -682,43 +1708,131 @@ impl MailApp {
         cx.notify();
     }
 
-    /// Add or remove a label on the open mail.
+    /// The single writer for label assignment. The list row's overflow menu
+    /// routes through here so the reading view and the menu cannot drift.
     fn toggle_label(&mut self, id: LabelId, email: EmailId, cx: &mut Context<Self>) {
         self.labels.toggle(email, id);
         cx.notify();
     }
 
-    fn render_inbox(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_inbox(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
         let open_entity = entity.clone();
         let star_entity = entity.clone();
+        let menu_entity = entity.clone();
         // A selected label narrows the list to the mails carrying it, on top of
         // whatever mailbox is showing.
         let mut rows = self.store.visible_summaries();
         if let Some(label) = self.selected_label {
-            rows.retain(|row| self.labels.labels_for(row.id).contains(&label));
+            rows.retain(|row| self.labels.labels_for(&row.id).contains(&label));
         }
+        // Resolve each row's chips in row order, so the list can draw what
+        // a mail carries without reaching back into the store per row.
+        let labels: Vec<Vec<Label>> = rows
+            .iter()
+            .map(|row| {
+                self.labels
+                    .labels_for(&row.id)
+                    .iter()
+                    .filter_map(|id| self.labels.label(*id).cloned())
+                    .collect()
+            })
+            .collect();
         let selected_index = self.store.selected_index();
         Inbox::new(
             rows,
+            labels,
             selected_index,
             self.inbox_focus.clone(),
             self.inbox_scroll.clone(),
             self.density(),
-            self.theme,
             move |id, window, cx| {
                 open_entity.update(cx, |this, cx| this.open_email(id, window, cx));
             },
             move |id, _window, cx| {
                 star_entity.update(cx, |this, cx| this.toggle_star(id, cx));
             },
+            move |id, position, _window, cx| {
+                menu_entity.update(cx, |this, cx| this.open_label_menu(id, position, cx));
+            },
         )
+        .into_any_element()
+    }
+
+    /// The list, with the fetch counter beneath it.
+    ///
+    /// Nothing is drawn in place of the list while mail loads. Each message goes
+    /// into the store the moment it comes back from Gmail, so the inbox fills
+    /// in with real rows as the fetch runs.
+    ///
+    /// Deliberately returns the list with no wrapper. An earlier version
+    /// wrapped it in a column to carry the fetch counter, and that wrapper
+    /// collapsed the list to zero height for the whole length of every sync —
+    /// blanking the inbox at exactly the moment it was being waited on. The
+    /// counter is a sibling of the split instead, so nothing ever wraps the
+    /// list.
+    fn render_list(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.render_inbox(cx)
+    }
+
+    /// Move mail from the fetch into the list, as it arrives.
+    ///
+    /// The workers hand each message over a channel; this drains that channel
+    /// onto the main thread and repaints. Drained with `try_recv` on a timer
+    /// rather than a blocking receive, because this runs on the foreground
+    /// executor and blocking there would freeze the window — which is the one
+    /// thing the whole exercise is meant to avoid.
+    ///
+    /// The loop ends by itself: the fetch closes the stream when it is done, so
+    /// the channel reports disconnected and this is not a permanent timer.
+    fn pump_incoming(&self, mut incoming: nori_gmail::IncomingMail, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut batch = Vec::new();
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(60))
+                    .await;
+                batch.clear();
+                let open = nori_gmail::drain(&mut incoming, &mut batch);
+                let arrived = !batch.is_empty();
+                let _ = this.update(cx, |this, cx| {
+                    for remote in batch.drain(..) {
+                        this.store
+                            .upsert(crate::model::to_email(&remote, this.fetch_account()));
+                    }
+                    if arrived {
+                        cx.notify();
+                    }
+                });
+                if !open && !arrived {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The account newly fetched mail belongs to. Falls back to the connected
+    /// account; the stream is only ever created for a real one.
+    fn fetch_account(&self) -> &str {
+        self.account.address().unwrap_or_default()
+    }
+
+    /// The "34 of 80" line, only while a fetch is running.
+    fn render_sync_counter(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.syncing {
+            return None;
+        }
+        Some(crate::views::syncing::counter(
+            Theme::current(cx),
+            self.sync_stream.as_ref().and_then(|stream| stream.label()),
+        ))
     }
 }
 
 impl Render for MailApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::current(cx);
         let entity = cx.entity();
         let sidebar_entity = entity.clone();
         let sidebar_search_entity = entity.clone();
@@ -731,21 +1845,21 @@ impl Render for MailApp {
         let resize_start_entity = entity.clone();
         let resize_step_entity = entity.clone();
         let label_entity = entity.clone();
+        let labels_action_entity = entity.clone();
         let create_label_entity = entity.clone();
         let delete_label_entity = entity.clone();
         let rename_label_entity = entity.clone();
-        let counts = [
-            self.store.count(Mailbox::Inbox),
-            self.store.count(Mailbox::Starred),
-            self.store.count(Mailbox::Sent),
-            self.store.count(Mailbox::Drafts),
-            self.store.count(Mailbox::Archive),
-            self.store.count(Mailbox::Trash),
-        ];
+        // From the server when the account is connected, so a folder Nori has
+        // not downloaded yet still shows what it holds rather than a zero that
+        // reads as lost mail. Falls back to the local index otherwise, which is
+        // what sample mail needs.
+        let counts: [usize; 6] = std::array::from_fn(|index| {
+            let mailbox = Mailbox::NAV_ITEMS[index];
+            self.account.count_of(mailbox, self.store.count(mailbox))
+        });
         let sidebar = Sidebar::new(
             self.store.selected_mailbox(),
             counts,
-            theme,
             self.sidebar_width,
             self.sidebar_visible,
             self.mailboxes_collapsed,
@@ -779,7 +1893,13 @@ impl Render for MailApp {
             },
             self.labels.labels().to_vec(),
             self.selected_label,
+            self.labels_collapsed,
+            self.label_composer_open,
             self.new_label_field.clone(),
+            self.new_label_focus.clone(),
+            move |action, window, cx| {
+                labels_action_entity.update(cx, |this, cx| this.labels_action(action, window, cx));
+            },
             move |label, _window, cx| {
                 label_entity.update(cx, |this, cx| this.select_label(label, cx));
             },
@@ -814,7 +1934,7 @@ impl Render for MailApp {
             )
         } else {
             match self.store.workspace_view() {
-                WorkspaceView::Email(id) => match self.store.email(id) {
+                WorkspaceView::Email(id) => match self.store.email(&id) {
                     Some(email) => (
                         Some(email.mailbox.label().into()),
                         email.subject.clone().into(),
@@ -830,8 +1950,8 @@ impl Render for MailApp {
             .iter()
             .filter_map(|id| {
                 self.store
-                    .email(*id)
-                    .map(|email| (*id, email.subject.clone().into()))
+                    .email(id)
+                    .map(|email| (id.clone(), email.subject.clone().into()))
             })
             .collect();
         let tab_entity = cx.entity();
@@ -843,7 +1963,6 @@ impl Render for MailApp {
             Some(EmailTabs::new(
                 tabs,
                 self.store.active_tab(),
-                theme,
                 self.tab_scroll.clone(),
                 move |id, window, cx| {
                     select_tab_entity.update(cx, |this, cx| this.open_email(id, window, cx));
@@ -857,24 +1976,18 @@ impl Render for MailApp {
                 },
             ))
         };
-        let top_bar = TopBar::new(
-            theme,
-            self.sidebar_visible,
-            prefix,
-            title,
-            move |window, cx| {
-                top_toggle_entity.update(cx, |this, cx| this.toggle_sidebar(window, cx));
-            },
-        );
+        let top_bar = TopBar::new(self.sidebar_visible, prefix, title, move |window, cx| {
+            top_toggle_entity.update(cx, |this, cx| this.toggle_sidebar(window, cx));
+        });
         let workspace: gpui::AnyElement = match self.settings.clone() {
             // Settings holds the workspace beside the mail sidebar. The mail
             // views are not built at all while it is open, so the list behind
             // it costs nothing.
             Some(settings) => settings.into_any_element(),
             None => match self.store.workspace_view() {
-                WorkspaceView::Mailbox => self.render_inbox(cx).into_any_element(),
+                WorkspaceView::Mailbox => self.render_list(cx),
                 WorkspaceView::Email(id) => {
-                    if let Some(email) = self.store.email(id).cloned() {
+                    if let Some(email) = self.store.email(&id).cloned() {
                         let reply = Self::reply_seed(&email, false, false);
                         let reply_all = Self::reply_seed(&email, true, false);
                         let forward = Self::reply_seed(&email, false, true);
@@ -883,12 +1996,11 @@ impl Render for MailApp {
                         let reply_all_entity = view_entity.clone();
                         let forward_entity = view_entity.clone();
                         let pin_entity = view_entity.clone();
-                        let label_assign_entity = view_entity.clone();
-                        let email_id = email.id;
+                        let email_id = email.id.clone();
                         EmailView::new(
                             email,
                             self.workspace_focus.clone(),
-                            theme,
+                            self.images.clone(),
                             move |window, cx| {
                                 reply_entity.update(cx, |this, cx| {
                                     this.open_compose(reply.clone(), window, cx)
@@ -905,23 +2017,19 @@ impl Render for MailApp {
                                 });
                             },
                             move |_window, cx| {
-                                pin_entity.update(cx, |this, cx| this.toggle_pin(email_id, cx));
-                            },
-                            self.labels.labels().to_vec(),
-                            self.labels.labels_for(email_id).to_vec(),
-                            move |label, _window, cx| {
-                                label_assign_entity
-                                    .update(cx, |this, cx| this.toggle_label(label, email_id, cx));
+                                pin_entity
+                                    .update(cx, |this, cx| this.toggle_pin(email_id.clone(), cx));
                             },
                         )
                         .into_any_element()
                     } else {
-                        self.render_inbox(cx).into_any_element()
+                        self.render_list(cx)
                     }
                 }
             },
         };
         let overlay = self.render_overlay(cx);
+        let label_menu = self.render_label_menu(entity, cx);
         let settings_open = self.settings.is_some();
         // Compose's column. Fixed width rather than a percentage so the mail
         // list keeps a readable measure instead of being squeezed by however
@@ -934,8 +2042,15 @@ impl Render for MailApp {
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(px(-5.))
-                .w(px(10.))
+                // The strip is invisible, so it has to be generous, and it must
+                // straddle the seam: the visible edge users aim at is the
+                // shell's left border, so a press a few pixels into the mail
+                // side has to start the drag too. An inside-only strip made
+                // every grab from the mail side a miss, which read as "drag
+                // left does nothing" because growing the composer is exactly
+                // the gesture that starts from that side.
+                .left(px(-8.))
+                .w(px(24.))
                 .cursor(CursorStyle::ResizeLeftRight)
                 .role(Role::Splitter)
                 .aria_label("Resize compose")
@@ -954,7 +2069,7 @@ impl Render for MailApp {
                 })
                 .on_key_down({
                     let resize_entity = resize_entity.clone();
-                    move |event, _window, cx| {
+                    move |event, window, cx| {
                         let step = if event.keystroke.modifiers.shift {
                             40.
                         } else {
@@ -967,37 +2082,33 @@ impl Render for MailApp {
                                 } else {
                                     -step
                                 };
-                                resize_entity
-                                    .update(cx, |this, cx| this.nudge_compose_pane(delta, cx));
+                                resize_entity.update(cx, |this, cx| {
+                                    this.nudge_compose_pane(delta, window, cx)
+                                });
                                 cx.stop_propagation();
                             }
                             "home" => {
                                 resize_entity.update(cx, |this, cx| {
-                                    this.set_compose_pane_width(COMPOSE_PANE_MIN, cx)
+                                    this.set_compose_pane_width(COMPOSE_PANE_MIN, window, cx)
                                 });
                                 cx.stop_propagation();
                             }
                             "end" => {
+                                // As wide as this window allows, which is not a
+                                // fixed number.
                                 resize_entity.update(cx, |this, cx| {
-                                    this.set_compose_pane_width(COMPOSE_PANE_MAX, cx)
+                                    let max = compose_pane_max(
+                                        f32::from(window.viewport_size().width),
+                                        this.sidebar_width,
+                                    );
+                                    this.set_compose_pane_width(max, window, cx)
                                 });
                                 cx.stop_propagation();
                             }
                             _ => {}
                         }
                     }
-                })
-                .child(
-                    // Only lights up on hover, matching the sidebar's handle.
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(px(4.))
-                        .w(px(2.))
-                        .bg(transparent_black())
-                        .group_hover("compose-resize", |style| style.bg(theme.focus)),
-                );
+                });
 
             div()
                 .id("compose-pane-shell")
@@ -1007,11 +2118,29 @@ impl Render for MailApp {
                 .w(px(self.compose_pane_width))
                 .h_full()
                 .flex()
-                .border_l_1()
-                .border_color(theme.hairline_strong)
                 .child(compose)
                 .child(handle)
         });
+        // Explicit width for the mail column while compose is open. Flex
+        // minimums follow content width here, so a flex_1 main refuses to
+        // shrink below the reading view's measure: the composer then grows
+        // past the window edge (Send slides off-screen) instead of the seam
+        // travelling. Deriving the width from the window makes the seam
+        // track the divider 1:1 by construction.
+        let main_width = match (&compose_pane, settings_open) {
+            (Some(_), false) => {
+                let sidebar = if self.sidebar_visible {
+                    self.sidebar_width
+                } else {
+                    0.
+                };
+                Some(
+                    (f32::from(window.viewport_size().width) - sidebar - self.compose_pane_width)
+                        .max(0.),
+                )
+            }
+            _ => None,
+        };
 
         div()
             .id("mail-app")
@@ -1031,9 +2160,9 @@ impl Render for MailApp {
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_tab_strip))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.update_sidebar_resize(event.position.x.as_f32(), cx);
-                this.update_compose_resize(event.position.x.as_f32(), cx);
+                this.update_compose_resize(event.position.x.as_f32(), window, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -1073,24 +2202,90 @@ impl Render for MailApp {
                                 .flex_1()
                                 .min_h_0()
                                 .flex()
+                                // Stretch the children to the row's height. Without
+                                // it `workspace-main` takes its content height, and
+                                // since the list inside it sizes with `flex_1` that
+                                // is circular: a short list looks fine, and a long
+                                // one — more rows than the viewport — collapses to
+                                // nothing because nothing tells the list how tall it
+                                // is allowed to be.
+                                .items_stretch()
                                 .child(
                                     div()
                                         .id("workspace-main")
-                                        .flex_1()
-                                        .min_w_0()
                                         .flex()
+                                        .h_full()
+                                        .min_h_0()
+                                        // Clip, never overflow: without this a
+                                        // wide reading view pushes the row
+                                        // past the window edge.
+                                        .overflow_hidden()
+                                        .when_some(main_width, |this, w| this.w(px(w)).flex_none())
+                                        .when(main_width.is_none(), |this| this.flex_1().min_w_0())
                                         .child(workspace),
                                 )
                                 .when_some(
                                     compose_pane.filter(|_| !settings_open),
                                     |this, pane| this.child(pane),
                                 ),
-                        ),
+                        )
+                        // The fetch counter, below the split rather than around
+                        // the list: it sizes to its own text and the list keeps
+                        // the full height of whatever is left.
+                        .when_some(self.render_sync_counter(cx), |this, counter| {
+                            this.child(div().flex_none().child(counter))
+                        }),
                 ),
             )
             .when(!settings_open, |this| {
                 this.when_some(overlay, |this, overlay| this.child(overlay))
             })
+            .when_some(label_menu, |this, menu| this.child(menu))
+            // Mounted last, so it sits above every other surface, and only
+            // while a divider is actually being dragged. The root's own
+            // `on_mouse_move` has to rely on the event bubbling up through
+            // whatever the pointer is currently over, and a drag that crosses
+            // from the compose pane onto the scrolling reading view (or the
+            // other way round) is exactly the case where that path is
+            // unreliable. A full-window overlay removes the question: the
+            // pointer is always over the one element that wants the event.
+            .when(
+                self.compose_resize.is_some() || self.sidebar_resize.is_some(),
+                |this| {
+                    this.child(
+                        div()
+                            .id("divider-drag-overlay")
+                            .debug_selector(|| "divider-drag-overlay".into())
+                            .absolute()
+                            .inset_0()
+                            .cursor(CursorStyle::ResizeLeftRight)
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, window, cx| {
+                                    this.update_sidebar_resize(event.position.x.as_f32(), cx);
+                                    this.update_compose_resize(
+                                        event.position.x.as_f32(),
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                    this.end_sidebar_resize(cx);
+                                    this.end_compose_resize(cx);
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                                    this.end_sidebar_resize(cx);
+                                    this.end_compose_resize(cx);
+                                }),
+                            ),
+                    )
+                },
+            )
     }
 }
 
@@ -1098,10 +2293,10 @@ impl Render for MailApp {
 mod tests {
     use super::*;
     use crate::actions::{CloseTab, Compose, OpenSelected};
-    use gpui::{AppContext, TestAppContext, VisualTestContext};
+    use gpui::{AppContext, TestAppContext, VisualTestContext, WindowHandle};
 
-    const COMPOSE_PANE_MAX: f32 = super::COMPOSE_PANE_MAX;
     const COMPOSE_PANE_MIN: f32 = super::COMPOSE_PANE_MIN;
+    const MIN_READING_PANE_WIDTH: f32 = super::MIN_READING_PANE_WIDTH;
 
     #[gpui::test]
     fn starts_in_inbox_and_opens_selected_email(cx: &mut TestAppContext) {
@@ -1144,7 +2339,7 @@ mod tests {
             WorkspaceView::Email(id) => id,
             WorkspaceView::Mailbox => panic!("opening a mail should show it"),
         };
-        app.update(&mut cx, |app, cx| app.toggle_pin(id, cx));
+        app.update(&mut cx, |app, cx| app.toggle_pin(id.clone(), cx));
         assert_eq!(app.read_with(&cx, |app, _| app.store.tabs().len()), 1);
         let workspace_focus = app.read_with(&cx, |app, _| app.workspace_focus.clone());
         cx.update(|window, cx| workspace_focus.dispatch_action(&CloseTab, window, cx));
@@ -1357,7 +2552,7 @@ mod tests {
         );
 
         // Pinning it earns the tab.
-        app.update(&mut cx, |app, cx| app.toggle_pin(id, cx));
+        app.update(&mut cx, |app, cx| app.toggle_pin(id.clone(), cx));
         cx.run_until_parked();
         assert!(
             cx.debug_bounds("email-tabs").is_some(),
@@ -1396,7 +2591,7 @@ mod tests {
             WorkspaceView::Email(id) => id,
             WorkspaceView::Mailbox => panic!("opening a mail should show it"),
         };
-        app.update(&mut cx, |app, cx| app.toggle_pin(id, cx));
+        app.update(&mut cx, |app, cx| app.toggle_pin(id.clone(), cx));
         cx.run_until_parked();
         assert!(cx.debug_bounds("email-tabs").is_some());
 
@@ -1410,7 +2605,7 @@ mod tests {
             "the keybind hides the strip"
         );
         assert!(
-            app.read_with(&cx, |app, _| app.store.email(id).is_some_and(|e| e.pinned)),
+            app.read_with(&cx, |app, _| app.store.email(&id).is_some_and(|e| e.pinned)),
             "hiding the strip must not unpin the mail"
         );
 
@@ -1452,7 +2647,7 @@ mod tests {
         );
         assert_eq!(
             app.read_with(&cx, |app, _| app.store.workspace_view()),
-            WorkspaceView::Email(EmailId(1)),
+            WorkspaceView::Email(EmailId::from(1)),
             "clicking a result should open that mail"
         );
     }
@@ -1531,6 +2726,390 @@ mod tests {
         );
     }
 
+    /// Widening the pane was reported dead while narrowing it worked. The
+    /// delta math is symmetric, so the useful guard is that a leftward drag
+    /// moves the seam by exactly the distance the pointer travelled, and that
+    /// a rightward drag mirrors it.
+    #[gpui::test]
+    fn the_compose_divider_moves_both_ways_by_the_same_distance(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+        cx.update(|window, cx| focus.dispatch_action(&Compose, window, cx));
+        cx.run_until_parked();
+
+        let seam_x = |cx: &mut VisualTestContext| {
+            f32::from(cx.debug_bounds("compose-pane-shell").unwrap().origin.x)
+        };
+        let y = gpui::px(300.);
+
+        let drag = |cx: &mut VisualTestContext, dx: f32| {
+            let seam = seam_x(cx);
+            let grab = gpui::Point::new(gpui::px(seam + 6.), y);
+            cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::default());
+            let to = gpui::Point::new(grab.x + gpui::px(dx), y);
+            cx.simulate_mouse_move(
+                to,
+                Some(gpui::MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.run_until_parked();
+            let after = seam_x(cx);
+            cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::default());
+            cx.run_until_parked();
+            (seam, after)
+        };
+
+        let (start, after_left) = drag(&mut cx, -120.);
+        assert!(
+            after_left < start,
+            "dragging left must widen the pane: seam {start} -> {after_left}"
+        );
+        assert!(
+            (start - after_left - 120.).abs() <= 1.,
+            "the seam should track the pointer 1:1, moved {} for a 120px drag",
+            start - after_left
+        );
+
+        let (_, after_right) = drag(&mut cx, 120.);
+        assert!(
+            (after_right - after_left - 120.).abs() <= 1.,
+            "dragging right must mirror it exactly: {after_left} -> {after_right}"
+        );
+    }
+
+    /// The reported bug: dragging the seam left did nothing, because the
+    /// composer was already pinned against a flat 960px ceiling. On a wide
+    /// window that ceiling is reached long before the pointer runs out of
+    /// room, so the divider felt welded in one direction.
+    #[gpui::test]
+    fn a_wide_window_lets_the_composer_grow_past_the_old_flat_ceiling(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        // A large display, where the flat ceiling used to bite.
+        cx.simulate_resize(gpui::size(gpui::px(2832.), gpui::px(1500.)));
+        let app = window.root(&mut cx).unwrap();
+        let inbox = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+        cx.update(|window, cx| inbox.dispatch_action(&OpenSelected, window, cx));
+        cx.run_until_parked();
+        let workspace = app.read_with(&cx, |app, _| app.workspace_focus.clone());
+        cx.update(|window, cx| workspace.dispatch_action(&Compose, window, cx));
+        cx.run_until_parked();
+
+        let seam_x = |cx: &mut VisualTestContext| {
+            f32::from(cx.debug_bounds("compose-pane-shell").unwrap().origin.x)
+        };
+        let y = gpui::px(600.);
+
+        let grab = gpui::Point::new(gpui::px(seam_x(&mut cx) + 6.), y);
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::default());
+        // Drag a long way left, well past the old 960px ceiling.
+        let far = gpui::Point::new(gpui::px(600.), y);
+        cx.simulate_mouse_move(
+            far,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let grown = app.read_with(&cx, |app, _| app.compose_pane_width);
+        let seam_after = seam_x(&mut cx);
+        cx.simulate_mouse_up(far, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            grown > 960.,
+            "a wide window must let the composer pass the old flat ceiling, got {grown}"
+        );
+        // It must stop at the window-derived bound, not run away with the window.
+        let expected = compose_pane_max(2832., app.read_with(&cx, |app, _| app.sidebar_width));
+        assert!(
+            grown <= expected + 0.5,
+            "the composer must respect the window-derived maximum: {grown} > {expected}"
+        );
+        // And the mail pane must survive beside it.
+        let reading = seam_after - app.read_with(&cx, |app, _| app.sidebar_width);
+        assert!(
+            reading >= MIN_READING_PANE_WIDTH,
+            "the reading pane must keep a usable width, got {reading}"
+        );
+    }
+
+    /// The bound has to shrink on a narrow window too, or a small screen would
+    /// let the composer crowd the mail out entirely.
+    #[gpui::test]
+    fn a_narrow_window_shrinks_the_composers_ceiling(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(700.)));
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+        cx.update(|window, cx| focus.dispatch_action(&Compose, window, cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.set_compose_pane_width(10_000., window, cx)
+            });
+        });
+        let wide_max = compose_pane_max(2832., app.read_with(&cx, |app, _| app.sidebar_width));
+        let narrow_max = compose_pane_max(900., app.read_with(&cx, |app, _| app.sidebar_width));
+        assert!(
+            narrow_max < wide_max,
+            "a narrow window must cap the composer lower: {narrow_max} vs {wide_max}"
+        );
+        assert_eq!(
+            app.read_with(&cx, |app, _| app.compose_pane_width),
+            narrow_max
+        );
+        // Never below the minimum, or the fields become unusable.
+        assert!(
+            narrow_max >= COMPOSE_PANE_MIN,
+            "the ceiling must never fall under the minimum: {narrow_max}"
+        );
+    }
+
+    /// The keyboard nudges run through the same clamp as the drag but never
+    /// touch a mouse event, so they isolate the arithmetic. `nudge` is what
+    /// the divider's Left/Right keys call.
+    #[gpui::test]
+    fn the_divider_nudges_both_ways_by_the_same_distance(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+        cx.update(|window, cx| focus.dispatch_action(&Compose, window, cx));
+        cx.run_until_parked();
+
+        let start = app.read_with(&cx, |app, _| app.compose_pane_width);
+        let nudge = |cx: &mut VisualTestContext, step: f32| {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.nudge_compose_pane(step, window, cx));
+            });
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| app.compose_pane_width)
+        };
+
+        // The divider's Left key nudges by +12, Right by -12.
+        let widened = nudge(&mut cx, 12.);
+        let narrowed = nudge(&mut cx, -12.);
+
+        assert!(
+            widened > start,
+            "a positive nudge must widen the pane: {start} -> {widened}"
+        );
+        assert!(
+            (widened - narrowed - 12.).abs() <= 0.5,
+            "the reverse nudge must undo the first exactly: {widened} vs {narrowed}"
+        );
+        assert!(
+            (narrowed - start).abs() <= 0.5,
+            "a left/right pair must be a no-op, not a drift: {start} -> {narrowed}"
+        );
+
+        // And the clamps are reachable in both directions, so neither end is
+        // a wall that only opens one way.
+        let floored = nudge(&mut cx, -10_000.);
+        assert_eq!(floored, COMPOSE_PANE_MIN);
+        let ceiled = nudge(&mut cx, 20_000.);
+        assert_eq!(
+            ceiled,
+            compose_pane_max(1400., app.read_with(&cx, |app, _| app.sidebar_width)),
+            "the ceiling must be the window-derived maximum, not a flat constant"
+        );
+        assert!(
+            ceiled > floored,
+            "the ceiling must be above the floor, or one direction is dead: {floored} vs {ceiled}"
+        );
+    }
+
+    /// A drag that crosses from the compose pane onto the scrolling reading
+    /// view used to die there, so only one direction worked. While a drag is
+    /// live a full-window overlay must exist, and it must keep receiving
+    /// moves even when the pointer is far outside the compose pane.
+    #[gpui::test]
+    fn a_live_drag_is_carried_by_a_full_window_overlay(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1800.), gpui::px(900.)));
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+        cx.update(|window, cx| focus.dispatch_action(&Compose, window, cx));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("divider-drag-overlay").is_none(),
+            "no overlay before a drag starts"
+        );
+
+        let seam = cx.debug_bounds("compose-pane-shell").unwrap().origin.x;
+        let y = gpui::px(300.);
+        let grab = gpui::Point::new(seam + gpui::px(6.), y);
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let overlay = cx
+            .debug_bounds("divider-drag-overlay")
+            .expect("a live drag must mount the overlay");
+        assert!(
+            overlay.origin.x <= gpui::px(0.) && overlay.size.width >= gpui::px(1800.),
+            "the overlay must cover the window, not just the pane: {overlay:?}"
+        );
+
+        // Now drag well past the reading pane's own content, the way a hand
+        // travelling left would, and check the pane grew by the same amount.
+        let start = app.read_with(&cx, |app, _| app.compose_pane_width);
+        let far = gpui::Point::new(grab.x - gpui::px(300.), y);
+        cx.simulate_mouse_move(
+            far,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let grown = app.read_with(&cx, |app, _| app.compose_pane_width);
+        cx.simulate_mouse_up(far, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            (grown - start - 300.).abs() <= 1.,
+            "dragging 300px left over the reading view must widen the pane by 300: {start} -> {grown}"
+        );
+        assert!(
+            cx.debug_bounds("divider-drag-overlay").is_none(),
+            "releasing must tear the overlay down"
+        );
+    }
+
+    /// The reported failure: with an email open *and* compose showing, the
+    /// divider would not budge. The reading pane fills the space the handle
+    /// used to straddle, so the grab strip has to live inside the compose
+    /// pane and be wide enough to hit by hand.
+    #[gpui::test]
+    fn the_compose_divider_drags_while_reading_an_email(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        let inbox_focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+
+        // Read a mail, then open compose beside it.
+        cx.update(|window, cx| inbox_focus.dispatch_action(&OpenSelected, window, cx));
+        cx.run_until_parked();
+        let workspace_focus = app.read_with(&cx, |app, _| app.workspace_focus.clone());
+        cx.update(|window, cx| workspace_focus.dispatch_action(&Compose, window, cx));
+        cx.run_until_parked();
+        assert!(
+            matches!(
+                app.read_with(&cx, |app, _| app.store.workspace_view()),
+                WorkspaceView::Email(_)
+            ),
+            "this test is only meaningful while an email is open"
+        );
+
+        let shell = cx
+            .debug_bounds("compose-pane-shell")
+            .expect("compose renders beside the reading view");
+        let handle = cx
+            .debug_bounds("compose-pane-resize")
+            .expect("the divider renders");
+        assert!(
+            handle.origin.x < shell.origin.x,
+            "the grab strip must reach across the seam onto the mail side: handle {:?} shell {:?}",
+            handle,
+            shell
+        );
+        assert!(
+            handle.size.width >= gpui::px(20.),
+            "an invisible grab strip narrower than 20px is a coin flip: {:?}",
+            handle.size.width
+        );
+
+        let pane_width =
+            |cx: &mut VisualTestContext| cx.debug_bounds("compose-pane-shell").unwrap().size.width;
+        let start = pane_width(&mut cx);
+
+        // Grab just onto the *mail* side of the seam, the way a hand aiming
+        // at the visible edge does, and drag left to widen the pane. This is
+        // the gesture that used to be a clean miss.
+        let grab = gpui::Point::new(
+            shell.origin.x - gpui::px(4.),
+            shell.origin.y + gpui::px(300.),
+        );
+        cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::default());
+        let moved = gpui::Point::new(grab.x - gpui::px(80.), grab.y);
+        cx.simulate_mouse_move(
+            moved,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let widened = pane_width(&mut cx);
+        cx.simulate_mouse_up(moved, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            widened > start,
+            "dragging the divider left while reading should widen the pane, {start:?} -> {widened:?}"
+        );
+
+        // The width state growing is not enough: the seam itself must travel
+        // left by the same distance, and the pane's right edge must stay
+        // inside the window. Without that, the composer grows past the
+        // window edge instead — the Send button slides off-screen right
+        // while the mail view keeps every pixel.
+        let shell_after = cx
+            .debug_bounds("compose-pane-shell")
+            .expect("compose still renders after the drag");
+        let seam_travelled = f32::from(shell.origin.x) - f32::from(shell_after.origin.x);
+        assert!(
+            (seam_travelled - 80.).abs() <= 2.,
+            "the seam must follow the pointer 1:1, travelled {seam_travelled} for an 80px drag"
+        );
+        let right_edge = f32::from(shell_after.origin.x) + f32::from(shell_after.size.width);
+        assert!(
+            right_edge <= 1400. + 1.,
+            "the composer must not run past the window edge, right edge at {right_edge}"
+        );
+    }
+
     #[gpui::test]
     fn the_compose_divider_resizes_the_pane(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
@@ -1578,20 +3157,324 @@ mod tests {
             "dragging the divider left should widen the pane, {start:?} -> {widened:?}"
         );
 
-        // And the clamp holds at the ends.
-        cx.update(|_, cx| {
-            app.update(cx, |this, cx| this.set_compose_pane_width(10_000., cx));
+        // And the clamps hold at the ends, with the upper one derived from
+        // the window rather than a flat constant.
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.set_compose_pane_width(10_000., window, cx)
+            });
         });
         assert_eq!(
             app.read_with(&cx, |app, _| app.compose_pane_width),
-            COMPOSE_PANE_MAX
+            compose_pane_max(1400., app.read_with(&cx, |app, _| app.sidebar_width))
         );
-        cx.update(|_, cx| {
-            app.update(cx, |this, cx| this.set_compose_pane_width(0., cx));
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| this.set_compose_pane_width(0., window, cx));
         });
         assert_eq!(
             app.read_with(&cx, |app, _| app.compose_pane_width),
             COMPOSE_PANE_MIN
+        );
+    }
+
+    #[gpui::test]
+    fn the_row_menu_assigns_labels_and_the_list_shows_chips(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+
+        // Mail 1 is seeded with the "Work" label. The row must draw it as a
+        // chip immediately left of the subject.
+        let work = app
+            .read_with(&cx, |app, _| {
+                app.labels
+                    .labels()
+                    .iter()
+                    .find(|label| label.name == "Work")
+                    .map(|label| label.id)
+            })
+            .expect("the Work label should be seeded");
+        assert_eq!(
+            app.read_with(&cx, |app, _| app
+                .labels
+                .labels_for(&EmailId::from(1))
+                .to_vec()),
+            vec![work]
+        );
+        assert!(
+            cx.debug_bounds(format!("row-label-1-{work}").leak())
+                .is_some(),
+            "an assigned label must show left of the row's subject"
+        );
+
+        // Open the menu from the row's overflow button.
+        let button = cx
+            .debug_bounds("row-menu-1")
+            .expect("every row should carry an overflow button");
+        let mods = gpui::Modifiers::default();
+        cx.simulate_mouse_down(button.center(), gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_up(button.center(), gpui::MouseButton::Left, mods);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("label-menu").is_some(),
+            "the overflow button should open the label menu"
+        );
+
+        // Toggling a label from the menu assigns it, and leaves the menu open
+        // so a second label is one click away.
+        let personal = app
+            .read_with(&cx, |app, _| {
+                app.labels
+                    .labels()
+                    .iter()
+                    .find(|label| label.name == "Personal")
+                    .map(|label| label.id)
+            })
+            .expect("the Personal label should be seeded");
+        assert!(!app.read_with(&cx, |app, _| {
+            app.labels.labels_for(&EmailId::from(1)).contains(&personal)
+        }));
+        let item = cx
+            .debug_bounds(format!("label-menu-item-{personal}").leak())
+            .expect("the menu should list the Personal label");
+        cx.simulate_click(item.center(), mods);
+        cx.run_until_parked();
+        assert!(
+            app.read_with(&cx, |app, _| app
+                .labels
+                .labels_for(&EmailId::from(1))
+                .contains(&personal)),
+            "picking a label in the menu should assign it"
+        );
+        assert!(
+            cx.debug_bounds("label-menu").is_some(),
+            "the menu stays open so a second label is one click away"
+        );
+
+        // Escape closes it.
+        cx.update(|window, cx| focus.dispatch_action(&Dismiss, window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("label-menu").is_none());
+
+        // The newly assigned label now rides on the row beside the first one.
+        assert!(
+            cx.debug_bounds(format!("row-label-1-{personal}").leak())
+                .is_some(),
+            "assigning a label from the menu must add its chip to the row"
+        );
+    }
+
+    /// The three-line layout carries the same chips on the subject line, so
+    /// switching density never hides what a mail is tagged with.
+    #[gpui::test]
+    fn comfortable_rows_show_label_chips_left_of_the_subject(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.set_setting(Setting::CompactRows, false, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Mail 1 is seeded with the Work label.
+        let work = app
+            .read_with(&cx, |app, _| {
+                app.labels
+                    .labels()
+                    .iter()
+                    .find(|label| label.name == "Work")
+                    .map(|label| label.id)
+            })
+            .expect("the Work label should be seeded");
+        let chip = cx
+            .debug_bounds(format!("row-label-1-{work}").leak())
+            .expect("the comfortable row must draw the assigned chip");
+        let row = cx
+            .debug_bounds("email-row-1")
+            .expect("the row should be rendered");
+        assert!(
+            chip.origin.x > row.origin.x,
+            "the chip must sit inside the row, not on its edge: {chip:?} vs {row:?}"
+        );
+        assert!(
+            chip.size.width > gpui::px(0.),
+            "the chip must have a real width: {chip:?}"
+        );
+    }
+
+    /// The list must draw rows both when idle and while a sync is in flight.
+    ///
+    /// The second case is the one that matters: the fetch counter used to
+    /// arrive wrapped around the list, and that wrapper collapsed the list to
+    /// zero height, so the inbox went blank for the whole length of every
+    /// sync — precisely when it was being waited on.
+    #[gpui::test]
+    fn rows_draw_while_a_sync_is_in_flight(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        let load = |cx: &mut VisualTestContext, syncing: bool| {
+            cx.update(|_, cx| {
+                app.update(cx, |this, cx| {
+                    let mail: Vec<crate::model::Email> = (0..20)
+                        .map(|n| crate::model::Email {
+                            id: EmailId(format!("s{n}").leak().to_string()),
+                            sender: format!("Sender {n}"),
+                            subject: format!("Subject {n}"),
+                            preview: format!("Preview {n}"),
+                            timestamp: "Sep 26".to_string(),
+                            mailbox: Mailbox::Inbox,
+                            ..Default::default()
+                        })
+                        .collect();
+                    this.store.restore(mail, None);
+                    this.syncing = syncing;
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+        };
+
+        for syncing in [false, true] {
+            load(&mut cx, syncing);
+            let list = cx.debug_bounds("email-list").expect("the list is rendered");
+            assert!(
+                list.size.height > gpui::px(400.),
+                "the list must keep its height while syncing={syncing}, got {list:?}"
+            );
+            let row = cx
+                .debug_bounds("email-row-s0")
+                .unwrap_or_else(|| panic!("a row must draw while syncing={syncing}"));
+            assert!(
+                row.size.height > gpui::px(0.),
+                "the row must have height while syncing={syncing}, got {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_formats_sniff_from_magic_bytes() {
+        assert_eq!(
+            sniff_image_format(&[0x89, b'P', b'N', b'G', 0]),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            sniff_image_format(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            sniff_image_format(b"GIF89a\x01\x00"),
+            Some(ImageFormat::Gif)
+        );
+        assert_eq!(
+            sniff_image_format(b"RIFF\x00\x00\x00\x00WEBPVP8\x00"),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(sniff_image_format(b"<svg"), None, "XML is not a picture");
+        assert_eq!(sniff_image_format(&[]), None);
+        assert_eq!(sniff_image_format(b"hello"), None);
+    }
+
+    #[test]
+    fn only_absolute_https_pictures_fetch() {
+        assert!(is_fetchable_image_url("https://img.example/a.jpg"));
+        assert!(!is_fetchable_image_url("http://img.example/a.jpg"));
+        assert!(!is_fetchable_image_url("https://"));
+        assert!(!is_fetchable_image_url("/relative/a.jpg"));
+        assert!(!is_fetchable_image_url(""));
+    }
+
+    #[gpui::test]
+    fn the_image_cache_restarts_instead_of_growing_forever(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                for index in 0..MAX_CACHED_IMAGES + 100 {
+                    this.insert_image_slot(
+                        format!("https://img.example/{index}.jpg"),
+                        ImageSlot::Failed,
+                    );
+                }
+            });
+        });
+        assert!(
+            app.read_with(&cx, |app, _| app.images.len()) <= MAX_CACHED_IMAGES,
+            "hundreds of failed pictures must not accumulate without bound"
+        );
+    }
+
+    #[gpui::test]
+    fn opening_a_mail_with_pictures_queues_downloads(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        // Mail 1 gets a rich body with a picture before it opens.
+        cx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                this.store.set_body(
+                    &EmailId::from(1),
+                    vec![nori_gmail::RichBlock::Image {
+                        src: "https://img.example/a.jpg".to_string(),
+                        alt: "A".to_string(),
+                        link: None,
+                    }],
+                );
+            });
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| this.open_email(EmailId::from(1), window, cx));
+        });
+        cx.run_until_parked();
+
+        // img.example never resolves, so the slot settles failed — but the
+        // point is the open queued it at all.
+        assert!(
+            app.read_with(&cx, |app, _| app
+                .images
+                .contains_key("https://img.example/a.jpg")),
+            "opening a mail with pictures must queue their downloads"
         );
     }
 
@@ -1632,6 +3515,203 @@ mod tests {
         ));
     }
 
+    /// Open the app tall enough that the sidebar's scrolled nav lays out the
+    /// labels section, which sits below the mailboxes.
+    fn open_app_with_labels(cx: &mut TestAppContext) -> (WindowHandle<MailApp>, VisualTestContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(1200.)));
+        (window, visual)
+    }
+
+    /// Click whatever the debug selector names, by its own centre. The
+    /// selector is `&'static str` because that is what gpui's `debug_bounds`
+    /// takes, so these helpers only ever name a literal.
+    fn click_selector(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} should be on screen"));
+        let center = bounds.center();
+        cx.simulate_click(
+            gpui::Point::new(center.x, center.y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+    }
+
+    /// Both sidebar groups read as one block: a header, then its rows flush
+    /// underneath, then a clear gap before the next group. This pins the
+    /// vertical rhythm so a change to one group's padding cannot quietly make
+    /// the two look different.
+    #[gpui::test]
+    fn the_sidebar_groups_are_spaced_like_each_other(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let _ = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        let bottom = |cx: &mut VisualTestContext, selector: &'static str| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should be laid out"));
+            bounds.origin.y + bounds.size.height
+        };
+        let top = |cx: &mut VisualTestContext, selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should be laid out"))
+                .origin
+                .y
+        };
+        let gap = |cx: &mut VisualTestContext, above: &'static str, below: &'static str| {
+            top(cx, below) - bottom(cx, above)
+        };
+
+        // Rows sit flush under their own header, in both groups.
+        let under_mailboxes = gap(&mut cx, "sidebar-mailboxes-toggle", "sidebar-mailbox-0");
+        let under_labels = gap(&mut cx, "sidebar-labels-toggle", "sidebar-labels");
+        assert_eq!(
+            under_mailboxes, under_labels,
+            "a group's rows should hug its own header the same way in both groups"
+        );
+
+        // And the two groups are clearly separated from each other.
+        let between = gap(&mut cx, "sidebar-mailbox-5", "sidebar-labels-toggle");
+        assert!(
+            between > under_labels * 2,
+            "the Labels header needs clear air above it, got {between} against \
+             {under_labels} inside a group"
+        );
+    }
+
+    #[gpui::test]
+    fn the_labels_group_collapses_independently_of_the_mailboxes(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        // Both groups start open, so a seeded label row is on screen.
+        assert!(
+            app.read_with(&cx, |app, _| !app.labels_collapsed),
+            "the labels group starts expanded"
+        );
+        assert!(!app.read_with(&cx, |app, _| app.mailboxes_collapsed));
+        assert!(
+            cx.debug_bounds("sidebar-labels").is_some(),
+            "the label rows are on screen while the group is open"
+        );
+
+        click_selector(&mut cx, "sidebar-labels-toggle");
+        assert!(
+            app.read_with(&cx, |app, _| app.labels_collapsed),
+            "the header should collapse the labels group"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-labels").is_none(),
+            "a collapsed group shows its header and nothing else"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-mailbox-0").is_some(),
+            "collapsing labels must not touch the mailboxes group"
+        );
+        assert!(!app.read_with(&cx, |app, _| app.mailboxes_collapsed));
+
+        click_selector(&mut cx, "sidebar-labels-toggle");
+        assert!(!app.read_with(&cx, |app, _| app.labels_collapsed));
+        assert!(cx.debug_bounds("sidebar-labels").is_some());
+    }
+
+    /// The composer's open/close mechanics in one walk: the `+` opens it, the
+    /// `+` again closes it, opening on a collapsed group expands that group,
+    /// and collapsing the group takes the composer with it.
+    #[gpui::test]
+    fn the_label_composer_opens_and_closes(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+        let composer_open =
+            |cx: &VisualTestContext| app.read_with(cx, |app, _| app.label_composer_open);
+        let labels_collapsed =
+            |cx: &VisualTestContext| app.read_with(cx, |app, _| app.labels_collapsed);
+        let act = |cx: &mut VisualTestContext, action: LabelsAction| {
+            cx.update(|window, cx| app.update(cx, |app, cx| app.labels_action(action, window, cx)));
+            cx.run_until_parked();
+        };
+
+        assert!(cx.debug_bounds("sidebar-label-new").is_none());
+        assert!(!composer_open(&cx));
+
+        // The `+` opens it, and the `+` is also the pointer way back out.
+        click_selector(&mut cx, "sidebar-labels-add");
+        assert!(composer_open(&cx));
+        assert!(cx.debug_bounds("sidebar-label-new").is_some());
+        click_selector(&mut cx, "sidebar-labels-add");
+        assert!(!composer_open(&cx));
+
+        // Opening it on a collapsed group has to expand that group, or the `+`
+        // would appear to do nothing.
+        act(&mut cx, LabelsAction::ToggleCollapsed);
+        assert!(labels_collapsed(&cx));
+        act(&mut cx, LabelsAction::ToggleComposer);
+        assert!(composer_open(&cx));
+        assert!(
+            !labels_collapsed(&cx),
+            "the + must not appear to do nothing on a collapsed group"
+        );
+
+        // Collapsing takes the composer with it rather than hiding it.
+        act(&mut cx, LabelsAction::ToggleCollapsed);
+        assert!(
+            !composer_open(&cx),
+            "collapsing out from under a live field would hide it without \
+             dismissing it"
+        );
+    }
+
+    /// A successful create ends the visit; a refused one must not, or the name
+    /// could not be corrected.
+    #[gpui::test]
+    fn creating_a_label_ends_the_composer_but_a_refused_one_does_not(cx: &mut TestAppContext) {
+        let (window, mut cx) = open_app_with_labels(cx);
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+        let named = |cx: &VisualTestContext, name: &str| {
+            app.read_with(cx, |app, _| {
+                app.labels.labels().iter().any(|label| label.name == name)
+            })
+        };
+
+        // Deliberately not a seeded name: creating the label first makes the
+        // second attempt a duplicate whatever the app starts with.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.labels_action(LabelsAction::ToggleComposer, window, cx);
+                app.create_label("Receipts".to_string(), window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(named(&cx, "Receipts"));
+        assert!(
+            !app.read_with(&cx, |app, _| app.label_composer_open),
+            "one label per visit: the composer closes after a successful create"
+        );
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.labels_action(LabelsAction::ToggleComposer, window, cx);
+                app.create_label("Receipts".to_string(), window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            app.read_with(&cx, |app, _| app.label_composer_open),
+            "a duplicate has to stay open so the name can be corrected"
+        );
+    }
+
     #[gpui::test]
     fn labels_can_be_created_assigned_filtered_and_deleted(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
@@ -1647,14 +3727,26 @@ mod tests {
         let app = window.root(&mut cx).unwrap();
         cx.run_until_parked();
 
-        // The sidebar renders the seeded labels and the create row.
+        // The sidebar renders the seeded labels under a collapsible header,
+        // and the composer is closed until the header's `+` opens it.
         assert!(
             cx.debug_bounds("sidebar-labels").is_some(),
             "the sidebar renders a labels section"
         );
-        assert!(cx.debug_bounds("sidebar-label-new").is_some());
+        assert!(
+            cx.debug_bounds("sidebar-labels-toggle").is_some(),
+            "the labels group has a header of its own"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-labels-add").is_some(),
+            "the header carries the new-label button"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-label-new").is_none(),
+            "the composer must not be on screen before the + is pressed"
+        );
 
-        // Create a label through the app, the way the sidebar row commits it.
+        // Create a label through the app, the way the composer commits it.
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.create_label("Follow up".to_string(), window, cx)
@@ -1685,7 +3777,7 @@ mod tests {
 
         // Assign it to a mail that already carries a seeded label, so the two
         // compose rather than replacing each other.
-        let email_id = EmailId(1);
+        let email_id = EmailId::from(1);
         let work = app
             .read_with(&cx, |app, _| {
                 app.labels
@@ -1695,27 +3787,36 @@ mod tests {
                     .map(|l| l.id)
             })
             .expect("Work is seeded");
-        app.update(&mut cx, |app, cx| app.toggle_label(follow_up, email_id, cx));
+        app.update(&mut cx, |app, cx| {
+            app.toggle_label(follow_up, email_id.clone(), cx)
+        });
         assert_eq!(
-            app.read_with(&cx, |app, _| app.labels.labels_for(email_id).to_vec()),
+            app.read_with(&cx, |app, _| app.labels.labels_for(&email_id).to_vec()),
             vec![work, follow_up],
             "the new label joins the one the mail already had"
         );
-        // Open the mail so the reading view, and its label picker, render.
+        // In the list, the overflow menu is where labels are assigned.
+        assert!(
+            cx.debug_bounds("row-menu-1").is_some(),
+            "the list row carries the label menu"
+        );
+
+        // The reading view no longer carries a label row: opening a mail must
+        // not put labels back under the body.
         app.update(&mut cx, |app, cx| {
-            app.store.open_email(email_id);
+            app.store.open_email(email_id.clone());
             cx.notify();
         });
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("email-labels").is_some(),
-            "the reading view renders the label picker"
+            cx.debug_bounds("email-labels").is_none(),
+            "labels are assigned from the list, not under the message body"
         );
 
         // Deleting it clears the assignment and the filter.
         app.update(&mut cx, |app, cx| app.delete_label(follow_up, cx));
         assert_eq!(
-            app.read_with(&cx, |app, _| app.labels.labels_for(email_id).to_vec()),
+            app.read_with(&cx, |app, _| app.labels.labels_for(&email_id).to_vec()),
             vec![work],
             "deleting a label leaves the others the mail carried"
         );
@@ -1739,6 +3840,107 @@ mod tests {
             app.store.overlay(),
             Some(Overlay::Compose)
         )));
+    }
+
+    #[gpui::test]
+    #[gpui::test]
+    fn the_light_mode_switch_republishes_the_theme(cx: &mut TestAppContext) {
+        // The theme is the one setting that lives outside the app struct, so
+        // the contract is the global itself: flipping the switch has to change
+        // what every view reads at paint time.
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+
+        let published_canvas = |cx: &VisualTestContext| {
+            cx.try_read_global::<Theme, _>(|theme, _| theme.canvas.to_rgb())
+                .unwrap_or(Theme::dark().canvas.to_rgb())
+        };
+        assert_eq!(
+            published_canvas(&mut cx),
+            Theme::dark().canvas.to_rgb(),
+            "a cold start is dark"
+        );
+
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.set_setting(Setting::LightMode, true, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            published_canvas(&mut cx),
+            Theme::light().canvas.to_rgb(),
+            "flipping the setting should publish the light palette"
+        );
+
+        cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.set_setting(Setting::LightMode, false, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            published_canvas(&mut cx),
+            Theme::dark().canvas.to_rgb(),
+            "flipping it back should publish dark again"
+        );
+    }
+
+    #[gpui::test]
+    fn the_light_mode_switch_is_on_the_appearance_page(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| MailApp::new(window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(760.)));
+        let app = window.root(&mut cx).unwrap();
+        let focus = app.read_with(&cx, |app, _| app.inbox_focus.clone());
+        cx.run_until_parked();
+
+        cx.update(|window, cx| focus.dispatch_action(&OpenSettings, window, cx));
+        cx.run_until_parked();
+
+        // Walk to Appearance by clicking the page row, the way a user does.
+        let row = cx
+            .debug_bounds(SettingsPage::Appearance.nav_id())
+            .expect("the page column should list Appearance");
+        let center = row.center();
+        cx.simulate_click(
+            gpui::Point::new(center.x, center.y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        let toggle = cx
+            .debug_bounds(Setting::LightMode.element_id())
+            .expect("Appearance should offer the light mode switch");
+        let center = toggle.center();
+        cx.simulate_click(
+            gpui::Point::new(center.x, center.y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        assert!(
+            app.read_with(&cx, |app, _| app.settings_state.light_mode),
+            "clicking the switch should turn light mode on"
+        );
+        assert_eq!(
+            cx.try_read_global::<Theme, _>(|theme, _| theme.canvas.to_rgb()),
+            Some(Theme::light().canvas.to_rgb()),
+            "and the app should be painting from the light palette"
+        );
     }
 
     #[gpui::test]

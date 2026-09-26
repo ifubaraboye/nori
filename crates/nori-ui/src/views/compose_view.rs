@@ -1,4 +1,7 @@
-use gpui::{Context, Entity, EventEmitter, IntoElement, Render, Role, Window, div, prelude::*, px};
+use gpui::{
+    Context, Entity, EventEmitter, IntoElement, Render, Role, Subscription, Window, div,
+    prelude::*, px,
+};
 
 use super::super::components::{Button, ButtonStyle, Icon, TextField};
 use crate::actions::Dismiss;
@@ -15,7 +18,10 @@ pub struct ComposeView {
     to: Entity<TextField>,
     subject: Entity<TextField>,
     message: Entity<TextField>,
-    theme: Theme,
+    /// Kept so a change to the theme global repaints this view. Without it a
+    /// switch flipped from the settings page would leave an open compose pane
+    /// holding the old palette.
+    _theme_sub: Subscription,
 }
 
 impl ComposeView {
@@ -31,11 +37,12 @@ impl ComposeView {
             cx.new(|cx| TextField::new("compose-message", "Message", seed.body, false, 3, cx));
         let to_focus = to.read(cx).focus_handle();
         window.focus(&to_focus, cx);
+        let theme_sub = cx.observe_global::<Theme>(|_, cx| cx.notify());
         Self {
             to,
             subject,
             message,
-            theme: Theme::dark(),
+            _theme_sub: theme_sub,
         }
     }
 
@@ -46,7 +53,7 @@ impl ComposeView {
 
 impl Render for ComposeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = Theme::current(cx);
         let entity = cx.entity();
 
         div()

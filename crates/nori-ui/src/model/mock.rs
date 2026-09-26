@@ -1,4 +1,4 @@
-use super::{Email, EmailId, Mailbox};
+use super::{Email, EmailId, Mailbox, Origin};
 
 pub fn mock_emails() -> Vec<Email> {
     vec![
@@ -13,7 +13,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             true,
             true,
-            Some("project"),
             vec![
                 "Hey,",
                 "Here's the latest update on the project. The revised timeline is ready for review, and the implementation risk is now concentrated in the data migration window.",
@@ -32,7 +31,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             true,
             false,
-            None,
             vec![
                 "Hi,",
                 "Are you available for the meeting tomorrow? I moved it to 2:30 PM so the design team can join after their review.",
@@ -51,7 +49,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             true,
             false,
-            Some("dev"),
             vec![
                 "A new pull request is ready for review.",
                 "This change improves keyboard navigation in the tab bar, adds visible focus states, and introduces a regression test for wrapping between the first and last tabs.",
@@ -69,7 +66,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             true,
-            Some("design"),
             vec![
                 "I went through the prototype again this morning. The horizontal navigation reads well and keeps the message list feeling like the main surface.",
                 "The two areas that need another pass are tab overflow and the selected mailbox state. Both should remain understandable without relying on color alone.",
@@ -88,7 +84,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             false,
-            Some("finance"),
             vec![
                 "Hello,",
                 "Your monthly invoice is ready. The next billing cycle begins on October 1 and no action is required.",
@@ -107,7 +102,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             false,
-            Some("dev"),
             vec![
                 "The Wayland build is green again after updating the native text input dependency.",
                 "I also checked resize behavior at 1x and 2x scale. Nothing clips after the minimum window size is introduced.",
@@ -125,7 +119,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             true,
-            Some("planning"),
             vec![
                 "Here is the first pass at the planning outline. I kept the open questions in place rather than guessing.",
                 "The largest decision is whether we invest in another synchronization pass or use the current window to improve everyday navigation. My recommendation is the latter.",
@@ -144,7 +137,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             false,
-            Some("dev"),
             vec![
                 "NOR-184 moved to In Review.",
                 "Keyboard navigation and focus restoration are implemented. The remaining item is runtime verification with an IME and a screen reader.",
@@ -162,7 +154,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             false,
-            Some("research"),
             vec![
                 "Three participants returned to the editor tab model after seeing the prototype.",
                 "They valued the persistent horizontal structure, but two people expected a way to see more tab titles at once. We should test narrower variable-width tabs next.",
@@ -181,7 +172,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             false,
-            Some("security"),
             vec![
                 "A new sign-in was detected from Firefox on Linux at 9:14 AM.",
                 "If this was you, no action is needed. If you do not recognize the activity, review your active sessions and rotate your credentials.",
@@ -198,7 +188,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             false,
-            None,
             vec![
                 "There is a new ramen place near the office. Are you interested in going on Friday?",
                 "I can reserve a table around 12:30 if the group is small enough.",
@@ -216,7 +205,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Inbox,
             false,
             false,
-            Some("calendar"),
             vec![
                 "Your weekly product review starts Friday at 10:00 AM and ends at 10:45 AM.",
                 "Agenda: product risks, decisions needed, and a short update on the email client prototype.",
@@ -233,7 +221,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Sent,
             false,
             false,
-            None,
             vec![
                 "I left a few comments on the endpoint names and added the migration examples.",
                 "The important part is keeping the existing identifiers stable while the new surface settles.",
@@ -250,7 +237,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Sent,
             false,
             false,
-            None,
             vec![
                 "A short summary of decisions, open questions, and follow-ups for next week.",
                 "The main decision was to keep this phase UI-only and validate the interaction model before introducing any mail transport.",
@@ -267,7 +253,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Drafts,
             false,
             false,
-            None,
             vec![
                 "Capture the focus order and test the tab bar with longer subject lines.",
                 "Also verify the search overlay with the keyboard before sharing the prototype.",
@@ -284,7 +269,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Drafts,
             false,
             false,
-            None,
             vec!["Turn the open questions into a short checklist for the next review."],
         ),
         email(
@@ -298,7 +282,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Archive,
             false,
             false,
-            Some("release"),
             vec![
                 "The archived prototype checklist has been completed for the previous iteration.",
                 "This thread is kept for reference and is no longer active.",
@@ -315,7 +298,6 @@ pub fn mock_emails() -> Vec<Email> {
             Mailbox::Trash,
             false,
             false,
-            None,
             vec!["This is an old notification retained to demonstrate the trash view."],
         ),
     ]
@@ -333,11 +315,10 @@ fn email(
     mailbox: Mailbox,
     unread: bool,
     starred: bool,
-    label: Option<&str>,
     body: Vec<&str>,
 ) -> Email {
     Email {
-        id: EmailId(id),
+        id: EmailId::sample(id),
         sender: sender.to_string(),
         address: address.to_string(),
         recipients: if mailbox == Mailbox::Sent || mailbox == Mailbox::Drafts {
@@ -347,16 +328,20 @@ fn email(
         },
         subject: subject.to_string(),
         preview: preview.to_string(),
-        body: body
-            .iter()
-            .map(|paragraph| (*paragraph).to_string())
-            .collect(),
+        body: nori_gmail::text_blocks(
+            body.iter()
+                .map(|paragraph| (*paragraph).to_string())
+                .collect(),
+        ),
         timestamp: timestamp.to_string(),
         full_date: full_date.to_string(),
         mailbox,
         unread,
         starred,
         pinned: false,
-        label: label.map(str::to_string),
+        // Sample mail ships with its body inline, so there is never a fetch
+        // to wait on and `body_loaded` is true from the start.
+        body_loaded: true,
+        origin: Origin::Sample,
     }
 }

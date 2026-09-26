@@ -1,5 +1,6 @@
 use gpui::{
-    App, Context, Entity, EventEmitter, IntoElement, Render, Role, Window, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, IntoElement, Render, Role, Subscription, Window, div,
+    prelude::*, px,
 };
 
 use super::super::components::{Icon, TextField};
@@ -18,7 +19,9 @@ pub struct SearchView {
     query: Entity<TextField>,
     all_emails: Vec<Email>,
     selected_index: usize,
-    theme: Theme,
+    /// Kept so a change to the theme global repaints this view; an open search
+    /// dialog would otherwise hold the old palette.
+    _theme_sub: Subscription,
 }
 
 impl SearchView {
@@ -26,11 +29,12 @@ impl SearchView {
         let query = cx.new(|cx| TextField::new("search-query", "Search mail", "", true, 1, cx));
         let query_focus = query.read(cx).focus_handle();
         window.focus(&query_focus, cx);
+        let theme_sub = cx.observe_global::<Theme>(|_, cx| cx.notify());
         Self {
             query,
             all_emails,
             selected_index: 0,
-            theme: Theme::dark(),
+            _theme_sub: theme_sub,
         }
     }
 
@@ -66,7 +70,7 @@ impl SearchView {
         cx: &mut Context<Self>,
     ) {
         if let Some(email) = self.results(cx).get(self.selected_index) {
-            cx.emit(SearchEvent::Open(email.id));
+            cx.emit(SearchEvent::Open(email.id.clone()));
         }
     }
 
@@ -77,7 +81,7 @@ impl SearchView {
 
 impl Render for SearchView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = Theme::current(cx);
         let results = self.results(cx);
         let selected_index = self.selected_index.min(results.len().saturating_sub(1));
         let entity = cx.entity();
@@ -129,12 +133,13 @@ impl Render for SearchView {
                     .min_h_0()
                     .overflow_scroll()
                     .children(results.iter().enumerate().map(|(index, email)| {
-                        let id = email.id;
+                        let id = email.id.clone();
                         let selected = index == selected_index;
                         let result_entity = entity.clone();
+                        let open_id = id.clone();
                         div()
-                            .id(("search-result", id.0 as usize))
-                            .debug_selector(move || format!("search-result-{}", id.0))
+                            .id(format!("search-result-{id}"))
+                            .debug_selector(move || format!("search-result-{id}"))
                             .min_h(px(54.))
                             .mx(px(6.))
                             .mt(px(2.))
@@ -158,7 +163,9 @@ impl Render for SearchView {
                             .cursor_pointer()
                             .on_click(move |_event, _window, cx| {
                                 cx.stop_propagation();
-                                result_entity.update(cx, |_, cx| cx.emit(SearchEvent::Open(id)));
+                                result_entity.update(cx, |_, cx| {
+                                    cx.emit(SearchEvent::Open(open_id.clone()))
+                                });
                             })
                             .child(
                                 div()

@@ -15,7 +15,6 @@ use crate::theme::Theme;
 /// mailbox view.
 #[derive(IntoElement)]
 pub struct TopBar {
-    theme: Theme,
     sidebar_visible: bool,
     prefix: Option<SharedString>,
     title: SharedString,
@@ -24,25 +23,23 @@ pub struct TopBar {
 
 impl TopBar {
     pub fn new(
-        theme: Theme,
         sidebar_visible: bool,
         prefix: Option<impl Into<SharedString>>,
         title: impl Into<SharedString>,
         on_toggle_sidebar: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
-            theme,
             sidebar_visible,
             prefix: prefix.map(Into::into),
             title: title.into(),
-            toggle: SidebarToggle::new("top-bar-sidebar", theme, on_toggle_sidebar),
+            toggle: SidebarToggle::new("top-bar-sidebar", on_toggle_sidebar),
         }
     }
 }
 
 impl RenderOnce for TopBar {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let theme = self.theme;
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = Theme::current(cx);
         let sidebar_visible = self.sidebar_visible;
 
         div()

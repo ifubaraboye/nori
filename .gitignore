@@ -1,4 +1,9 @@
 /target
+
+# OAuth credentials. The client secret is readable from the binary anyway,
+# but it must not be in the repository.
+.env
+.env.local
 *.png
 !crates/nori-desktop/assets/app-icon.png
 

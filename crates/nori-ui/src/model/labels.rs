@@ -4,6 +4,7 @@
 //! can carry any number of labels. Colours are chosen by the user and stored
 //! with the label, so a rename never changes a chip's colour and two labels
 //! never collapse onto one.
+use serde::{Deserialize, Serialize};
 
 use gpui::Hsla;
 
@@ -25,7 +26,7 @@ pub const LABEL_COLOURS: [u32; 8] = [
     0x9A_A5_B5, // slate
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Label {
     pub id: LabelId,
     pub name: String,
@@ -35,13 +36,20 @@ pub struct Label {
 
 impl Label {
     /// The chip style: solid text over a translucent wash of the same hue.
-    /// The hue comes from the green channel because every palette entry is
-    /// already a plausible hue, which keeps the store free of colour maths.
+    ///
+    /// The stored colour is converted rather than sampled. Reading one channel
+    /// as a hue looks harmless because every palette entry is a plausible
+    /// colour, but it collapses pairs: amber and blue share a green channel,
+    /// as do green and teal, so those labels rendered identically.
     pub fn chip(&self) -> (Hsla, Hsla, Hsla) {
+        let base = Hsla::from(self.rgba());
+        // Palette lightness varies less than hue does, so lifting everything
+        // to one lightness is what keeps a chip's text legible on the canvas
+        // without flattening the hues that distinguish the labels.
         let base = Hsla {
-            h: f32::from(((self.colour >> 8) & 0xff) as u8) / 255.,
-            s: 0.55,
-            l: 0.70,
+            h: base.h,
+            s: base.s.clamp(0.35, 0.75),
+            l: 0.72,
             a: 1.,
         };
         let washed = |a: f32| Hsla {
@@ -51,6 +59,17 @@ impl Label {
             a,
         };
         (base, washed(0.45), washed(0.16))
+    }
+
+    /// The stored colour as an opaque RGBA.
+    pub fn rgba(&self) -> gpui::Rgba {
+        let channel = |shift: u32| f32::from(((self.colour >> shift) & 0xff) as u8) / 255.;
+        gpui::Rgba {
+            r: channel(16),
+            g: channel(8),
+            b: channel(0),
+            a: 1.,
+        }
     }
 }
 
@@ -118,6 +137,57 @@ impl LabelStore {
             .any(|label| label.name.eq_ignore_ascii_case(name))
     }
 
+    /// Create a label with a colour the caller chose, rather than one picked
+    /// by rotation.
+    ///
+    /// A label that came from Gmail keeps the colour it has there, so it does
+    /// not change when Nori is upgraded or when an unrelated label is created
+    /// first. Creating and then recolouring would leave a wrong colour visible
+    /// for a frame, and would spend a palette slot in between.
+    pub fn create_with_colour(&mut self, name: &str, colour: u32) -> Option<Label> {
+        let mut label = self.create(name)?;
+        self.set_colour(label.id, colour);
+        label.colour = colour;
+        Some(label)
+    }
+
+    /// Everything needed to rebuild the store from the local index.
+    pub fn snapshot(&self) -> (Vec<Label>, Vec<(EmailId, Vec<LabelId>)>) {
+        (self.labels.clone(), self.assignments.clone())
+    }
+
+    /// Replace the whole store. Only used when loading the local index, where
+    /// the file is the authority rather than whatever is on screen.
+    pub fn restore(&mut self, labels: Vec<Label>, assignments: Vec<(EmailId, Vec<LabelId>)>) {
+        self.next_id = labels.iter().map(|label| label.id).max().unwrap_or(0) + 1;
+        self.labels = labels;
+        self.assignments = assignments;
+    }
+
+    /// Drop every label and every assignment.
+    ///
+    /// Used when an account connects: the labels seeded for sample mail are
+    /// not the user's, and leaving them beside the ones that came from Gmail
+    /// puts four rows in the sidebar where two belong. The proper fix is an
+    /// origin on each label so only the sample ones go; until there is one,
+    /// connecting an account is the moment the sample set is discarded whole.
+    pub fn clear(&mut self) {
+        self.labels.clear();
+        self.assignments.clear();
+    }
+
+    /// Change a label's colour in place. Fails for a label that is not there.
+    pub fn set_colour(&mut self, id: LabelId, colour: u32) -> bool {
+        let Some(label) = self.labels.iter_mut().find(|label| label.id == id) else {
+            return false;
+        };
+        if label.colour == colour {
+            return false;
+        }
+        label.colour = colour;
+        true
+    }
+
     /// Rename a label, keeping its colour. Fails on a blank or duplicate name.
     pub fn rename(&mut self, id: LabelId, name: &str) -> bool {
         let name = name.trim();
@@ -153,10 +223,12 @@ impl LabelStore {
     }
 
     /// The label ids on one mail, in stable order.
-    pub fn labels_for(&self, email: EmailId) -> &[LabelId] {
+    /// By reference: an `EmailId` is no longer `Copy`, so taking it by value
+    /// would force a clone at every read.
+    pub fn labels_for(&self, email: &EmailId) -> &[LabelId] {
         self.assignments
             .iter()
-            .find(|(id, _)| *id == email)
+            .find(|(id, _)| *id == *email)
             .map(|(_, assigned)| assigned.as_slice())
             .unwrap_or(&[])
     }
@@ -210,7 +282,9 @@ mod tests {
 
     use crate::model::EmailId;
 
-    const MAIL: EmailId = EmailId(7);
+    fn mail() -> EmailId {
+        EmailId::sample(7)
+    }
 
     #[test]
     fn creating_rejects_blank_and_duplicate_names() {
@@ -235,6 +309,52 @@ mod tests {
     }
 
     #[test]
+    fn every_palette_entry_renders_as_a_distinct_chip() {
+        // The bug this guards: hue was read off the green channel, so palette
+        // entries that share a green channel rendered identically. Two labels
+        // that are the same colour are worse than two that are merely similar.
+        let mut seen: Vec<(f32, f32)> = Vec::new();
+        for (index, packed) in LABEL_COLOURS.iter().enumerate() {
+            let label = Label {
+                id: index as LabelId,
+                name: format!("L{index}"),
+                colour: *packed,
+            };
+            let (text, _, _) = label.chip();
+            assert!(
+                !seen
+                    .iter()
+                    .any(|(h, s)| (*h - text.h).abs() < 0.01 && (*s - text.s).abs() < 0.01),
+                "palette entry {index} ({packed:#x}) collides with an earlier one: \
+                 hue {} sat {}",
+                text.h,
+                text.s
+            );
+            seen.push((text.h, text.s));
+        }
+        assert_eq!(seen.len(), LABEL_COLOURS.len());
+    }
+
+    #[test]
+    fn a_chip_keeps_its_hue_and_is_legible_on_the_canvas() {
+        let mut store = LabelStore::new();
+        for name in ["Work", "Travel", "Finance"] {
+            let label = store.create(name).unwrap();
+            let (text, border, fill) = label.chip();
+            assert_eq!(text.a, 1., "the text carries the hue at full strength");
+            assert!(
+                fill.a < 0.3 && border.a < text.a,
+                "fill and border are washes"
+            );
+            // All three come from one hue, so a chip never reads as two colours.
+            assert!((text.h - fill.h).abs() < f32::EPSILON);
+            assert!((text.h - border.h).abs() < f32::EPSILON);
+            // Lightness is pinned so text clears contrast on the dark canvas.
+            assert!((text.l - 0.72).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
     fn renaming_keeps_the_colour_and_rejects_duplicates() {
         let mut store = LabelStore::new();
         let a = store.create("Work").unwrap();
@@ -252,28 +372,28 @@ mod tests {
         let mut store = LabelStore::new();
         let work = store.create("Work").unwrap();
         let urgent = store.create("Urgent").unwrap();
-        let mail = MAIL;
+        let mail = mail();
 
-        assert!(store.toggle(mail, work.id));
-        assert_eq!(store.labels_for(mail), &[work.id]);
+        assert!(store.toggle(mail.clone(), work.id));
+        assert_eq!(store.labels_for(&mail), &[work.id]);
         // A second label composes with the first.
-        assert!(store.toggle(mail, urgent.id));
-        assert_eq!(store.labels_for(mail), &[work.id, urgent.id]);
+        assert!(store.toggle(mail.clone(), urgent.id));
+        assert_eq!(store.labels_for(&mail), &[work.id, urgent.id]);
         // Toggling off leaves the other alone.
-        assert!(store.toggle(mail, work.id));
-        assert_eq!(store.labels_for(mail), &[urgent.id]);
-        assert!(store.toggle(mail, urgent.id));
-        assert!(store.labels_for(mail).is_empty());
+        assert!(store.toggle(mail.clone(), work.id));
+        assert_eq!(store.labels_for(&mail), &[urgent.id]);
+        assert!(store.toggle(mail.clone(), urgent.id));
+        assert!(store.labels_for(&mail).is_empty());
     }
 
     #[test]
     fn toggling_an_unknown_label_is_refused() {
         let mut store = LabelStore::new();
         assert!(
-            !store.toggle(EmailId(1), 999),
+            !store.toggle(EmailId::from(1), 999),
             "cannot assign a label that does not exist"
         );
-        assert!(store.labels_for(EmailId(1)).is_empty());
+        assert!(store.labels_for(&EmailId::from(1)).is_empty());
     }
 
     #[test]
@@ -281,19 +401,19 @@ mod tests {
         let mut store = LabelStore::new();
         let work = store.create("Work").unwrap();
         let keep = store.create("Keep").unwrap();
-        store.toggle(EmailId(3), work.id);
-        store.toggle(EmailId(3), keep.id);
-        store.toggle(EmailId(4), work.id);
+        store.toggle(EmailId::from(3), work.id);
+        store.toggle(EmailId::from(3), keep.id);
+        store.toggle(EmailId::from(4), work.id);
 
         assert!(store.remove(work.id));
         assert!(store.label(work.id).is_none());
         assert_eq!(
-            store.labels_for(EmailId(3)),
+            store.labels_for(&EmailId::from(3)),
             &[keep.id],
             "removing one label leaves the others the mail carried"
         );
         assert!(
-            store.labels_for(EmailId(4)).is_empty(),
+            store.labels_for(&EmailId::from(4)).is_empty(),
             "a mail that only had the removed label is now unlabelled"
         );
         assert!(

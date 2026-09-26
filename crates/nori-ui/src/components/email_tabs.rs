@@ -23,7 +23,6 @@ const CLOSE_GLYPH: f32 = 11. * 1.05;
 pub struct EmailTabs {
     tabs: Vec<(EmailId, SharedString)>,
     active: Option<EmailId>,
-    theme: Theme,
     scroll_handle: gpui::ScrollHandle,
     on_select: SelectTabHandler,
     on_close: CloseTabHandler,
@@ -33,7 +32,6 @@ impl EmailTabs {
     pub fn new(
         tabs: Vec<(EmailId, SharedString)>,
         active: Option<EmailId>,
-        theme: Theme,
         scroll_handle: gpui::ScrollHandle,
         on_select: impl Fn(EmailId, &mut Window, &mut App) + 'static,
         on_close: impl Fn(EmailId, &mut Window, &mut App) + 'static,
@@ -41,7 +39,6 @@ impl EmailTabs {
         Self {
             tabs,
             active,
-            theme,
             scroll_handle,
             on_select: Rc::new(on_select),
             on_close: Rc::new(on_close),
@@ -50,8 +47,8 @@ impl EmailTabs {
 }
 
 impl RenderOnce for EmailTabs {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let theme = self.theme;
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = Theme::current(cx);
         let scroll_handle = self.scroll_handle;
         let on_select = self.on_select.clone();
         let on_close = self.on_close.clone();
@@ -76,19 +73,19 @@ impl RenderOnce for EmailTabs {
             .border_color(theme.hairline)
             .overflow_x_scroll()
             .children(tabs.into_iter().map(|(id, label)| {
-                let is_active = active == Some(id);
+                let is_active = active == Some(id.clone());
                 let on_select = on_select.clone();
                 let on_close = on_close.clone();
-                let close_id = id;
+                let select_id = id.clone();
+                let close_id = id.clone();
                 div()
-                    .id(("email-tab", id.0 as usize))
+                    .id(format!("email-tab-{id}"))
                     .h(px(28.))
                     .min_w(px(118.))
                     .max_w(px(220.))
                     // Square, and no drawn edge. The tab's depth comes from
                     // being a lighter surface on a darker strip, not from a
                     // border or a radius around a flat fill.
-                    .rounded(px(0.))
                     .border_1()
                     .border_color(transparent_black())
                     .when(is_active, |this| this.shadow_sm())
@@ -109,13 +106,13 @@ impl RenderOnce for EmailTabs {
                     .text_color(if is_active { theme.text } else { theme.muted })
                     .cursor_pointer()
                     .hover(|style| style.bg(if is_active { theme.raised } else { theme.hover }))
-                    .on_click(move |_event, window, cx| on_select(id, window, cx))
+                    .on_click(move |_event, window, cx| on_select(select_id.clone(), window, cx))
                     .child(div().min_w_0().flex_1().truncate().child(label.clone()))
                     .child(
                         // A bare glyph: no border and no hover fill, so the
                         // close affordance never draws a box around the ×.
                         div()
-                            .id(format!("close-tab-{}", id.0))
+                            .id(format!("close-tab-{id}"))
                             .size(px(18.))
                             .flex_none()
                             .flex()
@@ -125,7 +122,7 @@ impl RenderOnce for EmailTabs {
                             .aria_label(format!("Close {}", label))
                             .on_click(move |_event, window, cx| {
                                 cx.stop_propagation();
-                                on_close(close_id, window, cx);
+                                on_close(close_id.clone(), window, cx);
                             })
                             .child(Icon::new("icons/close.svg", CLOSE_GLYPH, theme.ghost)),
                     )
