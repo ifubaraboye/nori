@@ -378,9 +378,25 @@ impl SettingsView {
             AccountState::Connecting => {
                 rows.push(self.render_note_row(
                     theme,
-                    "Waiting for the browser",
-                    "Finish signing in the tab that just opened, then come back \
-                     here. Nori is listening for the redirect.",
+                    "Signing in…",
+                    "Finish signing in the tab that just opened. Nori is \
+                     listening for the redirect, then it will start fetching \
+                     your mail.",
+                    false,
+                ));
+            }
+            AccountState::Fetching { address } => {
+                // The long part of a sign-in. Saying "waiting for the browser"
+                // here was true for a few seconds and a lie for the next
+                // minute, over an empty list that looks broken.
+                rows.push(self.render_note_row(
+                    theme,
+                    "Fetching your mail…",
+                    format!(
+                        "Signed in as {address}. Reading your mailbox now — this \
+                         takes a minute on a large one, and your mail appears as \
+                         it arrives."
+                    ),
                     false,
                 ));
             }

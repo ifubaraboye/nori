@@ -18,6 +18,15 @@ pub enum AccountState {
     Disconnected,
     /// A browser is open and Nori is waiting for the redirect.
     Connecting,
+    /// The grant is in hand and the mailbox is being read.
+    ///
+    /// Its own state rather than a flag on `Connected`, because the two are
+    /// told apart by the user for a long time: a first sync of a real mailbox
+    /// is tens of seconds, and "Synced" over an empty list for that long reads
+    /// as a broken app rather than a slow one.
+    Fetching {
+        address: String,
+    },
     Connected {
         address: String,
         /// Mails in the local index, for the pane's summary.
@@ -41,7 +50,9 @@ pub enum AccountState {
 impl AccountState {
     pub fn address(&self) -> Option<&str> {
         match self {
-            Self::Connected { address, .. } | Self::NeedsReauth { address } => Some(address),
+            Self::Connected { address, .. }
+            | Self::Fetching { address }
+            | Self::NeedsReauth { address } => Some(address),
             _ => None,
         }
     }
@@ -49,8 +60,11 @@ impl AccountState {
     /// Whether the account can sync as it stands. A stale grant is connected
     /// but not usable, and treating it as usable would run a sync that is
     /// guaranteed to fail.
+    ///
+    /// A mailbox mid-fetch counts: the grant behind it is good, which is the
+    /// only thing this asks.
     pub fn is_usable(&self) -> bool {
-        matches!(self, Self::Connected { .. })
+        matches!(self, Self::Connected { .. } | Self::Fetching { .. })
     }
 
     /// The badge beside a folder in the sidebar.

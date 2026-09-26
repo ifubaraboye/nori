@@ -431,12 +431,6 @@ impl MailStore {
         self.emails.clone()
     }
 
-    /// Whether any mail is loaded. Used to tell a first connect — where the
-    /// prototype's sample mail should be discarded — from a later one.
-    pub fn has_mail(&self) -> bool {
-        !self.emails.is_empty()
-    }
-
     /// The cursor for the next incremental sync, if one has been recorded.
     pub fn synced_history_id(&self) -> Option<&str> {
         self.synced_history_id.as_deref()

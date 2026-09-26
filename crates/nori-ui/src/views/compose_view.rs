@@ -1,3 +1,5 @@
+#[cfg(test)]
+use gpui::App;
 use gpui::{
     Context, Entity, EventEmitter, IntoElement, Render, Role, Subscription, Window, div,
     prelude::*, px,
@@ -46,6 +48,23 @@ impl ComposeView {
         }
     }
 
+    /// What has been typed into the body, and a way to put something there.
+    ///
+    /// Test-only today: they exist so the draft-survival test can stand in for a
+    /// user mid-sentence. The fields themselves are private, so without these
+    /// there is no way to observe that switching mailboxes left the text alone.
+    #[cfg(test)]
+    pub fn body_text(&self, cx: &App) -> String {
+        self.message
+            .read_with(cx, |field, _| field.content().to_string())
+    }
+
+    #[cfg(test)]
+    pub fn set_body_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.message
+            .update(cx, |field, cx| field.set_content(text, cx));
+    }
+
     fn dismiss(&mut self, _: &Dismiss, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(ComposeEvent::Dismiss);
     }
@@ -88,14 +107,22 @@ impl Render for ComposeView {
                     )
                     .child(div().flex_1())
                     .child(
-                        Button::new("compose-close", "")
-                            .dense()
-                            .icon(Icon::new("icons/close.svg", 14., theme.muted))
-                            .style(ButtonStyle::Ghost)
-                            .on_click(move |_event, _window, cx| {
-                                cx.stop_propagation();
-                                entity.update(cx, |_, cx| cx.emit(ComposeEvent::Dismiss));
-                            }),
+                        // Wrapped so the button has a debug selector, the way the
+                        // mail rows give their chrome one: `Button` sets an
+                        // element id only.
+                        div()
+                            .id("compose-close-wrap")
+                            .debug_selector(|| "compose-close".into())
+                            .child(
+                                Button::new("compose-close", "")
+                                    .dense()
+                                    .icon(Icon::new("icons/close.svg", 14., theme.muted))
+                                    .style(ButtonStyle::Ghost)
+                                    .on_click(move |_event, _window, cx| {
+                                        cx.stop_propagation();
+                                        entity.update(cx, |_, cx| cx.emit(ComposeEvent::Dismiss));
+                                    }),
+                            ),
                     ),
             )
             .child(
