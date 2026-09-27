@@ -4,8 +4,15 @@
 # but it must not be in the repository.
 .env
 .env.local
+# Screenshots and other rasters are ignored, because the ones that turn up in
+# working directories are scratch. These two are exceptions the site cannot do
+# without: index.html loads them as the product shot in each palette, and the
+# rule above silently dropped them, which would have published a site with two
+# broken images.
 *.png
 !crates/nori-desktop/assets/app-icon.png
+!site/mock.png
+!site/mock2.png
 
 # web build artifacts
 node_modules/

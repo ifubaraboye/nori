@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nori</title>
+    <meta
+      name="description"
+      content="Nori is a mail client written in Rust on GPUI, the framework behind Zed. Threads, labels, search, and a keyboard-first reader running on your machine and nowhere else."
+    />
+    <meta name="theme-color" content="#0a0a0a" />
+    <link rel="icon" href="./nori.jpg" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              ink: { DEFAULT: "#0a0a0a", raised: "#101010", chrome: "#141414" },
+              fog: {
+                50: "#fafafa",
+                100: "#f4f4f4",
+                200: "#e4e4e4",
+                300: "#c6c6c6",
+                400: "#a1a1a1",
+                500: "#7c7c7c",
+                600: "#5c5c5c",
+                700: "#3d3d3d",
+              },
+              nori: { DEFAULT: "#e2795b", dim: "#c2603d", deep: "#8f3f26" },
+            },
+            fontFamily: {
+              sans: ["Inter", "ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "sans-serif"],
+              mono: ['"JetBrains Mono"', "ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
+            },
+          },
+        },
+      };
+    </script>
+
+    <!-- Runs before first paint so the page never flashes the wrong theme. -->
+    <script>
+      (function () {
+        try {
+          // ?theme=light wins (handy for previews and screenshots), then a
+          // previous choice, then dark — the site is designed dark-first.
+          var q = /[?&]theme=(light|dark)/.exec(location.search);
+          var theme = q ? q[1] : localStorage.getItem("nori-theme") || "dark";
+          document.documentElement.setAttribute("data-theme", theme);
+          document.documentElement.style.colorScheme = theme;
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "dark");
+        }
+      })();
+    </script>
+
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        background: #0a0a0a;
+      }
+
+      /* ── theme toggle ──────────────────────────────────────────
+         Two stacked shots, one per theme: the light one is absolutely
+         positioned over the dark one so swapping never shifts layout. */
+      .shot-light {
+        display: none;
+      }
+      [data-theme="light"] .shot-dark {
+        display: none;
+      }
+      [data-theme="light"] .shot-light {
+        display: block;
+      }
+      #theme-btn .icon-sun {
+        display: none;
+      }
+      [data-theme="light"] #theme-btn .icon-sun {
+        display: block;
+      }
+      [data-theme="light"] #theme-btn .icon-moon {
+        display: none;
+      }
+
+      /* ── light mode ────────────────────────────────────────────
+         Scoped to [data-theme="light"], which outranks Tailwind's
+         single-class rules on specificity alone, so the markup keeps
+         its dark values and needs no dark: variants. */
+      [data-theme="light"] body {
+        background: #f6f4f1;
+      }
+
+      /* text */
+      [data-theme="light"] .text-white { color: #17150f; }
+      [data-theme="light"] .text-black { color: #faf9f7; }
+      [data-theme="light"] .text-fog-100,
+      [data-theme="light"] .text-fog-200 { color: #262320; }
+      [data-theme="light"] .text-fog-300 { color: #423d38; }
+      [data-theme="light"] .text-fog-400 { color: #6a635c; }
+      [data-theme="light"] .text-fog-500 { color: #877f77; }
+      [data-theme="light"] .text-fog-600 { color: #a49b92; }
+      [data-theme="light"] .text-fog-700 { color: #bab1a8; }
+
+      /* surfaces */
+      [data-theme="light"] .bg-ink { background-color: #f6f4f1; }
+      [data-theme="light"] .bg-ink\/85 { background-color: rgba(246, 244, 241, 0.85); }
+      [data-theme="light"] .bg-white { background-color: #17150f; }
+      [data-theme="light"] .bg-white\/30 { background-color: rgba(23, 21, 15, 0.14); }
+      [data-theme="light"] .bg-white\/40 { background-color: rgba(23, 21, 15, 0.16); }
+      [data-theme="light"] .bg-white\/\[0\.015\] { background-color: rgba(23, 21, 15, 0.018); }
+      [data-theme="light"] .bg-white\/\[0\.02\] { background-color: rgba(23, 21, 15, 0.025); }
+      [data-theme="light"] .bg-white\/\[0\.055\] { background-color: rgba(23, 21, 15, 0.07); }
+      [data-theme="light"] .bg-\[\#161616\]\/95 { background-color: rgba(255, 255, 255, 0.96); }
+
+      /* hairlines */
+      [data-theme="light"] .border-white\/10,
+      [data-theme="light"] .border-white\/\[0\.08\] { border-color: rgba(23, 21, 15, 0.16); }
+      [data-theme="light"] .border-white\/\[0\.07\] { border-color: rgba(23, 21, 15, 0.14); }
+      [data-theme="light"] .border-white\/\[0\.06\] { border-color: rgba(23, 21, 15, 0.12); }
+      [data-theme="light"] .border-white\/\[0\.055\],
+      [data-theme="light"] .border-white\/\[0\.05\] { border-color: rgba(23, 21, 15, 0.1); }
+      [data-theme="light"] .border-black\/25 { border-color: rgba(23, 21, 15, 0.18); }
+      [data-theme="light"] .ring-white\/10 { --tw-ring-color: rgba(23, 21, 15, 0.14); }
+
+      /* interaction states: the dark-mode hovers are white washes and pale
+         text, which disappear on a light canvas. Wrapped in (hover: hover) so
+         it matches Tailwind's own guard and a tap on touch doesn't stick. */
+      @media (hover: hover) {
+        [data-theme="light"] .hover\:bg-fog-200:hover { background-color: #2f2b25; }
+        [data-theme="light"] .hover\:bg-white\/\[0\.06\]:hover { background-color: rgba(23, 21, 15, 0.06); }
+        [data-theme="light"] .hover\:bg-white\/\[0\.03\]:hover { background-color: rgba(23, 21, 15, 0.04); }
+        [data-theme="light"] .hover\:text-fog-100:hover { color: #17150f; }
+        [data-theme="light"] .hover\:text-white:hover { color: #17150f; }
+      }
+
+      /* the primary button inverts to ink-on-dark */
+      [data-theme="light"] .shadow-\[inset_0_1px_0_rgba\(255\,255\,255\,0\.6\)\] {
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      }
+      [data-theme="light"] .shadow-\[inset_0_1px_0_rgba\(255\,255\,255\,0\.6\)\,0_8px_24px_-12px_rgba\(255\,255\,255\,0\.4\)\] {
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 8px 24px -14px rgba(23, 21, 15, 0.5);
+      }
+      [data-theme="light"] .shadow-\[0_24px_70px_-24px_rgba\(0\,0\,0\,0\.95\)\] {
+        box-shadow: 0 24px 70px -30px rgba(23, 21, 15, 0.35);
+      }
+
+      /* kbd chips */
+      [data-theme="light"] kbd {
+        color: #262320;
+        background: rgba(23, 21, 15, 0.04);
+        border-color: rgba(23, 21, 15, 0.14);
+        border-bottom-color: rgba(23, 21, 15, 0.22);
+      }
+
+      /* Hairline rails that run the full height of the page, the way a
+         letterpress rule runs down a margin. */
+      .rail {
+        background-image: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.09) 12%, rgba(255, 255, 255, 0.09) 88%, transparent);
+      }
+
+      /* Product band: a generated topographic-contour plate on warm paper, so
+         the dark window reads as an object on a desk. The gradient underneath
+         is the fallback if the plate is missing. */
+      .paper {
+        background-color: #ece3d9;
+        background-image: url("./band.jpg"), linear-gradient(180deg, #efe9e3 0%, #e7ded6 46%, #ddd2c8 100%);
+        background-size: cover, cover;
+        background-position: center, center;
+        background-repeat: no-repeat, no-repeat;
+      }
+      .grain {
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+        background-size: 180px 180px;
+      }
+
+      kbd {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 11px;
+        line-height: 1;
+        color: #e4e4e4;
+        background: rgba(255, 255, 255, 0.045);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-bottom-color: rgba(255, 255, 255, 0.16);
+        border-radius: 5px;
+        padding: 4px 6px;
+        white-space: nowrap;
+      }
+
+      .reveal {
+        opacity: 0;
+        transform: translateY(12px);
+        transition:
+          opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1),
+          transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+      .reveal.in {
+        opacity: 1;
+        transform: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .reveal {
+          opacity: 1;
+          transform: none;
+          transition: none;
+        }
+      }
+
+      .acc-panel {
+        display: grid;
+        grid-template-rows: 0fr;
+        transition: grid-template-rows 0.34s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+      .acc-panel > div {
+        overflow: hidden;
+      }
+      .acc[data-open="true"] .acc-panel {
+        grid-template-rows: 1fr;
+      }
+      .acc[data-open="true"] .acc-chev {
+        transform: rotate(180deg);
+      }
+      .acc-chev {
+        transition: transform 0.34s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+
+      @keyframes toast {
+        from {
+          opacity: 0;
+          transform: translate(-50%, 12px) scale(0.98);
+        }
+      }
+      .toast-in {
+        animation: toast 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+
+      /* Slow drift on the protocol row, so nothing on the page is ever
+         completely still. */
+      @keyframes drift {
+        0%,
+        100% {
+          transform: translate3d(0, 0, 0);
+        }
+        50% {
+          transform: translate3d(0, -3px, 0);
+        }
+      }
+      .drift {
+        animation: drift 8s ease-in-out infinite;
+      }
+    </style>
+  </head>
+
+  <body class="bg-ink font-sans text-fog-200 antialiased selection:bg-nori/30 selection:text-white">
+    <div class="mx-auto w-full max-w-[1100px] border-x border-white/[0.055]">
+      <!-- ══════════════════════════ header ══════════════════════════ -->
+      <header id="top" class="sticky top-0 z-50 border-b border-white/[0.055] bg-ink/85 backdrop-blur-md">
+        <div class="flex items-center justify-between px-8 py-4 sm:px-10">
+          <a href="#top" class="group flex items-center gap-2.5">
+            <img
+              src="./nori.jpg"
+              width="40"
+              height="40"
+              alt=""
+              class="h-7 w-7 rounded-[7px] object-cover ring-1 ring-white/10 transition-transform duration-300 group-hover:-rotate-6"
+            />
+            <span class="text-[18px] font-semibold tracking-[-0.01em] text-white">Nori</span>
+          </a>
+
+          
+
+          <div class="flex items-center gap-2.5">
+            <button
+              id="theme-btn"
+              type="button"
+              aria-label="Switch to light mode"
+              aria-pressed="false"
+              class="grid h-8 w-8 place-items-center rounded-lg text-fog-500 transition-colors duration-200 hover:bg-white/[0.06] hover:text-fog-100"
+            >
+              <svg class="icon-moon h-[17px] w-[17px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20.5 14.3A8.6 8.6 0 0 1 9.7 3.5a8.6 8.6 0 1 0 10.8 10.8Z" />
+              </svg>
+              <svg class="icon-sun h-[17px] w-[17px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="4.2" />
+                <path d="M12 2.5v2.2M12 19.3v2.2M4.2 4.2l1.6 1.6M18.2 18.2l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.2 19.8l1.6-1.6M18.2 5.8l1.6-1.6" />
+              </svg>
+            </button>
+            <a
+              href="https://github.com/ifubaraboye/nori"
+              target="_blank"
+              rel="noreferrer noopener"
+              aria-label="Nori on GitHub"
+              class="grid h-8 w-8 place-items-center rounded-lg text-fog-500 transition-colors duration-200 hover:bg-white/[0.06] hover:text-fog-100"
+            >
+              <svg viewBox="0 0 16 16" class="h-[17px] w-[17px] fill-current" aria-hidden="true">
+                <path
+                  d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+                />
+              </svg>
+            </a>
+            <button
+              data-download
+              class="inline-flex items-center gap-1.5  bg-white px-3 py-[7px] text-[12.5px] font-medium text-black transition-all duration-200 hover:bg-fog-200 active:scale-[0.98]"
+            >
+              <svg viewBox="0 0 24 24" class="h-[13px] w-[13px]" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3.5v11" />
+                <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+                <path d="M4.5 19.5h15" />
+              </svg>
+              Download
+            </button>
+            <button
+              id="menu-btn"
+              aria-label="Menu"
+              aria-expanded="false"
+              class="grid h-8 w-8 place-items-center rounded-lg text-fog-400 transition-colors hover:bg-white/[0.06] hover:text-white lg:hidden"
+            >
+              <svg viewBox="0 0 24 24" class="h-[18px] w-[18px]" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                <path d="M4 7h16M4 12h16M4 17h16" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        
+      </header>
+
+      <!-- ══════════════════════════ hero ══════════════════════════ -->
+      <section class="px-8 pb-28 pt-24 sm:px-10 sm:pb-36 sm:pt-20">
+        <div class="grid gap-16 lg:grid-cols-[1.35fr_1fr] lg:gap-14">
+          <div>
+           
+
+            <h1
+              class="reveal mt-9 text-[38px] font-semibold leading-[1.06] tracking-[-0.038em] text-white sm:text-[60px]"
+              style="transition-delay: 60ms"
+            >
+              Every inbox,<br />
+              <span class="text-white">One native window.</span>
+            </h1>
+
+            <p
+              class="reveal mt-8 max-w-[430px] text-[15px] leading-[1.65] text-fog-400"
+              style="transition-delay: 120ms"
+            >
+              Nori is an email client written in Rust on GPUI. Threads,
+              labels, search and a keyboard first reader, running on your machine and nowhere else.
+            </p>
+
+            <div class="reveal mt-10 flex flex-wrap items-center gap-x-5 gap-y-4" style="transition-delay: 180ms">
+              <button
+                data-download
+                class="inline-flex items-center gap-2  bg-white px-4 py-2.5 text-[13.5px] font-medium text-black shadow-[inset_0_1px_0_rgba(255,255,255,0.6),0_8px_24px_-12px_rgba(255,255,255,0.4)] transition-all duration-200 hover:bg-fog-200 active:scale-[0.985]"
+              >
+                <svg viewBox="0 0 24 24" class="h-[14px] w-[14px]" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3.5v11" />
+                  <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+                  <path d="M4.5 19.5h15" />
+                </svg>
+                Download
+              </button>
+            </div>
+          </div>
+
+          <!-- spec card -->
+          <div class="reveal self-end lg:pb-2" style="transition-delay: 240ms">
+           
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════ protocol strip ══════════════════════ -->
+      <section class="border-y border-white/[0.055] px-8">
+        <!--<div class="flex flex-col gap-5 sm:flex-row sm:items-center sm:gap-8">
+          <p class="shrink-0 font-mono text-[10px] uppercase tracking-[0.2em] text-fog-600">Speaks your provider's language</p>
+          <ul class="-my-1 flex flex-1 flex-wrap items-center gap-x-6 gap-y-3">
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 0ms">Gmail</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 350ms">IMAP</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 700ms">JMAP</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 1050ms">OAuth 2.0</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 1400ms">PKCE</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 1750ms">SMTP</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 2100ms">Gmail&nbsp;History&nbsp;API</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 2450ms">Wayland</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 2800ms">X11</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 3150ms">Rust</li>
+            <li class="drift font-mono text-[12px] text-fog-500 transition-colors duration-200 hover:text-fog-100" style="animation-delay: 3500ms">GPUI</li>
+          </ul>
+        </div>-->
+      </section>
+
+      <!-- ══════════════════════ product shot ══════════════════════ -->
+      <section id="product" class="relative">
+        <div class="paper absolute inset-0"></div>
+        <div class="grain absolute inset-0 opacity-[0.13] mix-blend-multiply"></div>
+        <div class="absolute inset-x-0 top-0 h-px bg-white/40"></div>
+
+        <div class="relative pb-14 pt-20 sm:pb-16 sm:pt-24">
+          <div class="reveal mx-auto max-w-[1012px]">
+            <!-- ── the app ── -->
+            <div class="grid">
+              <img
+                src="./mock.png"
+                width="1597"
+                height="879"
+                alt="Nori reading a Gmail inbox in dark mode: sidebar with mailboxes and labels, a tabbed message list, and per-row actions"
+                class="shot-dark col-start-1 row-start-1 w-full rounded-[10px] border border-black/25 shadow-[0_50px_100px_-30px_rgba(40,25,15,0.55)]"
+              />
+              <img
+                src="./mock2.png"
+                width="1597"
+                height="879"
+                alt="Nori reading a Gmail inbox in light mode: sidebar with mailboxes and labels, a tabbed message list, and per-row actions"
+                class="shot-light col-start-1 row-start-1 w-full rounded-[10px] border border-black/25 shadow-[0_50px_100px_-30px_rgba(40,25,15,0.55)]"
+              />
+            </div>
+
+            <!-- caption -->
+            <div class="mt-6 flex flex-wrap items-center justify-between gap-3 font-mono text-[10.5px] text-[#8b7f74]">
+            </div>
+          </div>
+        </div>
+        <div class="absolute inset-x-0 bottom-0 h-px bg-white/30"></div>
+      </section>
+
+      <!-- ══════════════════════ why native ══════════════════════ -->
+      <section id="read-path" class="py-12">
+        <div class="px-8 sm:px-10">
+          <p class="reveal font-mono text-[11px] uppercase tracking-[0.2em] text-fog-600">Why native</p>
+        </div>
+
+        <!-- full-bleed grid: rails sit on the container edge, cells carry their own padding -->
+        <div class="reveal mt-12 grid grid-cols-1 border-y border-white/[0.07] sm:grid-cols-2 lg:grid-cols-3">
+          <div class="border-b border-white/[0.07] sm:border-r lg:border-b-0">
+          <div class="px-6 py-7 sm:px-8 sm:py-8">
+            <div class="flex items-center gap-2.5">
+              <svg viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-fog-400" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.2 2.8 5.4 13.6h5.5l-1 7.6 7.9-10.8h-5.5Z" /></svg>
+              <h3 class="text-[14.5px] font-semibold tracking-[-0.01em] text-white">Built with Rust and GPUI</h3>
+            </div>
+            <p class="mt-3.5 max-w-[330px] text-[13.5px] leading-[1.6] text-fog-400">
+              The engine behind Zed. Every row is rendered directly by the GPU, keeping the DOM completely out of the reading path.
+            </p>
+          </div>
+          </div>
+          <div class="border-b border-white/[0.07] lg:border-r lg:border-b-0">
+          <div class="px-6 py-7 sm:px-8 sm:py-8">
+            <div class="flex items-center gap-2.5">
+              <svg viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-fog-400" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3.5 8.5 4.6L12 12.7 3.5 8.1Z" /><path d="m3.5 12.4 8.5 4.6 8.5-4.6" /><path d="m3.5 16.4 8.5 4.6 8.5-4.6" /></svg>
+              <h3 class="text-[14.5px] font-semibold tracking-[-0.01em] text-white">Mail, not Gmail</h3>
+            </div>
+            <p class="mt-3.5 max-w-[330px] text-[13.5px] leading-[1.6] text-fog-400">
+              Pure email primitives: sender, thread, labels, and body. Gmail&rsquo;s raw API quirks are isolated inside a single adapter layer.
+            </p>
+          </div>
+          </div>
+          <div class="border-b border-white/[0.07] sm:border-t lg:border-b-0 lg:border-t-0">
+          <div class="px-6 py-7 sm:px-8 sm:py-8">
+            <div class="flex items-center gap-2.5">
+              <svg viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-fog-400" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.4 12a8.6 8.6 0 1 0 2.6-6.2" /><path d="M3.4 3.6v4.4h4.4" /><path d="M12 7.6V12l3 1.8" /></svg>
+              <h3 class="text-[14.5px] font-semibold tracking-[-0.01em] text-white">Old mail is not stale mail</h3>
+            </div>
+            <p class="mt-3.5 max-w-[330px] text-[13.5px] leading-[1.6] text-fog-400">
+             Syncs only what changed since last time, not your entire inbox. One full refresh sets everything right if needed.
+            </p>
+          </div>
+          </div>
+          <div class="border-b border-white/[0.07] sm:border-r sm:border-l-0 lg:border-t">
+          <div class="px-6 py-7 sm:px-8 sm:py-8">
+            <div class="flex items-center gap-2.5">
+              <span class="grid h-4 w-4 shrink-0 place-items-center text-[14px] leading-none text-fog-400" aria-hidden="true">&#8984;</span>
+              <h3 class="text-[14.5px] font-semibold tracking-[-0.01em] text-white">Ten keys, whole client</h3>
+            </div>
+            <p class="mt-3.5 max-w-[330px] text-[13.5px] leading-[1.6] text-fog-400">
+              ⌘1&ndash;⌘6 to change views, and <span class="font-mono text-[12.5px] text-fog-300">Esc</span> to exit. Full client control without touching the mouse.
+            </p>
+          </div>
+          </div>
+          <div class="border-b border-white/[0.07] sm:border-r lg:border-t">
+          <div class="px-6 py-7 sm:px-8 sm:py-8">
+            <div class="flex items-center gap-2.5">
+              <svg viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-fog-400" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="10.5" rx="1.6" /><path d="M2.5 18.8h19" /><path d="M9.5 15.5v3.3" /></svg>
+              <h3 class="text-[14.5px] font-semibold tracking-[-0.01em] text-white">Nothing in the middle</h3>
+            </div>
+            <p class="mt-3.5 max-w-[330px] text-[13.5px] leading-[1.6] text-fog-400">
+              Tokens stay in your OS keychain, and the cache lives in a local directory you can clear anytime. No accounts, no metrics.
+            </p>
+          </div>
+          </div>
+          <div class="border-white/[0.07] sm:border-l lg:border-t">
+          <div class="px-6 py-7 sm:px-8 sm:py-8 lg:pr-8">
+            <div class="flex items-center gap-2.5">
+              <svg viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-fog-400" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5.5 7.5 4 4.5-4 4.5" /><path d="M12.5 17h6" /></svg>
+              <h3 class="text-[14.5px] font-semibold tracking-[-0.01em] text-white">One design, built twice</h3>
+            </div>
+            <p class="mt-3.5 max-w-[330px] text-[13.5px] leading-[1.6] text-fog-400">
+              A native Rust/GPUI client and a React port engineered to match pixel for pixel. A change to one lands in the other.
+            </p>
+          </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════════ download ══════════════════════ -->
+      <section id="download" class="px-8 py-16 sm:px-10 sm:py-20">
+        <div>
+          <div class="reveal">
+            <p class="font-mono text-[10px] uppercase tracking-[0.2em] text-fog-600">Download</p>
+            <h2 class="mt-5 text-[30px] font-semibold leading-[1.2] tracking-[-0.03em] text-white sm:text-[34px]">
+              Get Nori
+            </h2>
+            <!--<p class="mt-6 max-w-[380px] text-[13.5px] leading-[1.7] text-fog-500">
+              No build is published yet — Nori is a prototype, and the honest way to run it is from
+              source. The toolchain is pinned, GPUI comes from a fixed Zed revision, and the first
+              build is slow.
+            </p>-->
+            <div class="mt-7 flex flex-wrap items-center gap-4">
+              <button
+                data-download
+                class="inline-flex items-center gap-2 bg-white px-4 py-2.5 text-[13.5px] font-medium text-black shadow-[inset_0_1px_0_rgba(255,255,255,0.6)] transition-all duration-200 hover:bg-fog-200 active:scale-[0.985]"
+              >
+                <svg viewBox="0 0 24 24" class="h-[14px] w-[14px]" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3.5v11" />
+                  <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+                  <path d="M4.5 19.5h15" />
+                </svg>
+                Download
+              </button>
+              <!--<span class="font-mono text-[11.5px] text-fog-600">v0.1.0</span>-->
+            </div>
+          </div>
+
+          <!--<div class="reveal self-end">
+            <div class="rounded-xl border border-white/[0.08] bg-white/[0.015] p-1.5">
+              <div class="flex items-center justify-between rounded-lg px-3.5 py-3 transition-colors duration-200 hover:bg-white/[0.03]">
+                <div class="flex items-center gap-3">
+                  <svg viewBox="0 0 24 24" class="h-[15px] w-[15px] text-fog-500" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 5.5h16v13H4z" />
+                    <path d="M4 9.5h16" />
+                    <path d="M8 13h4" />
+                  </svg>
+                  <div>
+                    <div class="text-[12.5px] text-fog-200">Linux · x86_64</div>
+                    <div class="font-mono text-[10.5px] text-fog-600">wayland or x11 session</div>
+                  </div>
+                </div>
+                <span class="font-mono text-[10px] text-fog-600">build from source</span>
+              </div>
+              <div class="h-px bg-white/[0.055]"></div>
+              <div class="flex items-center justify-between rounded-lg px-3.5 py-3 transition-colors duration-200 hover:bg-white/[0.03]">
+                <div class="flex items-center gap-3">
+                  <svg viewBox="0 0 24 24" class="h-[15px] w-[15px] text-fog-500" fill="currentColor" aria-hidden="true">
+                    <path d="M16.4 12.7c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9s-1.8-.9-3-.8c-1.5 0-2.9.9-3.7 2.3-1.6 2.7-.4 6.8 1.1 9 .8 1.1 1.6 2.3 2.8 2.2 1.1 0 1.6-.7 2.9-.7s1.7.7 2.9.7c1.2 0 2-1.1 2.7-2.2.9-1.3 1.2-2.5 1.3-2.6-.1 0-2.4-.9-2.4-3.5ZM14.2 5.6c.6-.8 1-1.8.9-2.9-.9 0-2 .6-2.6 1.4-.6.7-1.1 1.8-.9 2.8 1 .1 2-.5 2.6-1.3Z" />
+                  </svg>
+                  <div>
+                    <div class="text-[12.5px] text-fog-200">macOS</div>
+                    <div class="font-mono text-[10.5px] text-fog-600">prototype, GPUI port pending</div>
+                  </div>
+                </div>
+                <span class="font-mono text-[10px] text-fog-600">soon</span>
+              </div>
+            </div>
+            <div class="mt-4 flex items-center gap-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-3.5 py-2.5">
+              <span class="text-fog-600">$</span>
+              <code class="truncate font-mono text-[11.5px] text-fog-300">cargo run -p nori-desktop</code>
+            </div>
+          </div>-->
+        </div>
+      </section>
+
+      <!-- ══════════════════════ questions ══════════════════════ -->
+      <!--<section id="questions" class="border-t border-white/[0.06] px-8 py-28 sm:px-10 sm:py-36">
+        <p class="reveal font-mono text-[10px] uppercase tracking-[0.2em] text-fog-600">Questions</p>
+
+        <div class="reveal mt-12 max-w-[720px] border-t border-white/[0.06]">
+          <div class="acc border-b border-white/[0.06]" data-open="false">
+            <button class="acc-head flex w-full items-center justify-between gap-6 py-5 text-left text-[14px] font-medium text-fog-200 transition-colors hover:text-white" aria-expanded="false">
+              Is this another Electron app?
+              <svg class="acc-chev h-[14px] w-[14px] shrink-0 text-fog-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9.5 6 6 6-6" />
+              </svg>
+            </button>
+            <div class="acc-panel">
+              <div>
+                <p class="max-w-[620px] pb-6 text-[13px] leading-[1.75] text-fog-500">
+                  No. Nori is Rust and GPUI. The sidebar, the list, the reader and the composer are
+                  native elements painted by the GPU, so a mailbox with a quarter-million messages
+                  scrolls at the refresh rate your display actually runs at. There is no Chromium
+                  process behind the window, and nothing in the read path is HTML.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div class="acc border-b border-white/[0.06]" data-open="false">
+            <button class="acc-head flex w-full items-center justify-between gap-6 py-5 text-left text-[14px] font-medium text-fog-200 transition-colors hover:text-white" aria-expanded="false">
+              Do I need a Nori account?
+              <svg class="acc-chev h-[14px] w-[14px] shrink-0 text-fog-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9.5 6 6 6-6" />
+              </svg>
+            </button>
+            <div class="acc-panel">
+              <div>
+                <p class="max-w-[620px] pb-6 text-[13px] leading-[1.75] text-fog-500">
+                  No. Nori has no accounts of its own and no server in the middle. You sign in to your
+                  provider over OAuth 2.0 with PKCE — the same flow a browser would use — and the
+                  refresh token stays on your machine. Delete it and sign in again; nothing is
+                  recovered on our side, because nothing was kept.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div class="acc border-b border-white/[0.06]" data-open="false">
+            <button class="acc-head flex w-full items-center justify-between gap-6 py-5 text-left text-[14px] font-medium text-fog-200 transition-colors hover:text-white" aria-expanded="false">
+              Where does my data live?
+              <svg class="acc-chev h-[14px] w-[14px] shrink-0 text-fog-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9.5 6 6 6-6" />
+              </svg>
+            </button>
+            <div class="acc-panel">
+              <div>
+                <p class="max-w-[620px] pb-6 text-[13px] leading-[1.75] text-fog-500">
+                  In a local cache Nori owns, alongside the copy your provider already keeps. No
+                  account, no telemetry, no analytics, no crash reporter. The web build is a separate
+                  React port of the same design and runs entirely on mock data.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div class="acc border-b border-white/[0.06]" data-open="false">
+            <button class="acc-head flex w-full items-center justify-between gap-6 py-5 text-left text-[14px] font-medium text-fog-200 transition-colors hover:text-white" aria-expanded="false">
+              What is the future plan?
+              <svg class="acc-chev h-[14px] w-[14px] shrink-0 text-fog-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9.5 6 6 6-6" />
+              </svg>
+            </button>
+            <div class="acc-panel">
+              <div>
+                <p class="max-w-[620px] pb-6 text-[13px] leading-[1.75] text-fog-500">
+                  Gmail is the first provider and the only crate that knows what a raw Gmail label id
+                  means. IMAP and JMAP land on the same provider-neutral interface, then multiple
+                  accounts in one sidebar, then a signed release with binary deltas. Today: a
+                  prototype with no accounts, no sync service, and no network of its own.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>-->
+
+      <!-- ══════════════════════ footer ══════════════════════ -->
+      <footer class="border-t border-white/[0.06] px-8 py-8 sm:px-10">
+        <div class="flex flex-col gap-8 sm:flex-row sm:items-center sm:justify-between">
+          <div class="flex items-center gap-3">
+            <img
+              src="./nori.jpg"
+              width="22"
+              height="22"
+              alt=""
+              class="h-[22px] w-[22px] rounded-[6px] object-cover ring-1 ring-white/10"
+            />
+            <div>
+              <div class="text-[12.5px] text-fog-300">© 2026 Nori</div>
+              <div class="font-mono text-[10px] text-fog-600"></div>
+            </div>
+          </div>
+
+          <!--<nav class="flex flex-wrap items-center gap-x-7 gap-y-2 text-[12px] text-fog-500">
+            <a href="https://github.com/ifubaraboye/nori" target="_blank" rel="noreferrer noopener" class="transition-colors hover:text-fog-100">Source</a>
+            <a href="#read-path" class="transition-colors hover:text-fog-100">How it works</a>
+            <a href="#keys" class="transition-colors hover:text-fog-100">Shortcuts</a>
+            <a href="#questions" class="transition-colors hover:text-fog-100">Questions</a>
+            <a href="#download" class="transition-colors hover:text-fog-100">Download</a>
+          </nav>-->
+        </div>
+
+        <!--<p class="mt-10 border-t border-white/[0.05] pt-6 font-mono text-[10px] leading-relaxed text-fog-700">
+          Set in Inter and JetBrains Mono. Built with Rust, GPUI, Tailwind, and an unnecessary amount
+          of margin.
+        </p>-->
+      </footer>
+    </div>
+
+    <!-- toast -->
+    <div
+      id="toast"
+      class="pointer-events-none fixed bottom-7 left-1/2 z-[60] w-[calc(100%-2rem)] max-w-[400px] -translate-x-1/2 translate-y-3 rounded-xl border border-white/10 bg-[#161616]/95 p-4 opacity-0 shadow-[0_24px_70px_-24px_rgba(0,0,0,0.95)] backdrop-blur transition-all duration-300"
+      role="status"
+      aria-live="polite"
+    >
+      <div class="flex items-start gap-3">
+        <span class="mt-[2px] grid h-6 w-6 shrink-0 place-items-center rounded-md bg-nori/15 text-nori">
+          <svg viewBox="0 0 24 24" class="h-[13px] w-[13px]" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3.5v11" />
+            <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+            <path d="M4.5 19.5h15" />
+          </svg>
+        </span>
+        <div class="min-w-0">
+          <p class="text-[12.5px] font-medium text-fog-100">No build is published yet</p>
+          <p class="mt-1.5 text-[11.5px] leading-[1.6] text-fog-500">
+            Nori is a prototype. Clone the repo and run
+            <code class="font-mono text-fog-300">cargo run -p nori-desktop</code> — the toolchain is
+            pinned in <code class="font-mono text-fog-300">rust-toolchain.toml</code>.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        "use strict";
+
+        /* ── theme ─────────────────────────────────────────────── */
+        var root = document.documentElement;
+        var themeBtn = document.getElementById("theme-btn");
+        function label() {
+          if (!themeBtn) return;
+          var light = root.getAttribute("data-theme") === "light";
+          themeBtn.setAttribute("aria-pressed", light ? "true" : "false");
+          themeBtn.setAttribute("aria-label", light ? "Switch to dark mode" : "Switch to light mode");
+        }
+        label();
+        if (themeBtn) {
+          themeBtn.addEventListener("click", function () {
+            var next = root.getAttribute("data-theme") === "light" ? "dark" : "light";
+            root.setAttribute("data-theme", next);
+            root.style.colorScheme = next;
+            label();
+            try {
+              localStorage.setItem("nori-theme", next);
+            } catch (e) {
+              /* private mode: the toggle still works for this page view */
+            }
+          });
+        }
+
+        /* ── mobile menu ───────────────────────────────────────── */
+        var menuBtn = document.getElementById("menu-btn");
+        var menu = document.getElementById("menu");
+        if (menuBtn && menu) {
+          menuBtn.addEventListener("click", function () {
+            var open = !menu.classList.contains("hidden");
+            menu.classList.toggle("hidden");
+            menuBtn.setAttribute("aria-expanded", String(!open));
+          });
+          menu.addEventListener("click", function (e) {
+            if (e.target.closest("a")) {
+              menu.classList.add("hidden");
+              menuBtn.setAttribute("aria-expanded", "false");
+            }
+          });
+        }
+
+        /* ── reveal on scroll ──────────────────────────────────── */
+        var reveals = Array.prototype.slice.call(document.querySelectorAll(".reveal"));
+        var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        if ("IntersectionObserver" in window && !reduced) {
+          var io = new IntersectionObserver(
+            function (entries) {
+              entries.forEach(function (entry) {
+                if (entry.isIntersecting) {
+                  entry.target.classList.add("in");
+                  io.unobserve(entry.target);
+                }
+              });
+            },
+            { rootMargin: "0px 0px -10% 0px", threshold: 0.06 }
+          );
+          reveals.forEach(function (el) {
+            io.observe(el);
+          });
+        } else {
+          reveals.forEach(function (el) {
+            el.classList.add("in");
+          });
+        }
+
+        /* ── FAQ accordion: one open at a time ─────────────────── */
+        var items = Array.prototype.slice.call(document.querySelectorAll(".acc"));
+        function setOpen(item, open) {
+          item.setAttribute("data-open", open ? "true" : "false");
+          var head = item.querySelector(".acc-head");
+          if (head) head.setAttribute("aria-expanded", open ? "true" : "false");
+        }
+        items.forEach(function (item) {
+          var head = item.querySelector(".acc-head");
+          if (!head) return;
+          head.addEventListener("click", function () {
+            var isOpen = item.getAttribute("data-open") === "true";
+            items.forEach(function (other) {
+              setOpen(other, false);
+            });
+            if (!isOpen) setOpen(item, true);
+          });
+        });
+
+        /* ── download toast ────────────────────────────────────── */
+        var toast = document.getElementById("toast");
+        var toastTimer;
+        function showToast() {
+          if (!toast) return;
+          window.clearTimeout(toastTimer);
+          toast.classList.remove("toast-in");
+          void toast.offsetWidth; /* restart the animation on repeat clicks */
+          toast.classList.add("toast-in");
+          toast.classList.remove("opacity-0", "translate-y-3");
+          toastTimer = window.setTimeout(function () {
+            toast.classList.add("opacity-0", "translate-y-3");
+            toast.classList.remove("toast-in");
+          }, 5400);
+        }
+        Array.prototype.forEach.call(document.querySelectorAll("[data-download]"), function (btn) {
+          btn.addEventListener("click", function (e) {
+            e.preventDefault();
+            /* The header button just takes you to the download block. */
+            if (btn.closest("header")) {
+              var target = document.getElementById("download");
+              if (target) target.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "start" });
+              return;
+            }
+            showToast();
+          });
+        });
+
+        /* ── the window drifts a few pixels as the band passes ──── */
+        var band = document.getElementById("product");
+        var shot = band && band.querySelector(".reveal");
+        if (band && shot && !reduced) {
+          var ticking = false;
+          window.addEventListener(
+            "scroll",
+            function () {
+              if (ticking) return;
+              ticking = true;
+              window.requestAnimationFrame(function () {
+                var rect = band.getBoundingClientRect();
+                var progress = (window.innerHeight - rect.top) / (window.innerHeight + rect.height);
+                var offset = (progress - 0.5) * 26;
+                shot.style.transform = "translate3d(0," + offset.toFixed(2) + "px,0)";
+                ticking = false;
+              });
+            },
+            { passive: true }
+          );
+        }
+      })();
+    </script>
+  </body>
+</html>
