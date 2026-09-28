@@ -47,6 +47,34 @@
   outline: 1px solid var(--nori-focus);
 }
 
+/* History arrows beside the toggle (sidebar.rs), 26px like the Rust box. */
+.nori-sidebar-history {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.nori-sidebar-history#sidebar-back {
+  margin-left: 6px;
+}
+.nori-sidebar-history:hover {
+  background: var(--nori-hover);
+}
+.nori-sidebar-history:active {
+  background: var(--nori-active);
+}
+.nori-sidebar-history:focus-visible {
+  outline: 1px solid var(--nori-focus);
+}
+.nori-sidebar-history--disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 .nori-sidebar-compose {
   padding: 10px 10px 1px;
 }

@@ -1,5 +1,7 @@
 import archiveSvg from "../assets/icons/archive.svg?raw";
 import appearanceSvg from "../assets/icons/appearance.svg?raw";
+import arrowLeftSvg from "../assets/icons/arrow-left.svg?raw";
+import arrowRightSvg from "../assets/icons/arrow-right.svg?raw";
 import bellSvg from "../assets/icons/bell.svg?raw";
 import chevronDownSvg from "../assets/icons/chevron-down.svg?raw";
 import chevronLeftSvg from "../assets/icons/chevron-left.svg?raw";
@@ -34,6 +36,8 @@ import "./Icon.css";
 const ICONS: Record<string, string> = {
   "icons/archive.svg": archiveSvg,
   "icons/appearance.svg": appearanceSvg,
+  "icons/arrow-left.svg": arrowLeftSvg,
+  "icons/arrow-right.svg": arrowRightSvg,
   "icons/bell.svg": bellSvg,
   "icons/chevron-down.svg": chevronDownSvg,
   "icons/chevron-left.svg": chevronLeftSvg,

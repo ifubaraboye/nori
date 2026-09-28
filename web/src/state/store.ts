@@ -25,6 +25,15 @@ export interface MailState {
   composeSeed: DraftSeed | null;
   /** Open settings page, or null. Holds the workspace while open. */
   settingsPage: SettingsPage | null;
+  /** Visited views, for the sidebar back/forward arrows (mail.rs NavEntry). */
+  historyBack: NavEntry[];
+  historyForward: NavEntry[];
+}
+
+export interface NavEntry {
+  view: WorkspaceView;
+  mailbox: Mailbox;
+  selectedIndex: number;
 }
 
 export type MailAction =
@@ -45,7 +54,8 @@ export type MailAction =
   | { type: "open-settings" }
   | { type: "close-settings" }
   | { type: "set-settings-page"; page: SettingsPage }
-  | { type: "go-back" };
+  | { type: "go-back" }
+  | { type: "go-forward" };
 
 export function visibleEmails(emails: Email[], mailbox: Mailbox): Email[] {
   return emails.filter((email) => {
@@ -70,7 +80,45 @@ function initialState(): MailState {
     overlay: null,
     composeSeed: null,
     settingsPage: null,
+    historyBack: [],
+    historyForward: [],
   };
+}
+
+function currentEntry(state: MailState): NavEntry {
+  return {
+    view: state.workspaceView,
+    mailbox: state.selectedMailbox,
+    selectedIndex: state.selectedIndex,
+  };
+}
+
+function sameEntry(a: NavEntry, b: NavEntry): boolean {
+  return (
+    a.mailbox === b.mailbox &&
+    a.selectedIndex === b.selectedIndex &&
+    (a.view.kind === "email" && b.view.kind === "email"
+      ? a.view.id === b.view.id
+      : a.view.kind === b.view.kind)
+  );
+}
+
+/** Record where we are so the arrows can retrace it (mail.rs push_history). */
+function pushHistory(state: MailState): MailState {
+  const entry = currentEntry(state);
+  const last = state.historyBack[state.historyBack.length - 1];
+  return {
+    ...state,
+    historyBack: last && sameEntry(last, entry) ? state.historyBack : [...state.historyBack, entry],
+    historyForward: [],
+  };
+}
+
+function restoreEntry(state: MailState, entry: NavEntry): MailState {
+  const activeTab = entry.view.kind === "email" && state.tabs.includes(entry.view.id)
+    ? entry.view.id
+    : null;
+  return { ...state, selectedMailbox: entry.mailbox, selectedIndex: entry.selectedIndex, activeTab, workspaceView: entry.view };
 }
 
 function openEmailInState(
@@ -129,13 +177,13 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
     case "set-selected-index":
       return { ...state, selectedIndex: action.index };
     case "open-email":
-      return {
+      return pushHistory({
         ...openEmailInState(state, action.id, {
           markRead: action.markRead,
           openInTab: action.openInTab,
         }),
         settingsPage: null,
-      };
+      });
     case "open-email-from-search":
       return {
         ...openEmailInState(state, action.id, {
@@ -200,8 +248,31 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
     case "set-settings-page":
       return { ...state, settingsPage: action.page };
     case "go-back": {
-      if (state.overlay != null) return { ...state, overlay: null, composeSeed: null };
-      return { ...state, workspaceView: { kind: "mailbox" } };
+      if (state.overlay === "search") return { ...state, overlay: null };
+      if (state.overlay === "compose") return { ...state, overlay: null };
+      if (state.settingsPage != null) return { ...state, settingsPage: null };
+      const previous = state.historyBack[state.historyBack.length - 1];
+      if (!previous) return { ...state, workspaceView: { kind: "mailbox" } };
+      return restoreEntry(
+        {
+          ...state,
+          historyBack: state.historyBack.slice(0, -1),
+          historyForward: [...state.historyForward, currentEntry(state)],
+        },
+        previous,
+      );
+    }
+    case "go-forward": {
+      const next = state.historyForward[state.historyForward.length - 1];
+      if (!next) return state;
+      return restoreEntry(
+        {
+          ...state,
+          historyBack: [...state.historyBack, currentEntry(state)],
+          historyForward: state.historyForward.slice(0, -1),
+        },
+        next,
+      );
     }
   }
 }

@@ -35,6 +35,10 @@ interface SidebarProps {
   onToggleGroup: () => void;
   onBeginResize: (startX: number) => void;
   onResizeStep: (delta: number) => void;
+  onBack: () => void;
+  onForward: () => void;
+  canBack: boolean;
+  canForward: boolean;
 }
 
 /** Port of components/sidebar.rs. */
@@ -52,6 +56,10 @@ export function Sidebar({
   onBeginResize,
   onResizeStep,
   onSettings,
+  onBack,
+  onForward,
+  canBack,
+  canForward,
 }: SidebarProps) {
   const clamped = clampSidebarWidth(width);
 
@@ -84,14 +92,52 @@ export function Sidebar({
       <div className="nori-sidebar-content" style={{ width: clamped }} aria-hidden={!visible}>
         <div className="nori-sidebar-header">
           <button
-            id="sidebar-hide"
+            id="sidebar-toggle"
             type="button"
             className="nori-sidebar-hide"
-            aria-label="Hide sidebar"
+            aria-label="Toggle sidebar"
             onClick={onToggle}
           >
             <Icon path="icons/panel-left.svg" size={18} color="var(--nori-muted)" />
           </button>
+          <div
+            id="sidebar-back"
+            role="button"
+            aria-label="Go back"
+            tabIndex={canBack ? 0 : -1}
+            className={canBack ? "nori-sidebar-history" : "nori-sidebar-history nori-sidebar-history--disabled"}
+            onClick={() => {
+              if (canBack) onBack();
+            }}
+            onKeyDown={(e) => {
+              if (canBack && (e.key === "Enter" || e.key === " ")) {
+                e.preventDefault();
+                onBack();
+              }
+            }}
+          >
+            <Icon path="icons/arrow-left.svg" size={14} color="var(--nori-muted)" />
+          </div>
+          <div
+            id="sidebar-forward"
+            role="button"
+            aria-label="Go forward"
+            tabIndex={canForward ? 0 : -1}
+            className={
+              canForward ? "nori-sidebar-history" : "nori-sidebar-history nori-sidebar-history--disabled"
+            }
+            onClick={() => {
+              if (canForward) onForward();
+            }}
+            onKeyDown={(e) => {
+              if (canForward && (e.key === "Enter" || e.key === " ")) {
+                e.preventDefault();
+                onForward();
+              }
+            }}
+          >
+            <Icon path="icons/arrow-right.svg" size={14} color="var(--nori-muted)" />
+          </div>
         </div>
 
         <div className="nori-sidebar-compose">

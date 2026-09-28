@@ -222,8 +222,14 @@ export function MailApp() {
       else if (e.key === "/") {
         e.preventDefault();
         dispatch({ type: "open-search" });
+      } else if (e.altKey && e.key === "ArrowLeft") {
+        e.preventDefault();
+        dispatch({ type: "go-back" });
+      } else if (e.altKey && e.key === "ArrowRight") {
+        e.preventDefault();
+        dispatch({ type: "go-forward" });
       } else if (e.key === "Escape") {
-        if (state.workspaceView.kind === "email") dispatch({ type: "go-back" });
+        dispatch({ type: "go-back" });
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -314,6 +320,10 @@ export function MailApp() {
             resizeRef.current = { startX, startWidth: sidebarWidth };
           }}
           onResizeStep={(delta) => setSidebarWidth((w) => clampSidebarWidth(w + delta))}
+          onBack={() => dispatch({ type: "go-back" })}
+          onForward={() => dispatch({ type: "go-forward" })}
+          canBack={state.historyBack.length > 0}
+          canForward={state.historyForward.length > 0}
         />
 
         <div className="nori-app-right">
