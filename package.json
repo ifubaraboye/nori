@@ -7,16 +7,16 @@
   "workspaces": ["web", "electron"],
   "scripts": {
     "dev": "bun run dev:web & bun run dev:electron",
-    "dev:web": "bun --cwd web run dev",
-    "dev:electron": "bun --cwd electron run build:main && electron electron/dist/main.cjs --dev",
-    "typecheck": "bun --cwd web run typecheck && bun --cwd electron run typecheck",
-    "build": "bun --cwd web run build && bun --cwd electron run build:main",
+    "dev:web": "cd web && bun run dev",
+    "dev:electron": "cd electron && bun run build:main && ../node_modules/.bin/electron dist/main.cjs --dev",
+    "typecheck": "cd web && bun run typecheck && cd ../electron && bun run typecheck",
+    "build": "cd web && bun run build && cd ../electron && bun run build:main",
     "build:electron": "bun run build && electron-builder",
-    "test": "bun --cwd electron run test",
-    "start": "electron electron/dist/main.cjs"
+    "test": "cd electron && bun test",
+    "start": "./node_modules/.bin/electron electron/dist/main.cjs"
   },
   "devDependencies": {
-    "electron": "^33.0.0",
+    "electron": "44.4.5",
     "electron-builder": "^25.0.0",
     "typescript": "^5.8.3"
   }
