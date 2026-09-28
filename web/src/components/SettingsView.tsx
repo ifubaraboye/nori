@@ -125,32 +125,38 @@ function ValueRow({
   );
 }
 
-function SignInRow({ label, onSignIn }: { label: string; onSignIn: () => void }) {
+function AccountHeading({
+  action,
+  onSignIn,
+  onSignOut,
+}: {
+  action?: { kind: "signin"; label: string } | { kind: "signout" };
+  onSignIn: () => void;
+  onSignOut: () => void;
+}) {
   return (
-    <div id="account-sign-in-row" className="nori-settings-action-row">
-      <div id="account-sign-in-wrap" className="nori-settings-action-wrap">
-        <Button
-          id="account-sign-in"
-          label={label}
-          buttonStyle="accent"
-          onClick={onSignIn}
-        />
-      </div>
-    </div>
-  );
-}
-
-function SignOutRow({ onSignOut }: { onSignOut: () => void }) {
-  return (
-    <div id="account-sign-out-row" className="nori-settings-action-row">
-      <div id="account-sign-out-wrap" className="nori-settings-action-wrap">
-        <Button
-          id="account-sign-out"
-          label="Disconnect"
-          buttonStyle="subtle"
-          onClick={onSignOut}
-        />
-      </div>
+    <div className="nori-settings-page-heading-row">
+      <div className="nori-settings-page-heading nori-settings-page-heading--inline">Account</div>
+      {action?.kind === "signin" && (
+        <div id="account-sign-in-wrap" className="nori-settings-page-heading-action">
+          <Button
+            id="account-sign-in"
+            label={action.label}
+            buttonStyle="accent"
+            onClick={onSignIn}
+          />
+        </div>
+      )}
+      {action?.kind === "signout" && (
+        <div id="account-sign-out-wrap" className="nori-settings-page-heading-action">
+          <Button
+            id="account-sign-out"
+            label="Disconnect"
+            buttonStyle="subtle"
+            onClick={onSignOut}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -198,7 +204,9 @@ export function SettingsView({
       <div id="settings-content" className="nori-settings-content">
         <div id="settings-content-scroll" className="nori-settings-content-scroll">
           <div className="nori-settings-page">
-            <div className="nori-settings-page-heading">{settingsPageLabel(page)}</div>
+            {page !== "account" && (
+              <div className="nori-settings-page-heading">{settingsPageLabel(page)}</div>
+            )}
             {page === "general" && (
               <>
                 <NoteRow
@@ -260,35 +268,50 @@ function AccountPage({
     case "disconnected":
       return (
         <>
+          <AccountHeading
+            action={{ kind: "signin", label: "Sign in with Gmail" }}
+            onSignIn={onSignIn}
+            onSignOut={onSignOut}
+          />
           <NoteRow
             title="No account connected"
             description="Sign in to sync a Gmail mailbox. Nori reads mail on your own machine and sends nothing to any server of ours."
             isLast={false}
           />
           <ValueRow label="Address" value="Not connected" isLast={false} />
-          <ValueRow label="Storage" value="Token file, created on first sign-in" isLast={false} />
-          <SignInRow label="Sign in with Gmail" onSignIn={onSignIn} />
+          <ValueRow label="Storage" value="Token file, created on first sign-in" isLast />
         </>
       );
     case "connecting":
       return (
-        <NoteRow
-          title="Signing in…"
-          description="Finish signing in the tab that just opened. Nori is listening for the redirect, then it will start fetching your mail."
-          isLast
-        />
+        <>
+          <AccountHeading onSignIn={onSignIn} onSignOut={onSignOut} />
+          <NoteRow
+            title="Signing in…"
+            description="Finish signing in the tab that just opened. Nori is listening for the redirect, then it will start fetching your mail."
+            isLast
+          />
+        </>
       );
     case "fetching":
       return (
-        <NoteRow
-          title="Fetching your mail…"
-          description={`Signed in as ${account.address ?? ""}. Reading your mailbox now — this takes a minute on a large one, and your mail appears as it arrives.`}
-          isLast
-        />
+        <>
+          <AccountHeading onSignIn={onSignIn} onSignOut={onSignOut} />
+          <NoteRow
+            title="Fetching your mail…"
+            description={`Signed in as ${account.address ?? ""}. Reading your mailbox now — this takes a minute on a large one, and your mail appears as it arrives.`}
+            isLast
+          />
+        </>
       );
     case "connected":
       return (
         <>
+          <AccountHeading
+            action={{ kind: "signout" }}
+            onSignIn={onSignIn}
+            onSignOut={onSignOut}
+          />
           <NoteRow
             title={account.address ?? ""}
             description="Synced. Mail and labels are read on demand, and read state and stars are written back."
@@ -299,26 +322,33 @@ function AccountPage({
             value={`${account.mailCount ?? 0} messages, ${account.labelCount ?? 0} labels`}
             isLast={false}
           />
-          <ValueRow label="Refresh" value="On open, and every few minutes" isLast={false} />
-          <SignOutRow onSignOut={onSignOut} />
+          <ValueRow label="Refresh" value="On open, and every few minutes" isLast />
         </>
       );
     case "needsReauth":
       return (
         <>
+          <AccountHeading
+            action={{ kind: "signin", label: "Sign in again" }}
+            onSignIn={onSignIn}
+            onSignOut={onSignOut}
+          />
           <NoteRow
             title={`${account.address ?? ""} needs to sign in again`}
             description="Google expires the token after about a week while the app is unverified. Nothing was lost — signing in again picks up where it left off."
-            isLast={false}
+            isLast
           />
-          <SignInRow label="Sign in again" onSignIn={onSignIn} />
         </>
       );
     case "failed":
       return (
         <>
-          <NoteRow title="Could not connect" description={account.reason ?? ""} isLast={false} />
-          <SignInRow label="Try again" onSignIn={onSignIn} />
+          <AccountHeading
+            action={{ kind: "signin", label: "Try again" }}
+            onSignIn={onSignIn}
+            onSignOut={onSignOut}
+          />
+          <NoteRow title="Could not connect" description={account.reason ?? ""} isLast />
         </>
       );
   }

@@ -43,6 +43,7 @@ export function MailApp() {
   const [mailboxesCollapsed, setMailboxesCollapsed] = useState(false);
   const [accountAddress, setAccountAddress] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   // Compose pane width (mail_app.rs COMPOSE_PANE_WIDTH/MIN/CEILING).
   const [composeWidth, setComposeWidthState] = useState(520);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -108,6 +109,17 @@ export function MailApp() {
     },
     [dispatch, settings.markReadOnOpen, settings.openInTab],
   );
+
+  const handleRefresh = useCallback(() => {
+    const bridge = getNoriBridge();
+    if (!bridge?.sync) return;
+    setRefreshing(true);
+    bridge
+      .sync()
+      .then(({ account }) => setAccountAddress(account))
+      .catch(() => undefined)
+      .finally(() => setRefreshing(false));
+  }, []);
 
   const toggleSettings = useCallback(() => {
     dispatch(state.settingsPage == null ? { type: "open-settings" } : { type: "close-settings" });
@@ -313,8 +325,16 @@ export function MailApp() {
                   ? activeEmail.subject
                   : mailboxLabel(state.selectedMailbox)
             }
-            prefix={settingsOpen ? "Settings" : undefined}
+            prefix={
+              settingsOpen
+                ? "Settings"
+                : state.workspaceView.kind === "email" && activeEmail
+                  ? mailboxLabel(activeEmail.mailbox)
+                  : undefined
+            }
             sidebarVisible={sidebarVisible}
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
             onToggleSidebar={() => {
               setSidebarVisible((v) => !v);
               resizeRef.current = null;

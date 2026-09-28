@@ -49,9 +49,15 @@
 }
 
 .nori-button--accent {
-  background: var(--nori-text);
-  border-color: var(--nori-text);
-  color: var(--nori-canvas);
+  background: var(--nori-accent);
+  border-color: transparent;
+  color: var(--nori-on-accent);
+}
+.nori-button--accent:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.nori-button--accent:active:not(:disabled) {
+  filter: brightness(0.92);
 }
 
 .nori-button--disabled {

@@ -85,6 +85,26 @@
   color: var(--nori-text);
 }
 
+.nori-settings-page-heading-row {
+  width: 100%;
+  padding: 22px 24px 14px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.nori-settings-page-heading--inline {
+  width: auto;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+}
+
+.nori-settings-page-heading-action {
+  flex: none;
+  display: flex;
+}
+
 .nori-settings-row {
   width: 100%;
   padding: 16px 24px;

@@ -19,6 +19,7 @@ import paperclipSvg from "../assets/icons/paperclip.svg?raw";
 import plusSvg from "../assets/icons/plus.svg?raw";
 import replyAllSvg from "../assets/icons/reply-all.svg?raw";
 import replySvg from "../assets/icons/reply.svg?raw";
+import resetSvg from "../assets/icons/reset.svg?raw";
 import searchSvg from "../assets/icons/search.svg?raw";
 import sendSvg from "../assets/icons/send.svg?raw";
 import sentSvg from "../assets/icons/sent.svg?raw";
@@ -52,6 +53,7 @@ const ICONS: Record<string, string> = {
   "icons/plus.svg": plusSvg,
   "icons/reply-all.svg": replyAllSvg,
   "icons/reply.svg": replySvg,
+  "icons/reset.svg": resetSvg,
   "icons/search.svg": searchSvg,
   "icons/send.svg": sendSvg,
   "icons/sent.svg": sentSvg,
