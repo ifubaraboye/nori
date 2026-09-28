@@ -89,3 +89,28 @@ export class IndexCache {
     } catch { /* idempotent */ }
   }
 }
+
+/**
+ * Reads from the current location, falling back to the one the Rust build
+ * used, and writes only to the current one.
+ *
+ * Without the fallback the app starts empty on every launch and waits for a
+ * slow full sync to rebuild a mailbox it already had on disk. An index found
+ * only in the old location is copied forward, so this settles after one run.
+ */
+export class FallbackIndexCache extends IndexCache {
+  constructor(
+    path: string,
+    private readonly fallback: IndexCache,
+  ) {
+    super(path);
+  }
+
+  override load(account: string): MailIndex | null {
+    return super.load(account) ?? this.fallback.load(account);
+  }
+
+  override save(index: MailIndex): void {
+    super.save(index);
+  }
+}

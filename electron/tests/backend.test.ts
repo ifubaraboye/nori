@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { challengeFor, generatePkce, matchesState } from "../src/backend/auth/pkce";
 import { urlencode, interpretCallback, beginAuth } from "../src/backend/auth/oauth";
-import { tokenFromExchange, isFresh, canRefresh, FileTokenStore, type Token } from "../src/backend/auth/token";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { tokenFromExchange, isFresh, canRefresh, discoverCredentials, FileTokenStore, MigratingTokenStore, type Token } from "../src/backend/auth/token";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { textWithStatus, detailOf, isTransient } from "../src/backend/gmail/http";
@@ -12,6 +12,7 @@ import { mayReplaceIndex, type MailIndex } from "../src/backend/gmail/cache";
 import { sanitizeHtml } from "../src/backend/gmail/sanitize";
 import { boundedHtml, fallbackText, hasRemoteImages } from "../src/backend/gmail/policy";
 import { parseHtmlBody, plainText, textBlocks, inlineCidImages } from "../src/backend/gmail/rich";
+import { findResourceRoot } from "../src/paths";
 
 describe("token file compatibility", () => {
   const dir = mkdtempSync(join(tmpdir(), "nori-token-"));
@@ -124,6 +125,52 @@ describe("oauth url encoding", () => {
     expect(body).not.toContain(request.verifier);
     expect(body).not.toContain(request.state);
     expect(await waiting).toBe("the-code");
+  });
+
+  test("the checked-in .env at the repository root is found", () => {
+    // Electron runs with its working directory at electron/, while the .env
+    // sits at the repository root one level up. Only the working directory
+    // was searched, so the credentials were reported missing in the one place
+    // they are actually used.
+    const root = mkdtempSync(join(tmpdir(), "nori-env-"));
+    const appDir = join(root, "electron");
+    mkdirSync(appDir);
+    writeFileSync(
+      join(root, ".env"),
+      "NORI_GMAIL_CLIENT_ID=id.apps.googleusercontent.com\nNORI_GMAIL_CLIENT_SECRET=GOCSPX-secret\n",
+    );
+    // The app's own .env is absent, as it is in a checkout.
+    expect(existsSync(join(appDir, ".env"))).toBe(false);
+    const creds = discoverCredentials(appDir);
+    expect(creds.clientId).toBe("id.apps.googleusercontent.com");
+    expect(creds.clientSecret).toBe("GOCSPX-secret");
+  });
+
+  test("a token in the legacy location is found and copied forward", () => {
+    // The Rust build wrote to ~/.config/nori; this port writes to Electron's
+    // userData. Reading only the new path reported "not signed in" for an
+    // account whose credential was already on disk.
+    const dir = mkdtempSync(join(tmpdir(), "nori-tok-"));
+    const current = new FileTokenStore(join(dir, "current", "a.token.json"));
+    const legacy = new FileTokenStore(join(dir, "legacy", "a.token.json"));
+    const token: Token = {
+      accessToken: "ya29.token",
+      refreshToken: "1//refresh",
+      expiresAt: 4_000_000_000,
+      scope: "gmail.modify",
+      tokenType: "Bearer",
+    };
+    legacy.save(token);
+    expect(current.load()).toBeNull();
+
+    const store = new MigratingTokenStore(current, legacy);
+    expect(store.load()?.accessToken).toBe("ya29.token");
+    // Copied forward, so the fallback is only paid once.
+    expect(current.load()?.accessToken).toBe("ya29.token");
+    // And the current location wins once it has one.
+    const fresh: Token = { ...token, accessToken: "ya29.newer" };
+    store.save(fresh);
+    expect(store.load()?.accessToken).toBe("ya29.newer");
   });
 
   test("a mismatched state is refused with a 400 and no echo", async () => {
@@ -317,5 +364,34 @@ describe("rich body", () => {
     const html = '<img src="cid:photo@x">';
     const out = inlineCidImages(html, [["<photo@x>", "image/png", bytes]]);
     expect(out).toContain("data:image/png;base64,");
+  });
+});
+
+describe("finding the app's own files", () => {
+  // The preload holds window.nori, and without it the app silently runs on
+  // sample mail: no sign-in, no real mail, and nothing in the renderer to say
+  // why. The bug was a lookup pointed at src/preload.cjs, so the depth the
+  // app path arrives at is the thing worth pinning.
+  const layout = "/repo";
+  const has = (path: string) => path === "/repo/electron/dist/preload.cjs";
+
+  test("walks up from the entry file's directory", () => {
+    // `electron dist/main.cjs` makes the app path electron/dist.
+    expect(findResourceRoot("/repo/electron/dist", has)).toBe(layout);
+    // A script placed beside dist/ makes it electron/.
+    expect(findResourceRoot("/repo/electron", has)).toBe(layout);
+    // Packaged, the asar root already holds the layout.
+    expect(findResourceRoot("/repo", has)).toBe(layout);
+  });
+
+  test("returns the start when nothing holds the layout", () => {
+    // A plausible-looking wrong answer here is worse than none: the caller
+    // reports a concrete missing path against the start instead.
+    expect(findResourceRoot("/elsewhere", () => false)).toBe("/elsewhere");
+  });
+
+  test("stops at the filesystem root rather than looping", () => {
+    // An unbounded walk would climb forever on a broken install.
+    expect(findResourceRoot("/", () => false)).toBe("/");
   });
 });

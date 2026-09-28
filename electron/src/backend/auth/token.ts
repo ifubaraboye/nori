@@ -54,6 +54,45 @@ export interface TokenStore {
   clear(): void;
 }
 
+/**
+ * Reads from the current location, falling back to the one the Rust build
+ * used, and writes only to the current one.
+ *
+ * The fallback matters more than it looks: without it a token written by the
+ * previous build reads as "not signed in", which sends the user through a
+ * pointless re-consent for a credential that was already on disk. A token
+ * found only in the old location is copied forward, so the migration happens
+ * once rather than on every start.
+ */
+export class MigratingTokenStore implements TokenStore {
+  constructor(
+    private readonly current: FileTokenStore,
+    private readonly legacy: FileTokenStore,
+  ) {}
+
+  load(): Token | null {
+    const token = this.current.load();
+    if (token) return token;
+    const old = this.legacy.load();
+    if (!old) return null;
+    try {
+      this.current.save(old);
+    } catch {
+      // A read-only userData is survivable: the legacy copy still works.
+    }
+    return old;
+  }
+
+  save(token: Token): void {
+    this.current.save(token);
+  }
+
+  clear(): void {
+    this.current.clear();
+    this.legacy.clear();
+  }
+}
+
 export class FileTokenStore implements TokenStore {
   constructor(readonly path: string) {}
 
@@ -150,6 +189,11 @@ export function discoverCredentials(cwd = process.cwd()): Credentials {
   const candidates: string[] = [];
   if (process.env.NORI_ENV_FILE) candidates.push(process.env.NORI_ENV_FILE);
   candidates.push(join(cwd, ".env"));
+  // The app is started from electron/ but the checked-in .env lives at the
+  // repository root, one level up. Looking only in the working directory found
+  // it when scripts ran from the root and missed it when Electron ran, which
+  // made the credentials look absent in the one place they are actually used.
+  candidates.push(join(cwd, "..", ".env"));
   candidates.push(join(configBase(), "nori", ".env"));
   const searched: string[] = [];
   for (const file of candidates) {

@@ -2,8 +2,7 @@
 // (window shell, menus, app identity) + the nori-gmail sync orchestrator that
 // the GPUI host was meant to own. The renderer is web/dist (Vite build).
 import { app, BrowserWindow, Menu, ipcMain, shell, dialog } from "electron";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -13,19 +12,25 @@ import {
   type Mailbox,
   type Snapshot,
 } from "./ipc.js";
-import { discoverCredentials, FileTokenStore, LastAccount } from "./backend/auth/token.js";
+import {
+  discoverCredentials,
+  FileTokenStore,
+  LastAccount,
+  MigratingTokenStore,
+  type TokenStore,
+} from "./backend/auth/token.js";
 import { beginAuth, exchange } from "./backend/auth/oauth.js";
 import { Sync, type RemoteMail } from "./backend/gmail/sync.js";
-import { IndexCache, mayReplaceIndex, type MailIndex } from "./backend/gmail/cache.js";
+import { FallbackIndexCache, IndexCache, mayReplaceIndex, type MailIndex } from "./backend/gmail/cache.js";
 import { gmailQuery, mailboxOf, toUiEmail, type UiEmail } from "./backend/gmail/account.js";
 import { bodyParagraphs } from "./backend/gmail/syncBodies.js";
 import { plainText, parseHtmlBody } from "./backend/gmail/rich.js";
 import { SettingsStore, defaultSettings } from "./backend/settings.js";
+import { findResourceRoot } from "./paths.js";
 
 export const APP_ID = "dev.nori.prototype";
 export const APP_NAME = "Nori";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const isDev = process.argv.includes("--dev") || process.env.NORI_DEV === "1";
 
 interface AppState {
@@ -57,14 +62,23 @@ function userDataDir(): string {
   return app.getPath("userData");
 }
 
-function tokenStoreFor(account: string): FileTokenStore {
-  // Prefer Electron userData; fall back to XDG path for migration compat.
-  return new FileTokenStore(join(userDataDir(), `${account}.token.json`));
+function tokenStoreFor(account: string): TokenStore {
+  // Rust wrote tokens and the index to ~/.config/nori; this port writes to
+  // Electron's userData. Reading only the new location reported "not signed
+  // in" for an account whose token was on disk the whole time, and threw away
+  // a synced mail index with it. The old path stays a read fallback, and a
+  // token found there is copied forward so the two never diverge again.
+  return new MigratingTokenStore(
+    new FileTokenStore(join(userDataDir(), `${account}.token.json`)),
+    FileTokenStore.withAccount(account),
+  );
 }
 
 function indexCacheFor(account: string): IndexCache {
-  const inUserData = new IndexCache(join(userDataDir(), `${account}.index.json`));
-  return inUserData;
+  return new FallbackIndexCache(
+    join(userDataDir(), `${account}.index.json`),
+    IndexCache.withAccount(account),
+  );
 }
 
 function emit(event: unknown): void {
@@ -451,6 +465,17 @@ function setAppMenus(): void {
 }
 
 async function openMainWindow(): Promise<void> {
+  const root = findResourceRoot(app.getAppPath());
+  const preload = join(root, "electron", "dist", "preload.cjs");
+  if (!existsSync(preload)) {
+    // A preload that fails to load is invisible from the renderer: it just
+    // finds no bridge and falls back to sample mail. Refuse to start instead,
+    // because "no window.nori" is otherwise indistinguishable from "not
+    // built", and that is exactly how this shipped broken.
+    throw new Error(
+      `the preload script is missing at ${preload}. Run \`bun run build:main\` before starting Electron.`,
+    );
+  }
   const window = new BrowserWindow({
     width: 1200,
     height: 760,
@@ -459,7 +484,7 @@ async function openMainWindow(): Promise<void> {
     backgroundColor: state.settings.lightMode ? "#fcfcfc" : "#1a1a1a",
     title: APP_NAME,
     webPreferences: {
-      preload: join(__dirname, "preload.cjs"),
+      preload,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -471,7 +496,7 @@ async function openMainWindow(): Promise<void> {
     await window.loadURL("http://localhost:3001");
     window.webContents.openDevTools({ mode: "detach" });
   } else {
-    const indexHtml = join(__dirname, "..", "web", "dist", "index.html");
+    const indexHtml = join(root, "web", "dist", "index.html");
     if (existsSync(indexHtml)) {
       await window.loadFile(indexHtml);
     } else {
