@@ -1,5 +1,10 @@
 * {
   box-sizing: border-box;
+  scrollbar-width: none;
+}
+
+::-webkit-scrollbar {
+  display: none;
 }
 
 html,
@@ -21,17 +26,4 @@ body {
 
 button {
   font-family: inherit;
-}
-
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--nori-strong-border);
-  border-radius: 5px;
-  border: 2px solid var(--nori-canvas);
-}
-::-webkit-scrollbar-track {
-  background: transparent;
 }
