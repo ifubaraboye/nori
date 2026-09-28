@@ -688,16 +688,21 @@ export function replySeed(email: Email, replyAll: boolean, forward: boolean): Dr
   } else {
     to = email.address;
   }
+  // Replying to a mail whose body has not loaded yet quotes what is there,
+  // which is nothing, rather than throwing and leaving the compose pane dead.
+  const quoted = (email.body ?? []).join("\n\n");
   const body = forward
-    ? `\n\n--- Forwarded message ---\nFrom: ${email.sender} <${email.address}>\n\n${email.body.join("\n\n")}`
-    : `\n\nOn ${email.fullDate}:\n${email.body.join("\n\n")}`;
+    ? `\n\n--- Forwarded message ---\nFrom: ${email.sender} <${email.address}>\n\n${quoted}`
+    : `\n\nOn ${email.fullDate}:\n${quoted}`;
   return { to, subject, body };
 }
 
 /** A mail with its fetched body attached, for the reading view. */
 export function withBody(state: MailState, email: Email): Email {
   const body = state.bodies[email.id];
-  return body ? { ...email, body } : email;
+  // Defaulting to [] keeps the reading view renderable for a mail whose body
+  // has not been fetched yet.
+  return { ...email, body: body ?? email.body ?? [] };
 }
 
 export interface MailStoreApi {

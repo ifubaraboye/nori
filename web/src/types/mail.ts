@@ -92,7 +92,9 @@ export function emailMatches(email: Email, query: string): boolean {
     email.sender.toLowerCase().includes(q) ||
     email.subject.toLowerCase().includes(q) ||
     email.preview.toLowerCase().includes(q) ||
-    email.body.some((p) => p.toLowerCase().includes(q))
+    // The body may not have been fetched yet; that is not a match, not a
+    // crash. Search covers whatever the list already holds.
+    (email.body ?? []).some((p) => p.toLowerCase().includes(q))
   );
 }
 

@@ -4,9 +4,10 @@ import {
   mailReducer,
   visibleEmails,
   withBody,
+  replySeed,
   type MailState,
 } from "./store";
-import type { Email, EmailId } from "../types/mail";
+import { emailMatches, type Email, type EmailId } from "../types/mail";
 
 /** Ids are strings, as Gmail's are. */
 const ONE = "1" as EmailId;
@@ -371,6 +372,20 @@ describe("host snapshot", () => {
     expect(s.account).toBe("connected");
     expect(s.accountAddress).toBe("me@x.com");
     expect(s.accountReason).toBeNull();
+  });
+
+  test("a mail with no body yet still renders and still quotes safely", () => {
+    // The bug this covers: a host snapshot carried no `body` key, so
+    // `email.body.map` threw on open and the reading pane went blank with no
+    // message. Every read of a body has to tolerate its absence.
+    const bare = { ...makeEmail("g1", "Real", "Real mail", "inbox"), body: undefined } as unknown as Email;
+    expect(() => withBody(base(), bare)).not.toThrow();
+    expect(withBody(base(), bare).body).toEqual([]);
+    expect(emailMatches(bare, "real")).toBe(true);
+    expect(() => replySeed(bare, false, false)).not.toThrow();
+    // And a fetched body still wins.
+    const withFetched = mailReducer(base(), { type: "load-body", id: "g1", body: ["Hello"] });
+    expect(withBody(withFetched, bare).body).toEqual(["Hello"]);
   });
 
   test("settled labels from the server win over the optimistic guess", () => {

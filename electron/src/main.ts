@@ -125,6 +125,9 @@ function snapshot(): Snapshot {
       fullDate: email.fullDate,
       mailbox: email.mailbox,
       threadId: email.threadId,
+      // Bodies are fetched on open, so a snapshot never carries one. The
+      // field is still sent, empty, because the renderer renders it directly.
+      body: [],
       pinned: (email as UiEmail & { pinned?: boolean }).pinned ?? false,
       labelIds: remoteLabelsOf(email.id),
     })),

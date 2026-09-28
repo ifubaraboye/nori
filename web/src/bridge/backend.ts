@@ -66,7 +66,9 @@ export function useHostBackend(dispatch: Dispatch): HostBackend {
     });
     dispatch({
       type: "load-snapshot",
-      emails: snap.emails as Email[],
+      // No cast: the host and the renderer agree on the mail shape, and a
+      // cast here is what let a missing `body` reach the reading view.
+      emails: snap.emails,
       labels: snap.labels.map((label, index) => ({
         id: (index + 1) as LabelId,
         name: label.name,

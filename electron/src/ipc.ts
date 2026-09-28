@@ -22,6 +22,15 @@ export interface Email extends EmailSummary {
   mailbox: Mailbox;
   threadId: string;
   pinned: boolean;
+  /**
+   * Always present, always empty in a snapshot.
+   *
+   * Bodies are fetched the first time a mail is opened, which is what keeps a
+   * large mailbox cheap to list. The field still has to exist: the renderer
+   * renders `email.body` directly, and a snapshot that omitted it left
+   * `undefined.map` to throw, which blanks the reading pane with no message.
+   */
+  body: string[];
   /** Gmail's own label ids, carried so a label toggle can write back. */
   labelIds: string[];
 }

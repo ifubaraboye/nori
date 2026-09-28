@@ -41,7 +41,10 @@ export function EmailView({
         </div>
         <div className="nori-email-view-rule" />
         <div className="nori-email-view-body">
-          {email.body.map((paragraph, i) => (
+          {/* A mail whose body has not arrived renders as an empty pane, not
+              as a crash: `body` is fetched on open and may legitimately be
+              absent for a moment. */}
+          {(email.body ?? []).map((paragraph, i) => (
             <p key={i}>{paragraph}</p>
           ))}
         </div>
