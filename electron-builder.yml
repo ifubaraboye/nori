@@ -1,0 +1,23 @@
+appId: dev.nori.prototype
+productName: Nori
+directories:
+  output: release
+  buildResources: electron/build
+files:
+  - electron/dist/**
+  - web/dist/**
+  - package.json
+extraMetadata:
+  main: electron/dist/main.cjs
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Network
+  desktop:
+    StartupWMClass: dev.nori.prototype
+mac:
+  category: public.app-category.social-networking
+win:
+  target:
+    - nsis

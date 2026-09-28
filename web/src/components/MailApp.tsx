@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { replySeed, useMailStore } from "../state/store";
+import { getNoriBridge } from "../bridge/noriBridge";
+import { notifyOpen, notifyToggleStar, useNoriBackend } from "../bridge/backend";
 import { mailboxLabel } from "../types/mail";
 import { clampSidebarWidth, SIDEBAR_DEFAULT_WIDTH, Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
@@ -19,8 +21,16 @@ import "./MailApp.css";
  */
 export function MailApp() {
   const { state, dispatch, summaries, activeEmail, counts } = useMailStore();
-  const [sidebarVisible, setSidebarVisible] = useState(true);
-  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
+  useNoriBackend();
+  // Host menu "Toggle Sidebar" arrives as a push event under Electron.
+  useEffect(() => {
+    const bridge = getNoriBridge();
+    if (!bridge) return;
+    return bridge.subscribe((event) => {
+      if (event.type === "toggle-sidebar") setSidebarVisible((v) => !v);
+    });
+  }, []);
+  const [sidebarVisible, setSidebarVisible] = useState(true);  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [mailboxesCollapsed, setMailboxesCollapsed] = useState(false);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
@@ -73,7 +83,10 @@ export function MailApp() {
       else if (e.key === "k") dispatch({ type: "move-selection", delta: -1 });
       else if (e.key === "Enter") {
         const email = summaries[state.selectedIndex];
-        if (email) dispatch({ type: "open-email", id: email.id });
+        if (email) {
+          dispatch({ type: "open-email", id: email.id });
+          notifyOpen(email.id);
+        }
       } else if (e.key === "c") openComposeDefault();
       else if (e.key === "/") {
         e.preventDefault();
@@ -150,7 +163,10 @@ export function MailApp() {
           <EmailTabs
             tabs={tabs}
             active={state.activeTab}
-            onSelect={(id) => dispatch({ type: "open-email", id })}
+            onSelect={(id) => {
+              dispatch({ type: "open-email", id });
+              notifyOpen(id);
+            }}
             onClose={(id) => dispatch({ type: "close-tab", id })}
             onNew={openComposeDefault}
           />
@@ -172,8 +188,14 @@ export function MailApp() {
               <EmailList
                 rows={summaries}
                 selectedIndex={state.selectedIndex}
-                onOpen={(id) => dispatch({ type: "open-email", id })}
-                onStar={(id) => dispatch({ type: "toggle-star", id })}
+                onOpen={(id) => {
+                  dispatch({ type: "open-email", id });
+                  notifyOpen(id);
+                }}
+                onStar={(id) => {
+                  dispatch({ type: "toggle-star", id });
+                  notifyToggleStar(id);
+                }}
                 onSelectIndex={(index) => dispatch({ type: "set-selected-index", index })}
               />
             )}

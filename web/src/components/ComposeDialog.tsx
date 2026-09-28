@@ -1,5 +1,7 @@
 import { useState } from "react";
 import type { DraftSeed } from "../types/mail";
+import { getNoriBridge } from "../bridge/noriBridge";
+import { notifySend } from "../bridge/backend";
 import { Button } from "./Button";
 import { Icon } from "./Icon";
 import "./ComposeDialog.css";
@@ -14,6 +16,8 @@ export function ComposeDialog({ seed, onDismiss }: ComposeDialogProps) {
   const [to, setTo] = useState(seed.to);
   const [subject, setSubject] = useState(seed.subject);
   const [body, setBody] = useState(seed.body);
+  const host = getNoriBridge();
+  const canSend = host != null && to.trim() !== "";
 
   return (
     <div
@@ -92,7 +96,12 @@ export function ComposeDialog({ seed, onDismiss }: ComposeDialogProps) {
           label="Send ↗"
           dense
           buttonStyle="accent"
-          disabled
+          disabled={!canSend}
+          onClick={() => {
+            if (!canSend) return;
+            notifySend({ to, subject, body });
+            onDismiss();
+          }}
           icon={<Icon path="icons/send.svg" size={13} color="var(--nori-faint)" />}
         />
       </div>

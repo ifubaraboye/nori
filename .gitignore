@@ -14,7 +14,14 @@
 !site/mock.png
 !site/mock2.png
 
-# web build artifacts
+# build artifacts
 node_modules/
 web/dist/
+dist/
+release/
+electron/dist/
+*.AppImage
+*.deb
+*.dmg
+*.exe
 

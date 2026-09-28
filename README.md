@@ -11,11 +11,33 @@ filesystem/mail backend.
 
 | Path | What it is |
 | --- | --- |
-| `crates/nori-ui` | Shared GPUI UI crate — views, components, model, theme |
-| `crates/nori-desktop` | Thin binary host (`nori`), window + icon setup |
-| `web/` | Standalone React + Vite port of the GPUI UI |
+| `crates/nori-ui` | Shared GPUI UI crate — views, components, model, theme (legacy) |
+| `crates/nori-desktop` | Thin binary host (`nori`), window + icon setup (legacy) |
+| `web/` | React + Vite renderer — runs standalone on mock data, or inside Electron |
+| `electron/` | Electron + Bun host — window shell + Gmail backend (the port) |
 
-## Desktop (Rust)
+## Electron + Bun (current)
+
+Requires [bun](https://bun.sh). The Electron host in `electron/` ports
+`crates/nori-desktop` (window shell, menus, app identity) and
+`crates/nori-gmail` (OAuth/PKCE loopback, tokens, Gmail REST, sync,
+send, sanitize/policy/rich) to TypeScript. `web/` is the renderer.
+
+```
+bun install
+bun run dev          # vite :3001 + Electron (dev loads http://localhost:3001)
+bun run typecheck    # web + electron
+bun run build        # web/dist + electron/dist
+bun run test         # bun:test backend parity suite
+bun run start        # launch the built app
+bun run build:electron  # packaged installers (electron-builder)
+```
+
+Credentials live in `.env` at the repo root (see `.env.example`).
+Tokens and the mail index stay in Electron `userData` (`0600`).
+See [`electron/README.md`](electron/README.md) for the module mapping.
+
+## Desktop (Rust, legacy)
 
 Requires the pinned toolchain in `rust-toolchain.toml` and a Wayland or X11
 session. GPUI is pulled from a pinned Zed revision, so the first build is slow.

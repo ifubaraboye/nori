@@ -42,16 +42,29 @@ export const NORI_PROTOCOL_VERSION = 1;
 
 export interface NoriBridge {
   protocolVersion: number;
+  // Host ids are Gmail strings; the local mock store uses numbers. Both flow
+  // through here, so every id-typed method accepts either.
   list: (mailbox: Mailbox) => Promise<EmailSummary[]>;
-  get: (id: EmailId) => Promise<Email | null>;
-  open: (id: EmailId) => Promise<void>;
-  toggleStar: (id: EmailId) => Promise<boolean>;
+  get: (id: EmailId | string) => Promise<Email | null>;
+  open: (id: EmailId | string) => Promise<void>;
+  toggleStar: (id: EmailId | string) => Promise<boolean>;
   search: (query: string) => Promise<EmailSummary[]>;
   send: (draft: DraftSeed) => Promise<void>;
   subscribe: (cb: (event: NoriEvent) => void) => () => void;
+  // Extended Electron host surface (optional; present under Electron,
+  // absent in standalone web). String ids because Gmail ids are strings.
+  sync?: () => Promise<{ account: string | null }>;
+  counts?: () => Promise<Record<Mailbox, number>>;
+  fetchBody?: (id: string) => Promise<string[]>;
+  signin?: () => Promise<string>;
+  signout?: () => Promise<void>;
 }
 
-export type NoriEvent = { type: "emails-changed" } | { type: "mailbox-changed"; mailbox: Mailbox };
+export type NoriEvent =
+  | { type: "emails-changed" }
+  | { type: "mailbox-changed"; mailbox: Mailbox }
+  | { type: "account-changed"; address: string | null }
+  | { type: "toggle-sidebar" };
 
 export type NoriRequest =
   | { channel: "nori"; id: number; method: "list"; params: { mailbox: Mailbox } }

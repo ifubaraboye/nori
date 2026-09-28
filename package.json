@@ -1,0 +1,23 @@
+{
+  "name": "nori",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Nori email client — Electron + Bun (React renderer in web/, Electron/Bun host in electron/)",
+  "type": "module",
+  "workspaces": ["web", "electron"],
+  "scripts": {
+    "dev": "bun run dev:web & bun run dev:electron",
+    "dev:web": "bun --cwd web run dev",
+    "dev:electron": "bun --cwd electron run build:main && electron electron/dist/main.cjs --dev",
+    "typecheck": "bun --cwd web run typecheck && bun --cwd electron run typecheck",
+    "build": "bun --cwd web run build && bun --cwd electron run build:main",
+    "build:electron": "bun run build && electron-builder",
+    "test": "bun --cwd electron run test",
+    "start": "electron electron/dist/main.cjs"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0",
+    "typescript": "^5.8.3"
+  }
+}
