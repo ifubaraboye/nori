@@ -298,37 +298,9 @@ function registerIpc(): void {
 }
 
 function setAppMenus(): void {
-  const template: Electron.MenuItemConstructorOptions[] = [
-    {
-      label: APP_NAME,
-      submenu: [{ label: `Quit ${APP_NAME}`, accelerator: "CmdOrCtrl+Q", click: () => app.quit() }],
-    },
-    {
-      label: "Edit",
-      submenu: [
-        { role: "undo" },
-        { role: "redo" },
-        { type: "separator" },
-        { role: "cut" },
-        { role: "copy" },
-        { role: "paste" },
-        { role: "selectAll" },
-      ],
-    },
-    {
-      label: "View",
-      submenu: [
-        {
-          label: "Toggle Sidebar",
-          accelerator: "CmdOrCtrl+Alt+B",
-          click: () => state.window?.webContents.send("nori-event", { type: "toggle-sidebar" }),
-        },
-        { role: "reload" },
-        { role: "toggleDevTools" },
-      ],
-    },
-  ];
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+  // No application menu: the Nori / Edit / View bar stays hidden and all
+  // shortcuts live in the renderer. Quit still works via window close.
+  Menu.setApplicationMenu(null);
 }
 
 async function openMainWindow(): Promise<void> {
