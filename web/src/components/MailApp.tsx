@@ -126,18 +126,6 @@ export function MailApp() {
 
   return (
     <div id="mail-app" className="nori-app">
-      <TopBar
-        title={
-          state.workspaceView.kind === "email" && activeEmail
-            ? activeEmail.subject
-            : mailboxLabel(state.selectedMailbox)
-        }
-        sidebarVisible={sidebarVisible}
-        onToggleSidebar={() => {
-          setSidebarVisible((v) => !v);
-          resizeRef.current = null;
-        }}
-      />
       <div className="nori-app-main">
         <Sidebar
           selected={state.selectedMailbox}
@@ -159,8 +147,21 @@ export function MailApp() {
           onResizeStep={(delta) => setSidebarWidth((w) => clampSidebarWidth(w + delta))}
         />
 
-        <div className="nori-workspace">
-          <EmailTabs
+        <div className="nori-app-right">
+          <TopBar
+            title={
+              state.workspaceView.kind === "email" && activeEmail
+                ? activeEmail.subject
+                : mailboxLabel(state.selectedMailbox)
+            }
+            sidebarVisible={sidebarVisible}
+            onToggleSidebar={() => {
+              setSidebarVisible((v) => !v);
+              resizeRef.current = null;
+            }}
+          />
+          <div className="nori-workspace">
+            <EmailTabs
             tabs={tabs}
             active={state.activeTab}
             onSelect={(id) => {
@@ -213,6 +214,7 @@ export function MailApp() {
               />
             </div>
           )}
+          </div>
         </div>
       </div>
 
