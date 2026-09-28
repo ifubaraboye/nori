@@ -10,9 +10,8 @@
 }
 
 .nori-email-view-inner {
-  width: 720px;
-  max-width: 100%;
-  margin: 0 auto;
+  width: 100%;
+  max-width: 720px;
   padding: 32px 44px 48px;
 }
 
@@ -56,7 +55,7 @@
 .nori-email-view-rule {
   margin-top: 23px;
   height: 1px;
-  background: var(--nori-border);
+  background: var(--nori-hairline);
 }
 .nori-email-view-rule + .nori-email-view-body {
   margin-top: 25px;

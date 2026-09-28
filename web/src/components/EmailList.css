@@ -74,6 +74,7 @@
   flex: none;
   width: 200px;
   font-size: 13px;
+  line-height: 20px;
   color: var(--nori-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -94,6 +95,7 @@
 .nori-email-row-compact-subject {
   min-width: 0;
   font-size: 13px;
+  line-height: 20px;
   font-weight: 400;
   color: var(--nori-text);
   overflow: hidden;
@@ -107,12 +109,14 @@
 .nori-email-row-thread-count {
   flex: none;
   font-size: 11.5px;
+  line-height: 20px;
   color: var(--nori-faint);
 }
 
 .nori-email-row-dash {
   flex: none;
   font-size: 12px;
+  line-height: 20px;
   color: var(--nori-ghost);
 }
 
@@ -121,6 +125,7 @@
   min-width: 0;
   flex-shrink: 3;
   font-size: 12px;
+  line-height: 20px;
   color: var(--nori-ghost);
   overflow: hidden;
   text-overflow: ellipsis;

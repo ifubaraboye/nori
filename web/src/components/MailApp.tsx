@@ -7,14 +7,14 @@ import {
   type SettingsPage,
 } from "../state/settings";
 import { getNoriBridge } from "../bridge/noriBridge";
-import { notifyOpen, notifyToggleStar, useNoriBackend } from "../bridge/backend";
-import { mailboxLabel } from "../types/mail";
+import { notifyOpen, notifySend, notifyToggleStar, useNoriBackend } from "../bridge/backend";
+import { mailboxLabel, type DraftSeed } from "../types/mail";
 import { clampSidebarWidth, SIDEBAR_DEFAULT_WIDTH, Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { EmailList } from "./EmailList";
 import { EmailTabs } from "./EmailTabs";
 import { EmailView } from "./EmailView";
-import { ComposeDialog } from "./ComposeDialog";
+import { ComposePane } from "./ComposePane";
 import { SearchDialog } from "./SearchDialog";
 import { SettingsView, type SettingsAccount } from "./SettingsView";
 import { Button } from "./Button";
@@ -43,7 +43,24 @@ export function MailApp() {
   const [mailboxesCollapsed, setMailboxesCollapsed] = useState(false);
   const [accountAddress, setAccountAddress] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
+  // Compose pane width (mail_app.rs COMPOSE_PANE_WIDTH/MIN/CEILING).
+  const [composeWidth, setComposeWidthState] = useState(520);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const composeResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  const composeMaxWidth = useCallback(() => {
+    const sidebar = sidebarVisible ? sidebarWidth : 0;
+    const max = Math.min(1600, Math.max(340, window.innerWidth - sidebar - 420));
+    return Math.max(340, max);
+  }, [sidebarVisible, sidebarWidth]);
+
+  const setComposeWidth = useCallback(
+    (width: number) => {
+      const max = composeMaxWidth();
+      setComposeWidthState(Math.min(max, Math.max(340, width)));
+    },
+    [composeMaxWidth],
+  );
 
   // The connected account, read live like the Rust settings view does.
   useEffect(() => {
@@ -56,6 +73,15 @@ export function MailApp() {
   }, []);
 
   const closeOverlay = useCallback(() => dispatch({ type: "close-overlay" }), [dispatch]);
+  const closeCompose = useCallback(() => dispatch({ type: "close-compose" }), [dispatch]);
+
+  const sendCompose = useCallback(
+    (draft: DraftSeed) => {
+      notifySend(draft);
+      dispatch({ type: "close-overlay" });
+    },
+    [dispatch],
+  );
 
   const openComposeDefault = useCallback(
     () => dispatch({ type: "open-compose", seed: { to: "", subject: "", body: "" } }),
@@ -130,9 +156,10 @@ export function MailApp() {
         if (e.key === "Escape") closeOverlay();
         return;
       }
-      // Compose dialog: only Escape dismisses globally; fields own the rest.
+      // Compose is a side pane: only Escape closes it globally; fields own
+      // the rest (the pane answers Esc itself and parks the draft).
       if (state.overlay === "compose") {
-        if (e.key === "Escape") closeOverlay();
+        if (e.key === "Escape") dispatch({ type: "close-compose" });
         return;
       }
       const mod_ = e.ctrlKey || e.metaKey;
@@ -203,15 +230,19 @@ export function MailApp() {
     cycleSettingsPage,
   ]);
 
-  // Sidebar drag resize (mail_app.rs mouse move/up handlers).
+  // Sidebar + compose-pane drag resize (mail_app.rs mouse move/up handlers).
+  // The compose divider sits on the pane's left edge, so its width moves
+  // opposite the pointer: dragging left grows the pane.
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       const r = resizeRef.current;
-      if (!r) return;
-      setSidebarWidth(clampSidebarWidth(r.startWidth + (e.clientX - r.startX)));
+      if (r) setSidebarWidth(clampSidebarWidth(r.startWidth + (e.clientX - r.startX)));
+      const c = composeResizeRef.current;
+      if (c) setComposeWidth(c.startWidth - (e.clientX - c.startX));
     };
     const onUp = () => {
       resizeRef.current = null;
+      composeResizeRef.current = null;
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -219,7 +250,7 @@ export function MailApp() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, []);
+  }, [setComposeWidth]);
 
   const tabs = state.tabs
     .map((id) => {
@@ -230,6 +261,7 @@ export function MailApp() {
 
   const settingsOpen = state.settingsPage != null;
   const settingsPage: SettingsPage = state.settingsPage ?? "general";
+  const composeOpen = state.overlay === "compose" && !settingsOpen;
   const account: SettingsAccount = signingIn
     ? { status: "fetching", address: accountAddress ?? undefined }
     : accountAddress != null
@@ -311,71 +343,106 @@ export function MailApp() {
                 onClose={(id) => dispatch({ type: "close-tab", id })}
                 onNew={openComposeDefault}
               />
-              <div className="nori-workspace-body">
-                {state.workspaceView.kind === "email" && activeEmail ? (
-                  <EmailView
-                    email={activeEmail}
-                    showSender={settings.showSender}
-                    onReply={() =>
-                      dispatch({ type: "open-compose", seed: replySeed(activeEmail, false, false) })
-                    }
-                    onReplyAll={() =>
-                      dispatch({ type: "open-compose", seed: replySeed(activeEmail, true, false) })
-                    }
-                    onForward={() =>
-                      dispatch({ type: "open-compose", seed: replySeed(activeEmail, false, true) })
-                    }
-                  />
-                ) : (
-                  <EmailList
-                    rows={summaries}
-                    selectedIndex={state.selectedIndex}
-                    compact={settings.compactRows}
-                    onOpen={(id) => openEmail(id)}
-                    onStar={(id) => {
-                      dispatch({ type: "toggle-star", id });
-                      notifyToggleStar(id);
-                    }}
-                    onSelectIndex={(index) => dispatch({ type: "set-selected-index", index })}
-                  />
+              <div id="workspace-split" className="nori-workspace-split">
+                <div className="nori-workspace-main">
+                  <div className="nori-workspace-body">
+                    {state.workspaceView.kind === "email" && activeEmail ? (
+                      <EmailView
+                        email={activeEmail}
+                        showSender={settings.showSender}
+                        onReply={() =>
+                          dispatch({ type: "open-compose", seed: replySeed(activeEmail, false, false) })
+                        }
+                        onReplyAll={() =>
+                          dispatch({ type: "open-compose", seed: replySeed(activeEmail, true, false) })
+                        }
+                        onForward={() =>
+                          dispatch({ type: "open-compose", seed: replySeed(activeEmail, false, true) })
+                        }
+                      />
+                    ) : (
+                      <EmailList
+                        rows={summaries}
+                        selectedIndex={state.selectedIndex}
+                        compact={settings.compactRows}
+                        onOpen={(id) => openEmail(id)}
+                        onStar={(id) => {
+                          dispatch({ type: "toggle-star", id });
+                          notifyToggleStar(id);
+                        }}
+                        onSelectIndex={(index) => dispatch({ type: "set-selected-index", index })}
+                      />
+                    )}
+                  </div>
+                  {!sidebarVisible && (
+                    <div className="nori-show-sidebar">
+                      <Button
+                        id="show-sidebar"
+                        label=""
+                        dense
+                        buttonStyle="ghost"
+                        ariaLabel="Show sidebar"
+                        onClick={() => setSidebarVisible(true)}
+                        icon={<Icon path="icons/panel-left.svg" size={14} color="var(--nori-muted)" />}
+                      />
+                    </div>
+                  )}
+                </div>
+                {composeOpen && (
+                  <div id="compose-pane-shell" style={{ width: composeWidth }}>
+                    <ComposePane
+                      seed={state.composeSeed ?? { to: "", subject: "", body: "" }}
+                      onChange={(draft) => dispatch({ type: "park-compose", seed: draft })}
+                      onClose={closeCompose}
+                      onSend={sendCompose}
+                    />
+                    <div
+                      id="compose-pane-resize"
+                      role="splitter"
+                      aria-label="Resize compose"
+                      tabIndex={0}
+                      onMouseDown={(e) => {
+                        e.stopPropagation();
+                        composeResizeRef.current = { startX: e.clientX, startWidth: composeWidth };
+                      }}
+                      onKeyDown={(e) => {
+                        const step = e.shiftKey ? 40 : 12;
+                        if (e.key === "ArrowLeft") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setComposeWidth(composeWidth + step);
+                        } else if (e.key === "ArrowRight") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setComposeWidth(composeWidth - step);
+                        } else if (e.key === "Home") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setComposeWidth(340);
+                        } else if (e.key === "End") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setComposeWidth(composeMaxWidth());
+                        }
+                      }}
+                    />
+                  </div>
                 )}
               </div>
-              {!sidebarVisible && (
-                <div className="nori-show-sidebar">
-                  <Button
-                    id="show-sidebar"
-                    label=""
-                    dense
-                    buttonStyle="ghost"
-                    ariaLabel="Show sidebar"
-                    onClick={() => setSidebarVisible(true)}
-                    icon={<Icon path="icons/panel-left.svg" size={14} color="var(--nori-muted)" />}
-                  />
-                </div>
-              )}
             </div>
           )}
         </div>
       </div>
 
-      {state.overlay != null && (
+      {state.overlay === "search" && (
         <div className="nori-overlay" onMouseDown={closeOverlay}>
-          {state.overlay === "search" ? (
-            <div className="nori-overlay-top">
-              <SearchDialog
-                emails={state.emails}
-                onOpen={(id) => openEmail(id, { fromSearch: true })}
-                onDismiss={closeOverlay}
-              />
-            </div>
-          ) : (
-            <div className="nori-overlay-top">
-              <ComposeDialog
-                seed={state.composeSeed ?? { to: "", subject: "", body: "" }}
-                onDismiss={closeOverlay}
-              />
-            </div>
-          )}
+          <div className="nori-overlay-top">
+            <SearchDialog
+              emails={state.emails}
+              onOpen={(id) => openEmail(id, { fromSearch: true })}
+              onDismiss={closeOverlay}
+            />
+          </div>
         </div>
       )}
     </div>

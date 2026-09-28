@@ -25,6 +25,7 @@
 .nori-workspace {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -34,6 +35,20 @@
   flex: 1;
   min-height: 0;
   display: flex;
+}
+
+.nori-workspace-split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.nori-workspace-main {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .nori-show-sidebar {

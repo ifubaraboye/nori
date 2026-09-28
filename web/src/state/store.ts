@@ -39,6 +39,8 @@ export type MailAction =
   | { type: "open-search" }
   | { type: "open-compose"; seed: DraftSeed }
   | { type: "close-overlay" }
+  | { type: "close-compose" }
+  | { type: "park-compose"; seed: DraftSeed }
   | { type: "open-email-from-search"; id: EmailId; markRead?: boolean; openInTab?: boolean }
   | { type: "open-settings" }
   | { type: "close-settings" }
@@ -114,8 +116,8 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
         selectedMailbox: action.mailbox,
         selectedIndex: 0,
         workspaceView: { kind: "mailbox" },
-        overlay: null,
-        composeSeed: null,
+        // The composer survives a mailbox switch, parked with its draft.
+        overlay: state.overlay === "compose" ? "compose" : null,
         settingsPage: null,
       };
     case "move-selection": {
@@ -140,8 +142,8 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
           markRead: action.markRead,
           openInTab: action.openInTab,
         }),
-        overlay: null,
-        composeSeed: null,
+        // The search scrim goes away; a compose pane underneath stays parked.
+        overlay: state.overlay === "compose" ? state.overlay : null,
         settingsPage: null,
       };
     case "close-tab":
@@ -179,11 +181,20 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
     }
     case "close-overlay":
       return { ...state, overlay: null, composeSeed: null };
+    case "close-compose":
+      // Parked, not discarded: reopening restores the draft.
+      return { ...state, overlay: null };
+    case "park-compose":
+      return { ...state, composeSeed: action.seed };
     case "open-settings":
       // Search is modal and would sit on top of settings, so it closes.
-      // The compose seed is parked, not discarded: reopening compose
-      // restores it, matching the Rust composer's hide (not destroy).
-      return { ...state, overlay: null, settingsPage: "general" };
+      // The composer is only hidden while settings is open, never destroyed:
+      // its seed stays parked and the pane comes back with it.
+      return {
+        ...state,
+        overlay: state.overlay === "compose" ? "compose" : null,
+        settingsPage: "general",
+      };
     case "close-settings":
       return { ...state, settingsPage: null };
     case "set-settings-page":
