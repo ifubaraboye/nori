@@ -140,7 +140,9 @@ export function defaultSettings(): SettingsState {
     markReadOnOpen: true,
     unreadBadges: true,
     confirmBeforeArchive: false,
-    compactRows: true,
+    // Comfortable (three lines) is today's default; compact is the opt-in
+    // that fits roughly twice as many rows. density.rs.
+    compactRows: false,
     showSender: true,
     lightMode: false,
     openInTab: true,
