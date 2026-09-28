@@ -63,6 +63,7 @@ function base(): MailState {
     labelFilter: null,
     account: "disconnected",
     accountAddress: null,
+    accountReason: null,
     syncing: false,
     bodies: {},
     remoteLabels: {},
@@ -344,6 +345,32 @@ describe("host snapshot", () => {
     // the server dropped does not.
     expect(s.previewTab).toBeNull();
     expect(s.workspaceView.kind).toBe("mailbox");
+  });
+
+  test("a failed sign-in records why, rather than sitting on 'fetching'", () => {
+    // The bug this covers: a sign-in that could never complete left the page
+    // claiming "Fetching your mail… Signed in as ." forever.
+    let s = base();
+    s = mailReducer(s, { type: "set-account", status: "connecting" });
+    expect(s.account).toBe("connecting");
+    s = mailReducer(s, {
+      type: "set-account",
+      status: "failed",
+      address: null,
+      reason: "no browser was opened",
+    });
+    expect(s.account).toBe("failed");
+    expect(s.accountAddress).toBeNull();
+    expect(s.accountReason).toBe("no browser was opened");
+  });
+
+  test("a sign-in that succeeds clears any earlier failure", () => {
+    let s = base();
+    s = mailReducer(s, { type: "set-account", status: "failed", reason: "boom" });
+    s = mailReducer(s, { type: "set-account", status: "connected", address: "me@x.com" });
+    expect(s.account).toBe("connected");
+    expect(s.accountAddress).toBe("me@x.com");
+    expect(s.accountReason).toBeNull();
   });
 
   test("settled labels from the server win over the optimistic guess", () => {

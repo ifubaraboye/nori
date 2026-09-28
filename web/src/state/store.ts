@@ -45,6 +45,8 @@ export interface MailState {
   /** Whether the account is connected, and what it is doing (account.rs). */
   account: AccountStatus;
   accountAddress: string | null;
+  /** Why the last sign-in failed, in the user's words. */
+  accountReason: string | null;
   /** True while the host is fetching; the list shows mail as it arrives. */
   syncing: boolean;
   /** Bodies not yet fetched, keyed by mail id (mail.rs body_loaded). */
@@ -107,7 +109,12 @@ export type MailAction =
   | { type: "remove-label"; labelId: LabelId }
   | { type: "set-colour"; labelId: LabelId; colour: number }
   | { type: "filter-by-label"; labelId: LabelId | null }
-  | { type: "set-account"; status: AccountStatus; address?: string | null }
+  | {
+      type: "set-account";
+      status: AccountStatus;
+      address?: string | null;
+      reason?: string;
+    }
   | { type: "set-syncing"; syncing: boolean }
   | {
       type: "load-snapshot";
@@ -164,6 +171,7 @@ function initialState(): MailState {
     labelFilter: null,
     account: "disconnected",
     accountAddress: null,
+    accountReason: null,
     syncing: false,
     bodies: {},
     remoteLabels: {},
@@ -521,6 +529,7 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
         account: action.status,
         accountAddress:
           action.address !== undefined ? action.address : state.accountAddress,
+        accountReason: action.reason ?? null,
       };
     case "set-syncing":
       return { ...state, syncing: action.syncing };

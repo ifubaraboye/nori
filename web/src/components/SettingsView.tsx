@@ -29,7 +29,10 @@ export interface SettingsAccount {
   address?: string;
   mailCount?: number;
   labelCount?: number;
+  /** Why the last sign-in failed. Shown verbatim on the failed page. */
   reason?: string;
+  /** True while the browser is open waiting for consent. */
+  waiting?: boolean;
 }
 
 interface SettingsViewProps {
@@ -287,8 +290,8 @@ function AccountPage({
         <>
           <AccountHeading onSignIn={onSignIn} onSignOut={onSignOut} />
           <NoteRow
-            title="Signing in…"
-            description="Finish signing in the tab that just opened. Nori is listening for the redirect, then it will start fetching your mail."
+            title="Waiting for Google…"
+            description="Your browser should have opened Google's consent screen. Nori is listening on a local port for the redirect it sends back, then it will start fetching your mail. Nothing here can complete until you approve it there."
             isLast
           />
         </>
@@ -348,7 +351,11 @@ function AccountPage({
             onSignIn={onSignIn}
             onSignOut={onSignOut}
           />
-          <NoteRow title="Could not connect" description={account.reason ?? ""} isLast />
+          <NoteRow
+            title="Could not connect"
+            description={account.reason ?? "Sign-in did not complete."}
+            isLast
+          />
         </>
       );
   }

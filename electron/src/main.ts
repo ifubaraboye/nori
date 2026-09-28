@@ -402,6 +402,7 @@ function registerIpc(): void {
     const { request, redirect } = await beginAuth(credentials);
     const codePromise = redirect.awaitCallback(request.state);
     await shell.openExternal(request.url);
+    console.log(`[nori] sign-in: opened ${request.url.split("?")[0]} for ${redirect.redirectUri}`);
     const code = await codePromise;
     const token = await exchange(credentials, request.redirectUri, code, request.verifier);
     // The profile lookup names the account, which is the token file's name.

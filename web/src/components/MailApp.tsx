@@ -303,7 +303,9 @@ export function MailApp() {
           mailCount: state.emails.length,
           labelCount: state.labels.length,
         }
-      : { status: state.account };
+      : state.account === "failed"
+        ? { status: "failed", reason: state.accountReason ?? "Sign-in did not complete." }
+        : { status: state.account };
   const visibleCounts = settings.unreadBadges
     ? counts
     : { inbox: 0, starred: 0, sent: 0, drafts: 0, archive: 0, trash: 0 };

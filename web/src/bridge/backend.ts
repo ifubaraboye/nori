@@ -39,6 +39,13 @@ export interface HostBackend {
 
 type Dispatch = (action: unknown) => void;
 
+/** IPC rejections arrive as "Error invoking remote method ... : <reason>". */
+function describe(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const colon = message.lastIndexOf(": ");
+  return colon === -1 ? message : message.slice(colon + 2);
+}
+
 /**
  * Wire the host to the store. Returns the backend for imperative calls, and
  * pulls a snapshot on mount and whenever the host says something changed.
@@ -133,10 +140,34 @@ export function useHostBackend(dispatch: Dispatch): HostBackend {
       await bridgeRef.current?.send(draft);
     },
     async signin() {
+      const bridge = bridgeRef.current;
+      // No bridge means there is nothing to sign in to. Saying "fetching"
+      // here is what left the page claiming to be signed in while no
+      // browser ever opened.
+      if (!bridge?.signin) {
+        dispatch({
+          type: "set-account",
+          status: "failed",
+          address: null,
+          reason: "This build has no Gmail connection. Run the Electron app to sign in.",
+        });
+        return;
+      }
       dispatch({ type: "set-account", status: "connecting" });
-      const address = await bridgeRef.current?.signin?.();
-      dispatch({ type: "set-account", status: "fetching", address });
-      await refresh();
+      try {
+        const address = await bridge.signin();
+        dispatch({ type: "set-account", status: "fetching", address });
+        await refresh();
+      } catch (err) {
+        // Every failure lands here with the reason, so the page can name it
+        // rather than spinning forever on "Fetching your mail".
+        dispatch({
+          type: "set-account",
+          status: "failed",
+          address: null,
+          reason: describe(err),
+        });
+      }
     },
     async signout() {
       await bridgeRef.current?.signout?.();
