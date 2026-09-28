@@ -1,6 +1,5 @@
 import { useEffect, useRef } from "react";
 import type { EmailId, EmailSummary } from "../types/mail";
-import { Button } from "./Button";
 import { Icon } from "./Icon";
 import "./EmailList.css";
 
@@ -45,51 +44,102 @@ export function EmailList({ rows, selectedIndex, compact, onOpen, onStar, onSele
               }}
               className={[
                 "nori-email-row",
+                compact ? "nori-email-row--compact" : "nori-email-row--comfortable",
                 selected ? "nori-email-row--selected" : "",
-                compact ? "nori-email-row--compact" : "",
+                row.unread ? "nori-email-row--unread" : "",
               ]
                 .filter(Boolean)
                 .join(" ")}
             >
-              <div className="nori-email-row-main">
-                <div className="nori-email-row-top">
-                  <span
+              <div
+                className={
+                  row.unread ? "nori-email-row-accent nori-email-row-accent--unread" : "nori-email-row-accent"
+                }
+              />
+              {compact ? (
+                <div className="nori-email-row-compact">
+                  <div id={`email-row-sender-${row.id}`} className="nori-email-row-compact-sender">
+                    {row.sender}
+                  </div>
+                  <div className="nori-email-row-compact-subject-wrap">
+                    <div
+                      className={
+                        row.unread
+                          ? "nori-email-row-compact-subject nori-email-row-compact-subject--unread"
+                          : "nori-email-row-compact-subject"
+                      }
+                    >
+                      {row.subject}
+                    </div>
+                    {row.threadCount > 1 && (
+                      <div className="nori-email-row-thread-count">({row.threadCount})</div>
+                    )}
+                    <div className="nori-email-row-dash">—</div>
+                    <div className="nori-email-row-compact-preview">{row.preview}</div>
+                  </div>
+                </div>
+              ) : (
+                <div className="nori-email-row-comfortable">
+                  <div
                     className={
                       row.unread
-                        ? "nori-email-row-sender nori-email-row-sender--unread"
-                        : "nori-email-row-sender"
+                        ? "nori-email-row-comfortable-sender nori-email-row-comfortable-sender--unread"
+                        : "nori-email-row-comfortable-sender"
                     }
                   >
                     {row.sender}
-                  </span>
-                  <span className="nori-email-row-time">{row.timestamp}</span>
+                  </div>
+                  <div className="nori-email-row-comfortable-subject-row">
+                    <div
+                      className={
+                        row.unread
+                          ? "nori-email-row-comfortable-subject nori-email-row-comfortable-subject--unread"
+                          : "nori-email-row-comfortable-subject"
+                      }
+                    >
+                      {row.subject}
+                    </div>
+                    {row.threadCount > 1 && (
+                      <div className="nori-email-row-thread-count">({row.threadCount})</div>
+                    )}
+                  </div>
+                  <div className="nori-email-row-comfortable-preview">{row.preview}</div>
                 </div>
-                <div
-                  className={
-                    row.unread
-                      ? "nori-email-row-subject nori-email-row-subject--unread"
-                      : "nori-email-row-subject"
-                  }
+              )}
+              {!compact && (
+                <div className="nori-email-row-timestamp-wrap">
+                  <div className="nori-email-row-timestamp">{row.timestamp}</div>
+                </div>
+              )}
+              <div className="nori-email-row-trailing">
+                <div id={`email-row-menu-${row.id}`}>
+                  <button
+                    id={`row-menu-${row.id}`}
+                    type="button"
+                    className="nori-email-row-icon-button"
+                    aria-label={`More actions for ${row.sender}`}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Icon path="icons/ellipsis.svg" size={14} color="var(--nori-ghost)" />
+                  </button>
+                </div>
+                <button
+                  id={`star-${row.id}`}
+                  type="button"
+                  className="nori-email-row-icon-button"
+                  aria-label={row.starred ? "Remove star" : "Add star"}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onStar(row.id);
+                  }}
                 >
-                  {row.subject}
-                </div>
-                <div className="nori-email-row-preview">{row.preview}</div>
-              </div>
-              <Button
-                id={`star-${row.id}`}
-                label=""
-                dense
-                buttonStyle="ghost"
-                ariaLabel={row.starred ? "Remove star" : "Add star"}
-                onClick={() => onStar(row.id)}
-                icon={
                   <Icon
                     path={row.starred ? "icons/star-filled.svg" : "icons/star.svg"}
-                    size={14}
-                    color={row.starred ? "var(--nori-accent)" : "var(--nori-faint)"}
+                    size={16}
+                    color={row.starred ? "var(--nori-accent)" : "var(--nori-ghost)"}
                   />
-                }
-              />
+                </button>
+              </div>
             </div>
           );
         })}

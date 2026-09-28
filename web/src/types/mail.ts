@@ -53,6 +53,7 @@ export interface EmailSummary {
   timestamp: string;
   unread: boolean;
   starred: boolean;
+  threadCount: number;
 }
 
 export function emailSummary(email: Email): EmailSummary {
@@ -64,6 +65,7 @@ export function emailSummary(email: Email): EmailSummary {
     timestamp: email.timestamp,
     unread: email.unread,
     starred: email.starred,
+    threadCount: 1,
   };
 }
 
