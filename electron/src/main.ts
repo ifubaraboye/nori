@@ -140,11 +140,27 @@ function emailMatches(email: UiEmail, query: string): boolean {
 function saveIndex(): void {
   if (!state.account) return;
   const emails = [...state.emails.values()];
+  // The index file keeps the Rust shape — Nori's own numeric label ids, with
+  // the Gmail id alongside — so a cache written before the port still loads.
+  const labels = state.labels.map((l, index) => ({
+    id: index + 1,
+    name: l.name,
+    colour: l.colour,
+    remoteId: l.id,
+  }));
+  const byRemote = new Map(labels.map((l) => [l.remoteId as string, l.id]));
   const current: MailIndex = {
     account: state.account,
     emails: emails.map((e) => ({ ...e, mailbox: e.mailbox })),
-    labels: state.labels.map((l) => ({ id: Number(l.id) || 0, name: l.name, colour: l.colour })),
-    assignments: [...state.labelAssignments.entries()].map(([id, labels]) => [id, labels]),
+    labels,
+    assignments: [...state.labelAssignments.entries()]
+      .map(
+        ([id, remotes]): [string, number[]] => [
+          id,
+          remotes.map((r) => byRemote.get(r)).filter((n): n is number => n !== undefined),
+        ],
+      )
+      .filter(([, held]) => held.length > 0),
     historyId: state.historyId,
   };
   const cache = indexCacheFor(state.account);
@@ -171,9 +187,23 @@ async function restoreFromDisk(): Promise<void> {
         threadId: email.threadId ?? "",
       });
     }
-    state.labels = (index.labels ?? []).map((l) => ({ id: String(l.id), name: l.name, colour: l.colour }));
+    // A label cached before the port has no remoteId: it existed only
+    // locally, so it can be listed and shown but never written back.
+    state.labels = (index.labels ?? []).map((l) => ({
+      id: l.remoteId ?? `local:${l.id}`,
+      name: l.name,
+      colour: l.colour,
+    }));
     state.historyId = index.historyId;
-    state.labelAssignments = new Map(index.assignments ?? []);
+    const byLocal = new Map((index.labels ?? []).map((l) => [l.id, l.remoteId]));
+    state.labelAssignments = new Map(
+      (index.assignments ?? [])
+        .map(([id, held]) => [
+          id,
+          held.map((n) => byLocal.get(n)).filter((r): r is string => r !== undefined),
+        ] as [string, string[]])
+        .filter(([, remotes]) => remotes.length > 0),
+    );
   }
 }
 

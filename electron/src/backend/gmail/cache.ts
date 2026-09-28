@@ -19,9 +19,16 @@ export interface CachedEmail {
 }
 
 export interface CachedLabel {
+  /** Nori's own numeric id, as the Rust index stored it. */
   id: number;
   name: string;
   colour: number;
+  /**
+   * The Gmail label id behind it, when it came from a connected account.
+   * Absent for a label that only ever existed locally, which is why the
+   * assignments below cannot be written back without it.
+   */
+  remoteId?: string;
 }
 
 export interface MailIndex {

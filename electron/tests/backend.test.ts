@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { challengeFor, generatePkce, matchesState } from "../src/backend/auth/pkce";
 import { urlencode, interpretCallback, beginAuth } from "../src/backend/auth/oauth";
-import { tokenFromExchange, isFresh, canRefresh } from "../src/backend/auth/token";
+import { tokenFromExchange, isFresh, canRefresh, FileTokenStore, type Token } from "../src/backend/auth/token";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { textWithStatus, detailOf, isTransient } from "../src/backend/gmail/http";
 import { parseRecipients, guessMime, buildSendRaw, MAX_SEND_BYTES } from "../src/backend/gmail/send";
 import { folderCountsFromLookup } from "../src/backend/gmail/counts";
@@ -9,6 +12,54 @@ import { mayReplaceIndex, type MailIndex } from "../src/backend/gmail/cache";
 import { sanitizeHtml } from "../src/backend/gmail/sanitize";
 import { boundedHtml, fallbackText, hasRemoteImages } from "../src/backend/gmail/policy";
 import { parseHtmlBody, plainText, textBlocks, inlineCidImages } from "../src/backend/gmail/rich";
+
+describe("token file compatibility", () => {
+  const dir = mkdtempSync(join(tmpdir(), "nori-token-"));
+
+  test("a snake_case token from the Rust build still loads", () => {
+    // The Rust version wrote access_token / refresh_token / expires_at.
+    // Reading only camelCase yields a token with no access token at all, which
+    // then reads as "not signed in" and sends the user through a pointless
+    // re-consent for a credential that was already on disk.
+    const path = join(dir, "legacy.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        access_token: "ya29.legacy",
+        refresh_token: "1//legacy",
+        expires_at: 1790615097,
+        scope: "openid",
+        token_type: "Bearer",
+      }),
+    );
+    const token = new FileTokenStore(path).load();
+    expect(token?.accessToken).toBe("ya29.legacy");
+    expect(token?.refreshToken).toBe("1//legacy");
+    expect(token?.expiresAt).toBe(1790615097);
+    expect(token?.tokenType).toBe("Bearer");
+    expect(canRefresh(token as Token)).toBe(true);
+  });
+
+  test("a camelCase token loads, and survives a round trip", () => {
+    const path = join(dir, "modern.json");
+    const store = new FileTokenStore(path);
+    const token = tokenFromExchange("ya29.modern", "1//modern", 3600);
+    store.save(token);
+    const loaded = store.load();
+    expect(loaded?.accessToken).toBe("ya29.modern");
+    expect(loaded?.refreshToken).toBe("1//modern");
+  });
+
+  test("a token file with no access token is treated as absent", () => {
+    const path = join(dir, "garbage.json");
+    writeFileSync(path, JSON.stringify({ note: "not a token" }));
+    expect(new FileTokenStore(path).load()).toBeNull();
+  });
+
+  test("a missing file is the first run, not a failure", () => {
+    expect(new FileTokenStore(join(dir, "absent.json")).load()).toBeNull();
+  });
+});
 
 describe("pkce (RFC 7636)", () => {
   test("s256 matches the RFC appendix B vector", () => {

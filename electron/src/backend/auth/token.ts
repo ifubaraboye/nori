@@ -61,10 +61,30 @@ export class FileTokenStore implements TokenStore {
     return new FileTokenStore(tokenPathForAccount(account));
   }
 
+  /**
+   * Read a token written by either build.
+   *
+   * The Rust version serialised `access_token` / `refresh_token` /
+   * `expires_at` in snake_case; this port uses camelCase. Accepting both is
+   * what lets a token file written before the port survive it — reading only
+   * camelCase would silently yield a token with no access token at all, which
+   * then reads as "not signed in" and sends the user through a pointless
+   * re-consent for a credential that was sitting on disk the whole time.
+   */
   load(): Token | null {
     try {
-      const contents = readFileSync(this.path, "utf8");
-      return JSON.parse(contents) as Token;
+      const raw = JSON.parse(readFileSync(this.path, "utf8")) as Record<string, unknown>;
+      const accessToken = (raw.accessToken ?? raw.access_token) as string | undefined;
+      if (typeof accessToken !== "string" || accessToken === "") return null;
+      const refreshToken = (raw.refreshToken ?? raw.refresh_token) as string | undefined;
+      const expiresAt = (raw.expiresAt ?? raw.expires_at) as number | undefined;
+      return {
+        accessToken,
+        refreshToken: typeof refreshToken === "string" ? refreshToken : undefined,
+        expiresAt: typeof expiresAt === "number" ? expiresAt : undefined,
+        scope: (raw.scope as string | undefined) ?? undefined,
+        tokenType: (raw.tokenType ?? raw.token_type) as string | undefined,
+      };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw err;
