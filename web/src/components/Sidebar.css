@@ -75,6 +75,70 @@
   cursor: default;
 }
 
+/* Labels group: header + rows, living in the scrolling nav under the
+   mailboxes the same way the mailboxes sit under Search. */
+.nori-sidebar-group--labelled {
+  padding: 0 10px;
+}
+
+.nori-sidebar-group-row {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+}
+
+.nori-sidebar-group-toggle--inline {
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+}
+
+.nori-sidebar-labels {
+  flex: none;
+}
+
+.nori-sidebar-label-swatch {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border: 1px solid transparent;
+  border-radius: 2px;
+}
+
+.nori-sidebar-label-composer {
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  background: var(--nori-surface);
+  border: 1px solid var(--nori-focus);
+  border-radius: 6px;
+  color: var(--nori-text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+.nori-sidebar-label-composer::placeholder {
+  color: var(--nori-faint);
+}
+
+.nori-sidebar-label-add {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+}
+.nori-sidebar-label-add:hover {
+  background: var(--nori-hover);
+}
+
 .nori-sidebar-compose {
   padding: 10px 10px 1px;
 }
@@ -140,6 +204,10 @@
 }
 .nori-sidebar-row:focus-visible {
   outline: 1px solid var(--nori-focus);
+}
+/* Label rows are 30px, not the mailboxes' 32. */
+.nori-sidebar-row--label {
+  height: 30px;
 }
 .nori-sidebar-row--selected {
   background: var(--nori-selected);

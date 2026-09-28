@@ -1,0 +1,39 @@
+.nori-confirm-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--nori-overlay);
+}
+
+.nori-confirm-dialog {
+  width: 400px;
+  max-width: 100%;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--nori-raised);
+  border: 1px solid var(--nori-hairline-strong);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+}
+
+.nori-confirm-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--nori-text);
+}
+
+.nori-confirm-body {
+  font-size: 12.5px;
+  color: var(--nori-muted);
+}
+
+.nori-confirm-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

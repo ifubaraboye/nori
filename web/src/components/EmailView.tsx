@@ -9,10 +9,20 @@ interface EmailViewProps {
   onReply: () => void;
   onReplyAll: () => void;
   onForward: () => void;
+  onTogglePin: () => void;
+  onArchive: () => void;
 }
 
 /** Port of views/email_view.rs. */
-export function EmailView({ email, showSender, onReply, onReplyAll, onForward }: EmailViewProps) {
+export function EmailView({
+  email,
+  showSender,
+  onReply,
+  onReplyAll,
+  onForward,
+  onTogglePin,
+  onArchive,
+}: EmailViewProps) {
   return (
     <div id={`email-view-${email.id}`} className="nori-email-view" tabIndex={0}>
       <div className="nori-email-view-inner">
@@ -60,6 +70,29 @@ export function EmailView({ email, showSender, onReply, onReplyAll, onForward }:
             buttonStyle="subtle"
             onClick={onForward}
             icon={<Icon path="icons/forward.svg" size={13} color="var(--nori-muted)" />}
+          />
+          <span style={{ flex: 1 }} />
+          <Button
+            id="email-pin-button"
+            label={email.pinned ? "Unpin" : "Pin"}
+            dense
+            buttonStyle="subtle"
+            onClick={onTogglePin}
+            icon={
+              <Icon
+                path={email.pinned ? "icons/pin.svg" : "icons/pin-off.svg"}
+                size={13}
+                color={email.pinned ? "var(--nori-accent)" : "var(--nori-muted)"}
+              />
+            }
+          />
+          <Button
+            id="archive-button"
+            label="Archive"
+            dense
+            buttonStyle="subtle"
+            onClick={onArchive}
+            icon={<Icon path="icons/archive.svg" size={13} color="var(--nori-muted)" />}
           />
         </div>
       </div>

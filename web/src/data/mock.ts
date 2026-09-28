@@ -30,6 +30,8 @@ function email(
     mailbox,
     unread,
     starred,
+    // No mail is pinned at startup, so every mail opens as a preview tab.
+    pinned: false,
   };
 }
 

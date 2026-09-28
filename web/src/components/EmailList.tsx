@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { EmailId, EmailSummary } from "../types/mail";
+import { labelChip, type Label } from "../state/store";
 import { Icon } from "./Icon";
 import "./EmailList.css";
 
@@ -7,13 +8,24 @@ interface EmailListProps {
   rows: EmailSummary[];
   selectedIndex: number;
   compact: boolean;
+  labelsByEmail: Map<EmailId, Label[]>;
   onOpen: (id: EmailId) => void;
   onStar: (id: EmailId) => void;
+  onOpenMenu: (id: EmailId) => void;
   onSelectIndex: (index: number) => void;
 }
 
 /** Port of views/inbox.rs + components/email_row.rs. */
-export function EmailList({ rows, selectedIndex, compact, onOpen, onStar, onSelectIndex }: EmailListProps) {
+export function EmailList({
+  rows,
+  selectedIndex,
+  compact,
+  labelsByEmail,
+  onOpen,
+  onStar,
+  onOpenMenu,
+  onSelectIndex,
+}: EmailListProps) {
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -29,6 +41,10 @@ export function EmailList({ rows, selectedIndex, compact, onOpen, onStar, onSele
         {rows.map((row, index) => {
           const selected = index === selectedIndex;
           const label = `${row.sender}: ${row.subject}`;
+          const chips = (labelsByEmail.get(row.id) ?? []).map((l) => ({
+            label: l,
+            chip: labelChip(l.colour),
+          }));
           return (
             <div
               key={row.id}
@@ -62,6 +78,20 @@ export function EmailList({ rows, selectedIndex, compact, onOpen, onStar, onSele
                     {row.sender}
                   </div>
                   <div className="nori-email-row-compact-subject-wrap">
+                    {chips.length > 0 && (
+                      <div className="nori-email-row-labels">
+                        {chips.map(({ label, chip }) => (
+                          <span
+                            key={label.id}
+                            id={`row-label-${row.id}-${label.id}`}
+                            className="nori-email-row-label"
+                            style={{ color: chip.text, borderColor: chip.border, background: chip.fill }}
+                          >
+                            {label.name}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     <div
                       className={
                         row.unread
@@ -90,6 +120,20 @@ export function EmailList({ rows, selectedIndex, compact, onOpen, onStar, onSele
                     {row.sender}
                   </div>
                   <div className="nori-email-row-comfortable-subject-row">
+                    {chips.length > 0 && (
+                      <div className="nori-email-row-labels">
+                        {chips.map(({ label, chip }) => (
+                          <span
+                            key={label.id}
+                            id={`row-label-${row.id}-${label.id}`}
+                            className="nori-email-row-label"
+                            style={{ color: chip.text, borderColor: chip.border, background: chip.fill }}
+                          >
+                            {label.name}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     <div
                       className={
                         row.unread
@@ -118,7 +162,10 @@ export function EmailList({ rows, selectedIndex, compact, onOpen, onStar, onSele
                     type="button"
                     className="nori-email-row-icon-button"
                     aria-label={`More actions for ${row.sender}`}
-                    onClick={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onOpenMenu(row.id);
+                    }}
                   >
                     <Icon path="icons/ellipsis.svg" size={14} color="var(--nori-ghost)" />
                   </button>

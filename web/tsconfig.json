@@ -15,5 +15,8 @@
     "resolveJsonModule": true,
     "types": ["vite/client"]
   },
-  "include": ["src", "vite.config.ts"]
+  // bun:test specs are typechecked by their own runner, not by the renderer
+  // build; excluding them keeps `tsc` from demanding bun's globals here.
+  "include": ["src", "vite.config.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }

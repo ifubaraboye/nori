@@ -1,5 +1,6 @@
-import { useCallback } from "react";
-import { MAILBOX_NAV_ITEMS, mailboxLabel, type Mailbox } from "../types/mail";
+import { useCallback, useState } from "react";
+import { MAILBOX_NAV_ITEMS, mailboxLabel, type EmailId, type Mailbox } from "../types/mail";
+import { labelChip, type Label, type LabelId } from "../state/store";
 import { Button } from "./Button";
 import { Icon } from "./Icon";
 import "./Sidebar.css";
@@ -39,6 +40,12 @@ interface SidebarProps {
   onForward: () => void;
   canBack: boolean;
   canForward: boolean;
+  labels: Label[];
+  labelAssignments: Array<[EmailId, LabelId[]]>;
+  labelFilter: LabelId | null;
+  onCreateLabel: (name: string) => void;
+  onFilterLabel: (labelId: LabelId) => void;
+  onRemoveLabel: (labelId: LabelId) => void;
 }
 
 /** Port of components/sidebar.rs. */
@@ -60,8 +67,17 @@ export function Sidebar({
   onForward,
   canBack,
   canForward,
+  labels,
+  labelAssignments,
+  labelFilter,
+  onCreateLabel,
+  onFilterLabel,
+  onRemoveLabel,
 }: SidebarProps) {
   const clamped = clampSidebarWidth(width);
+  const [labelsCollapsed, setLabelsCollapsed] = useState(false);
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [newLabel, setNewLabel] = useState("");
 
   const onResizeKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -224,6 +240,104 @@ export function Sidebar({
                 </div>
               );
             })}
+          {/* A group's rows sit flush under their own header and the header
+              is preceded by a spacer, so each group reads as one block. */}
+          <div style={{ height: 10 }} />
+          <div className="nori-sidebar-group nori-sidebar-group--labelled">
+            <div className="nori-sidebar-group-row">
+              <button
+                id="sidebar-labels-toggle"
+                type="button"
+                className="nori-sidebar-group-toggle nori-sidebar-group-toggle--inline"
+                aria-label="Labels group"
+                onClick={() => setLabelsCollapsed((v) => !v)}
+                onKeyDown={(e) => {
+                  if ((e.key === "ArrowLeft" && !labelsCollapsed) || (e.key === "ArrowRight" && labelsCollapsed)) {
+                    setLabelsCollapsed((v) => !v);
+                  }
+                }}
+              >
+                <span>Labels</span>
+                <Icon
+                  path={labelsCollapsed ? "icons/chevron-right.svg" : "icons/chevron-down.svg"}
+                  size={12}
+                  color="var(--nori-faint)"
+                />
+              </button>
+              {/* Sibling of the toggle, never a child: the toggle is itself a
+                  button, and a button nested in one is a hit-test problem. */}
+              <button
+                id="sidebar-labels-add"
+                type="button"
+                className="nori-sidebar-label-add"
+                aria-label="New label"
+                onClick={() => setComposerOpen((v) => !v)}
+              >
+                <Icon path="icons/plus.svg" size={13} color="var(--nori-faint)" />
+              </button>
+            </div>
+          </div>
+          {!labelsCollapsed && (
+            <div id="sidebar-labels" className="nori-sidebar-labels">
+              {labels.map((label) => {
+                const chip = labelChip(label.colour);
+                const held = labelAssignments.filter(([, ids]) => ids.includes(label.id)).length;
+                const filtering = labelFilter === label.id;
+                return (
+                  <div key={label.id} className="nori-sidebar-row-wrap">
+                    <button
+                      id={`sidebar-label-${label.id}`}
+                      type="button"
+                      role="button"
+                      aria-label={`Label ${label.name}`}
+                      aria-selected={filtering}
+                      className={
+                        filtering
+                          ? "nori-sidebar-row nori-sidebar-row--label nori-sidebar-row--selected"
+                          : "nori-sidebar-row nori-sidebar-row--label"
+                      }
+                      onClick={() => onFilterLabel(label.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Delete" || e.key === "Backspace") {
+                          e.stopPropagation();
+                          onRemoveLabel(label.id);
+                        }
+                      }}
+                    >
+                      <span
+                        className="nori-sidebar-label-swatch"
+                        style={{ background: chip.text, borderColor: chip.border }}
+                      />
+                      <span className="nori-sidebar-row-label">{label.name}</span>
+                      {held > 0 && <span className="nori-sidebar-row-count">{held}</span>}
+                    </button>
+                  </div>
+                );
+              })}
+              {composerOpen && (
+                <div className="nori-sidebar-row-wrap">
+                  <input
+                    id="sidebar-label-new"
+                    className="nori-sidebar-label-composer"
+                    value={newLabel}
+                    placeholder="Label name"
+                    autoFocus
+                    onChange={(e) => setNewLabel(e.target.value)}
+                    onKeyDown={(e) => {
+                      e.stopPropagation();
+                      if (e.key === "Enter" && newLabel.trim() !== "") {
+                        onCreateLabel(newLabel);
+                        setNewLabel("");
+                        setComposerOpen(false);
+                      } else if (e.key === "Escape") {
+                        setComposerOpen(false);
+                      }
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
         </nav>
 
         <div className="nori-sidebar-footer">

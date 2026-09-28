@@ -207,6 +207,26 @@
   white-space: nowrap;
 }
 
+/* Label chips sit immediately left of the subject, so what a mail carries
+   reads as part of the title row. Square, like every other surface here. */
+.nori-email-row-labels {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.nori-email-row-label {
+  padding: 1px 6px;
+  max-width: 120px;
+  font-size: 11px;
+  line-height: 15px;
+  border: 1px solid transparent;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Trailing chrome: overflow menu + star, centred on the row. */
 .nori-email-row-trailing {
   flex: none;

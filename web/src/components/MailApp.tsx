@@ -17,6 +17,8 @@ import { EmailView } from "./EmailView";
 import { ComposePane } from "./ComposePane";
 import { SearchDialog } from "./SearchDialog";
 import { SettingsView, type SettingsAccount } from "./SettingsView";
+import { LabelMenu } from "./LabelMenu";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { Button } from "./Button";
 import { Icon } from "./Icon";
 import "./MailApp.css";
@@ -27,7 +29,16 @@ import "./MailApp.css";
  * plus settings (Ctrl+Shift+P toggle, Up/Down move between pages).
  */
 export function MailApp() {
-  const { state, dispatch, summaries, activeEmail, counts } = useMailStore();
+  const {
+    state,
+    dispatch,
+    summaries,
+    activeEmail,
+    counts,
+    tabs,
+    previewTab,
+    labelsByEmail,
+  } = useMailStore();
   const [settings, setSettings] = useSettings();
   useNoriBackend();
   // Host menu "Toggle Sidebar" arrives as a push event under Electron.
@@ -174,6 +185,16 @@ export function MailApp() {
         if (e.key === "Escape") dispatch({ type: "close-compose" });
         return;
       }
+      // Confirm wins the hit-test: Esc order is
+      // confirm > label menu > search > compose > settings > go_back.
+      if (state.confirmArchive != null) {
+        if (e.key === "Escape") dispatch({ type: "cancel-archive" });
+        return;
+      }
+      if (state.labelMenuFor != null && e.key === "Escape") {
+        dispatch({ type: "close-label-menu" });
+        return;
+      }
       const mod_ = e.ctrlKey || e.metaKey;
       if (mod_ && e.shiftKey && (e.key === "p" || e.key === "P")) {
         e.preventDefault();
@@ -241,6 +262,8 @@ export function MailApp() {
     state.workspaceView,
     state.overlay,
     state.settingsPage,
+    state.confirmArchive,
+    state.labelMenuFor,
     closeOverlay,
     openComposeDefault,
     openEmail,
@@ -270,7 +293,7 @@ export function MailApp() {
     };
   }, [setComposeWidth]);
 
-  const tabs = state.tabs
+  const tabLabels = tabs
     .map((id) => {
       const email = state.emails.find((e) => e.id === id);
       return email ? { id, subject: email.subject } : null;
@@ -324,6 +347,12 @@ export function MailApp() {
           onForward={() => dispatch({ type: "go-forward" })}
           canBack={state.historyBack.length > 0}
           canForward={state.historyForward.length > 0}
+          labels={state.labels}
+          labelAssignments={state.assignments}
+          labelFilter={state.labelFilter}
+          onCreateLabel={(name) => dispatch({ type: "create-label", name })}
+          onFilterLabel={(labelId) => dispatch({ type: "filter-by-label", labelId })}
+          onRemoveLabel={(labelId) => dispatch({ type: "remove-label", labelId })}
         />
 
         <div className="nori-app-right">
@@ -367,11 +396,11 @@ export function MailApp() {
           ) : (
             <div className="nori-workspace">
               <EmailTabs
-                tabs={tabs}
+                tabs={tabLabels}
+                preview={previewTab}
                 active={state.activeTab}
                 onSelect={(id) => openEmail(id)}
                 onClose={(id) => dispatch({ type: "close-tab", id })}
-                onNew={openComposeDefault}
               />
               <div id="workspace-split" className="nori-workspace-split">
                 <div className="nori-workspace-main">
@@ -389,12 +418,22 @@ export function MailApp() {
                         onForward={() =>
                           dispatch({ type: "open-compose", seed: replySeed(activeEmail, false, true) })
                         }
+                        onTogglePin={() => dispatch({ type: "toggle-pin", id: activeEmail.id })}
+                        onArchive={() =>
+                          dispatch({
+                            type: "request-archive",
+                            id: activeEmail.id,
+                            confirm: settings.confirmBeforeArchive,
+                          })
+                        }
                       />
                     ) : (
                       <EmailList
                         rows={summaries}
                         selectedIndex={state.selectedIndex}
                         compact={settings.compactRows}
+                        labelsByEmail={labelsByEmail}
+                        onOpenMenu={(id) => dispatch({ type: "open-label-menu", id })}
                         onOpen={(id) => openEmail(id)}
                         onStar={(id) => {
                           dispatch({ type: "toggle-star", id });
@@ -463,6 +502,25 @@ export function MailApp() {
           )}
         </div>
       </div>
+
+      {state.labelMenuFor != null && (
+        <LabelMenu
+          emailId={state.labelMenuFor}
+          labels={state.labels}
+          assigned={state.assignments.find(([id]) => id === state.labelMenuFor)?.[1] ?? []}
+          onToggle={(labelId) => dispatch({ type: "toggle-label", id: state.labelMenuFor as number, labelId })}
+          onCreate={(name) => dispatch({ type: "create-label", name })}
+          onDismiss={() => dispatch({ type: "close-label-menu" })}
+        />
+      )}
+
+      {state.confirmArchive != null && (
+        <ConfirmDialog
+          subject={state.emails.find((e) => e.id === state.confirmArchive)?.subject ?? ""}
+          onConfirm={() => dispatch({ type: "confirm-archive" })}
+          onCancel={() => dispatch({ type: "cancel-archive" })}
+        />
+      )}
 
       {state.overlay === "search" && (
         <div className="nori-overlay" onMouseDown={closeOverlay}>

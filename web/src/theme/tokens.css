@@ -1,3 +1,7 @@
+/* Geist, the app typeface. Loaded from the Google Fonts CDN so it needs no
+   bundled woff2 and no network at build time. */
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap");
+
 /* Port of crates/nori-ui/src/theme.rs Theme::dark() + Theme::light(). */
 /* :root is the dark default; [data-theme="light"] is the light palette. */
 :root {

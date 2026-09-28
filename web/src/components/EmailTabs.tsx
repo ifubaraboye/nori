@@ -5,20 +5,22 @@ import "./EmailTabs.css";
 
 interface EmailTabsProps {
   tabs: { id: EmailId; subject: string }[];
+  /** The provisional tab, rendered last and in italics (email_tabs.rs). */
+  preview: EmailId | null;
   active: EmailId | null;
   onSelect: (id: EmailId) => void;
   onClose: (id: EmailId) => void;
-  onNew: () => void;
 }
 
-/** Port of components/email_tabs.rs (36px bar, 118-220px tabs, accent underline). */
-export function EmailTabs({ tabs, active, onSelect, onClose, onNew }: EmailTabsProps) {
+/** Port of components/email_tabs.rs (40px bar, 118-220px tabs, inset strip). */
+export function EmailTabs({ tabs, preview, active, onSelect, onClose }: EmailTabsProps) {
   if (tabs.length === 0) return null;
   return (
     <div id="email-tabs" className="nori-tabs" role="tablist" aria-label="Open emails">
       <div className="nori-tabs-scroll">
         {tabs.map(({ id, subject }) => {
           const isActive = active === id;
+          const isPreview = preview === id;
           return (
             <div
               key={id}
@@ -33,7 +35,13 @@ export function EmailTabs({ tabs, active, onSelect, onClose, onNew }: EmailTabsP
                   onSelect(id);
                 }
               }}
-              className={isActive ? "nori-tab nori-tab--active" : "nori-tab"}
+              className={[
+                "nori-tab",
+                isActive ? "nori-tab--active" : "",
+                isPreview ? "nori-tab--preview" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
             >
               <span className="nori-tab-label">{subject}</span>
               <Button
@@ -43,20 +51,11 @@ export function EmailTabs({ tabs, active, onSelect, onClose, onNew }: EmailTabsP
                 buttonStyle="ghost"
                 ariaLabel={`Close ${subject}`}
                 onClick={() => onClose(id)}
-                icon={<Icon path="icons/close.svg" size={11} color="var(--nori-faint)" />}
+                icon={<Icon path="icons/close.svg" size={11.55} color="var(--nori-ghost)" />}
               />
             </div>
           );
         })}
-        <Button
-          id="new-email-tab"
-          label=""
-          dense
-          buttonStyle="ghost"
-          ariaLabel="Compose"
-          onClick={onNew}
-          icon={<Icon path="icons/plus.svg" size={14} color="var(--nori-muted)" />}
-        />
       </div>
     </div>
   );

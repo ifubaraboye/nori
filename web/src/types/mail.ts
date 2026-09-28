@@ -43,6 +43,8 @@ export interface Email {
   mailbox: Mailbox;
   unread: boolean;
   starred: boolean;
+  /** Pinned mail earns a tab in the strip; unpinned opens as a preview. */
+  pinned: boolean;
 }
 
 export interface EmailSummary {

@@ -1,0 +1,99 @@
+.nori-label-menu {
+  position: fixed;
+  z-index: 40;
+  width: 200px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--nori-raised);
+  border: 1px solid var(--nori-hairline-strong);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.nori-label-menu-item {
+  width: 100%;
+  height: 26px;
+  padding: 0 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: var(--nori-text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.nori-label-menu-item:hover {
+  background: var(--nori-hover);
+}
+.nori-label-menu-item--on {
+  color: var(--nori-text);
+}
+.nori-label-menu-item--on .nori-label-menu-name {
+  font-weight: 600;
+}
+
+.nori-label-menu-swatch {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border: 1px solid transparent;
+  border-radius: 2px;
+}
+
+.nori-label-menu-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nori-label-menu-empty {
+  padding: 6px;
+  font-size: 12px;
+  color: var(--nori-faint);
+}
+
+.nori-label-menu-new {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--nori-hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nori-label-menu-input {
+  width: 100%;
+  height: 26px;
+  padding: 0 7px;
+  background: var(--nori-surface);
+  border: 1px solid var(--nori-border);
+  border-radius: 5px;
+  color: var(--nori-text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+.nori-label-menu-input:focus {
+  border-color: var(--nori-focus);
+}
+.nori-label-menu-input::placeholder {
+  color: var(--nori-faint);
+}
+
+.nori-label-menu-swatches {
+  display: flex;
+  gap: 4px;
+}
+
+.nori-label-menu-swatch-option {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}

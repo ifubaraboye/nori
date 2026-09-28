@@ -18,6 +18,8 @@ import linkSvg from "../assets/icons/link.svg?raw";
 import mailSvg from "../assets/icons/mail.svg?raw";
 import panelLeftSvg from "../assets/icons/panel-left.svg?raw";
 import paperclipSvg from "../assets/icons/paperclip.svg?raw";
+import pinOffSvg from "../assets/icons/pin-off.svg?raw";
+import pinSvg from "../assets/icons/pin.svg?raw";
 import plusSvg from "../assets/icons/plus.svg?raw";
 import replyAllSvg from "../assets/icons/reply-all.svg?raw";
 import replySvg from "../assets/icons/reply.svg?raw";
@@ -54,6 +56,8 @@ const ICONS: Record<string, string> = {
   "icons/mail.svg": mailSvg,
   "icons/panel-left.svg": panelLeftSvg,
   "icons/paperclip.svg": paperclipSvg,
+  "icons/pin-off.svg": pinOffSvg,
+  "icons/pin.svg": pinSvg,
   "icons/plus.svg": plusSvg,
   "icons/reply-all.svg": replyAllSvg,
   "icons/reply.svg": replySvg,
