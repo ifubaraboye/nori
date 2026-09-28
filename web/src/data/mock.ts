@@ -2,7 +2,7 @@
 import type { Email, Mailbox } from "../types/mail";
 
 function email(
-  id: number,
+  id: string,
   sender: string,
   address: string,
   subject: string,
@@ -38,7 +38,7 @@ function email(
 export function mockEmails(): Email[] {
   return [
     email(
-      1,
+      "1",
       "John Smith",
       "john@example.com",
       "Project Update",
@@ -56,7 +56,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      2,
+      "2",
       "Sarah Jones",
       "sarah@example.com",
       "Meeting Tomorrow",
@@ -74,7 +74,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      3,
+      "3",
       "GitHub",
       "notifications@github.com",
       "New pull request",
@@ -91,7 +91,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      4,
+      "4",
       "Maya Chen",
       "maya@example.com",
       "Design review notes",
@@ -109,7 +109,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      5,
+      "5",
       "Finance",
       "billing@example.com",
       "Invoice #294",
@@ -127,7 +127,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      6,
+      "6",
       "Noah Williams",
       "noah@example.com",
       "Build passed on Linux",
@@ -144,7 +144,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      7,
+      "7",
       "Aisha Patel",
       "aisha@example.com",
       "Quarterly planning",
@@ -162,7 +162,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      8,
+      "8",
       "Linear",
       "updates@linear.app",
       "NOR-184 moved to In Review",
@@ -179,7 +179,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      9,
+      "9",
       "Elena Rossi",
       "elena@example.com",
       "Research interview summary",
@@ -197,7 +197,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      10,
+      "10",
       "Security",
       "security@example.com",
       "New sign-in from Firefox on Linux",
@@ -213,7 +213,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      11,
+      "11",
       "Tom Becker",
       "tom@example.com",
       "Lunch on Friday?",
@@ -230,7 +230,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      12,
+      "12",
       "Calendar",
       "calendar@example.com",
       "Invitation: Weekly product review",
@@ -246,7 +246,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      13,
+      "13",
       "You",
       "me@example.com",
       "Re: API naming",
@@ -262,7 +262,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      14,
+      "14",
       "You",
       "me@example.com",
       "September notes",
@@ -278,7 +278,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      15,
+      "15",
       "You",
       "me@example.com",
       "Prototype follow-ups",
@@ -294,7 +294,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      16,
+      "16",
       "You",
       "me@example.com",
       "Weekly notes",
@@ -307,7 +307,7 @@ export function mockEmails(): Email[] {
       ["Turn the open questions into a short checklist for the next review."],
     ),
     email(
-      17,
+      "17",
       "GitHub",
       "notifications@github.com",
       "Release checklist completed",
@@ -323,7 +323,7 @@ export function mockEmails(): Email[] {
       ],
     ),
     email(
-      18,
+      "18",
       "Old Projects",
       "projects@example.com",
       "Expired project notification",

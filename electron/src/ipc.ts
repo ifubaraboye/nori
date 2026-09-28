@@ -21,6 +21,9 @@ export interface Email extends EmailSummary {
   fullDate: string;
   mailbox: Mailbox;
   threadId: string;
+  pinned: boolean;
+  /** Gmail's own label ids, carried so a label toggle can write back. */
+  labelIds: string[];
 }
 
 export interface DraftSeed {
@@ -50,6 +53,9 @@ export type NoriInvokeChannel =
   | "nori:signin"
   | "nori:signout"
   | "nori:sync"
+  | "nori:snapshot"
+  | "nori:modify"
+  | "nori:status"
   | "nori:settings:get"
   | "nori:settings:set";
 
@@ -68,4 +74,25 @@ export interface NoriBridgeApi {
   sync: () => Promise<{ account: string | null }>;
   fetchBody: (id: string) => Promise<string[]>;
   counts: () => Promise<Record<Mailbox, number>>;
+  /** Full account snapshot: every held mail, the cursor, and label counts. */
+  snapshot: () => Promise<Snapshot>;
+  /** Server-side write-backs. Each returns the labels Gmail settled on. */
+  modify: (
+    id: string,
+    add: string[],
+    remove: string[],
+  ) => Promise<{ unread: boolean; starred: boolean }>;
+  archive: (id: string) => Promise<void>;
+  togglePin: (id: string) => Promise<boolean>;
+}
+
+export interface Snapshot {
+  account: string | null;
+  /** True when a first sync is running and mail is still arriving. */
+  syncing: boolean;
+  emails: Email[];
+  historyId?: string;
+  labels: Array<{ id: string; name: string; colour: number }>;
+  /** Gmail label id per Nori label, so assignments survive a restart. */
+  assignments: Array<[string, string[]]>;
 }

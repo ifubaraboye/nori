@@ -61,6 +61,28 @@ export interface NoriBridge {
   signout?: () => Promise<void>;
   settingsGet?: () => Promise<Partial<SettingsState> | null>;
   settingsSet?: (settings: SettingsState) => Promise<SettingsState>;
+  /** Full account snapshot: every held mail, the cursor, and label state. */
+  snapshot?: () => Promise<{
+    account: string | null;
+    syncing: boolean;
+    emails: Array<
+      Email & {
+        pinned: boolean;
+        labelIds: string[];
+      }
+    >;
+    historyId?: string;
+    labels: Array<{ id: string; name: string; colour: number }>;
+    assignments: Array<[string, string[]]>;
+  }>;
+  /** Server-side write-back. Resolves with the labels Gmail settled on. */
+  modify?: (
+    id: string,
+    add: string[],
+    remove: string[],
+  ) => Promise<{ unread: boolean; starred: boolean }>;
+  archive?: (id: string) => Promise<void>;
+  togglePin?: (id: string) => Promise<boolean>;
 }
 
 export type NoriEvent =

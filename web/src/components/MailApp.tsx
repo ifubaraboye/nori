@@ -7,8 +7,8 @@ import {
   type SettingsPage,
 } from "../state/settings";
 import { getNoriBridge } from "../bridge/noriBridge";
-import { notifyOpen, notifySend, notifyToggleStar, useNoriBackend } from "../bridge/backend";
-import { mailboxLabel, type DraftSeed } from "../types/mail";
+import { useHostBackend } from "../bridge/backend";
+import { mailboxLabel, type DraftSeed, type EmailId } from "../types/mail";
 import { clampSidebarWidth, SIDEBAR_DEFAULT_WIDTH, Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { EmailList } from "./EmailList";
@@ -40,7 +40,7 @@ export function MailApp() {
     labelsByEmail,
   } = useMailStore();
   const [settings, setSettings] = useSettings();
-  useNoriBackend();
+  const host = useHostBackend(dispatch as (action: unknown) => void);
   // Host menu "Toggle Sidebar" arrives as a push event under Electron.
   useEffect(() => {
     const bridge = getNoriBridge();
@@ -52,8 +52,6 @@ export function MailApp() {
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [mailboxesCollapsed, setMailboxesCollapsed] = useState(false);
-  const [accountAddress, setAccountAddress] = useState<string | null>(null);
-  const [signingIn, setSigningIn] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   // Compose pane width (mail_app.rs COMPOSE_PANE_WIDTH/MIN/CEILING).
   const [composeWidth, setComposeWidthState] = useState(520);
@@ -74,25 +72,28 @@ export function MailApp() {
     [composeMaxWidth],
   );
 
-  // The connected account, read live like the Rust settings view does.
+  // The account is read from the store, which the host backend keeps current
+  // on every snapshot, rather than tracked in component state.
   useEffect(() => {
-    const bridge = getNoriBridge();
-    if (!bridge?.sync) return;
-    bridge
+    if (!host.live) return;
+    host
       .sync()
-      .then(({ account }) => setAccountAddress(account))
       .catch(() => undefined);
-  }, []);
+  }, [host]);
 
   const closeOverlay = useCallback(() => dispatch({ type: "close-overlay" }), [dispatch]);
   const closeCompose = useCallback(() => dispatch({ type: "close-compose" }), [dispatch]);
 
   const sendCompose = useCallback(
     (draft: DraftSeed) => {
-      notifySend(draft);
-      dispatch({ type: "close-overlay" });
+      // The pane stays open until the send lands, so a failure has somewhere
+      // to show itself rather than silently dropping the draft.
+      host
+        .send(draft)
+        .then(() => dispatch({ type: "close-overlay" }))
+        .catch(() => undefined);
     },
-    [dispatch],
+    [dispatch, host],
   );
 
   const openComposeDefault = useCallback(
@@ -101,7 +102,8 @@ export function MailApp() {
   );
 
   const openEmail = useCallback(
-    (id: number, extra?: { fromSearch?: boolean }) => {
+    (id: EmailId, extra?: { fromSearch?: boolean }) => {
+      const wasUnread = state.emails.find((e) => e.id === id)?.unread ?? false;
       const action: MailAction = extra?.fromSearch
         ? {
             type: "open-email-from-search",
@@ -116,21 +118,21 @@ export function MailApp() {
             openInTab: settings.openInTab,
           };
       dispatch(action);
-      if (settings.markReadOnOpen) notifyOpen(id);
+      if (settings.markReadOnOpen && wasUnread) host.markRead(id);
+      // The body is not in a snapshot: it is fetched the first time a mail is
+      // opened, which is what keeps a large mailbox cheap to list.
+      if (host.live) void host.fetchBody(id);
     },
-    [dispatch, settings.markReadOnOpen, settings.openInTab],
+    [dispatch, host, settings.markReadOnOpen, settings.openInTab, state.emails],
   );
 
   const handleRefresh = useCallback(() => {
-    const bridge = getNoriBridge();
-    if (!bridge?.sync) return;
     setRefreshing(true);
-    bridge
+    host
       .sync()
-      .then(({ account }) => setAccountAddress(account))
       .catch(() => undefined)
       .finally(() => setRefreshing(false));
-  }, []);
+  }, [host]);
 
   const toggleSettings = useCallback(() => {
     dispatch(state.settingsPage == null ? { type: "open-settings" } : { type: "close-settings" });
@@ -148,24 +150,14 @@ export function MailApp() {
   );
 
   const handleSignIn = useCallback(() => {
-    const bridge = getNoriBridge();
-    if (!bridge?.signin) return;
-    setSigningIn(true);
-    bridge
+    host
       .signin()
-      .then((address) => setAccountAddress(address))
-      .catch(() => undefined)
-      .finally(() => setSigningIn(false));
-  }, []);
+      .catch(() => dispatch({ type: "set-account", status: "failed" }));
+  }, [host, dispatch]);
 
   const handleSignOut = useCallback(() => {
-    const bridge = getNoriBridge();
-    if (!bridge?.signout) return;
-    bridge
-      .signout()
-      .then(() => setAccountAddress(null))
-      .catch(() => undefined);
-  }, []);
+    host.signout().catch(() => undefined);
+  }, [host]);
 
   // Global shortcuts (mail_app.rs on_action handlers).
   useEffect(() => {
@@ -294,25 +286,24 @@ export function MailApp() {
   }, [setComposeWidth]);
 
   const tabLabels = tabs
-    .map((id) => {
+    .map((id): { id: EmailId; subject: string } | null => {
       const email = state.emails.find((e) => e.id === id);
       return email ? { id, subject: email.subject } : null;
     })
-    .filter((t): t is { id: number; subject: string } => t !== null);
+    .filter((t): t is { id: EmailId; subject: string } => t !== null);
 
   const settingsOpen = state.settingsPage != null;
   const settingsPage: SettingsPage = state.settingsPage ?? "general";
   const composeOpen = state.overlay === "compose" && !settingsOpen;
-  const account: SettingsAccount = signingIn
-    ? { status: "fetching", address: accountAddress ?? undefined }
-    : accountAddress != null
+  const account: SettingsAccount =
+    state.account === "connected" || state.account === "fetching"
       ? {
-          status: "connected",
-          address: accountAddress,
+          status: state.account,
+          address: state.accountAddress ?? undefined,
           mailCount: state.emails.length,
-          labelCount: 0,
+          labelCount: state.labels.length,
         }
-      : { status: "disconnected" };
+      : { status: state.account };
   const visibleCounts = settings.unreadBadges
     ? counts
     : { inbox: 0, starred: 0, sent: 0, drafts: 0, archive: 0, trash: 0 };
@@ -419,13 +410,26 @@ export function MailApp() {
                           dispatch({ type: "open-compose", seed: replySeed(activeEmail, false, true) })
                         }
                         onTogglePin={() => dispatch({ type: "toggle-pin", id: activeEmail.id })}
-                        onArchive={() =>
+                        onArchive={() => {
+                          if (!host.live) {
+                            dispatch({
+                              type: "request-archive",
+                              id: activeEmail.id,
+                              confirm: settings.confirmBeforeArchive,
+                            });
+                            return;
+                          }
+                          // A confirmed archive confirms locally first, so the
+                          // dialog and the server agree on what happened.
                           dispatch({
                             type: "request-archive",
                             id: activeEmail.id,
                             confirm: settings.confirmBeforeArchive,
-                          })
-                        }
+                          });
+                          if (!settings.confirmBeforeArchive) {
+                            host.archive(activeEmail.id);
+                          }
+                        }}
                       />
                     ) : (
                       <EmailList
@@ -436,8 +440,9 @@ export function MailApp() {
                         onOpenMenu={(id) => dispatch({ type: "open-label-menu", id })}
                         onOpen={(id) => openEmail(id)}
                         onStar={(id) => {
+                          const next = !(state.emails.find((e) => e.id === id)?.starred ?? false);
                           dispatch({ type: "toggle-star", id });
-                          notifyToggleStar(id);
+                          if (host.live) host.star(id, next);
                         }}
                         onSelectIndex={(index) => dispatch({ type: "set-selected-index", index })}
                       />
@@ -508,7 +513,15 @@ export function MailApp() {
           emailId={state.labelMenuFor}
           labels={state.labels}
           assigned={state.assignments.find(([id]) => id === state.labelMenuFor)?.[1] ?? []}
-          onToggle={(labelId) => dispatch({ type: "toggle-label", id: state.labelMenuFor as number, labelId })}
+          onToggle={(labelId) => {
+            const id = state.labelMenuFor as EmailId;
+            const before = state.remoteLabels[id] ?? [];
+            const remote = state.remoteLabelIds[labelId];
+            if (!remote) return;
+            const held = before.includes(remote);
+            dispatch({ type: "toggle-label", id, labelId });
+            host.applyLabels(id, held ? [] : [remote], held ? [remote] : []);
+          }}
           onCreate={(name) => dispatch({ type: "create-label", name })}
           onDismiss={() => dispatch({ type: "close-label-menu" })}
         />
@@ -517,7 +530,11 @@ export function MailApp() {
       {state.confirmArchive != null && (
         <ConfirmDialog
           subject={state.emails.find((e) => e.id === state.confirmArchive)?.subject ?? ""}
-          onConfirm={() => dispatch({ type: "confirm-archive" })}
+          onConfirm={() => {
+            const id = state.confirmArchive as EmailId;
+            dispatch({ type: "confirm-archive" });
+            if (host.live) host.archive(id);
+          }}
           onCancel={() => dispatch({ type: "cancel-archive" })}
         />
       )}

@@ -6,7 +6,13 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { NORI_PROTOCOL_VERSION, type EmailSummary, type Mailbox } from "./ipc.js";
+import {
+  NORI_PROTOCOL_VERSION,
+  type Email,
+  type EmailSummary,
+  type Mailbox,
+  type Snapshot,
+} from "./ipc.js";
 import { discoverCredentials, FileTokenStore, LastAccount } from "./backend/auth/token.js";
 import { beginAuth, awaitCallback, exchange } from "./backend/auth/oauth.js";
 import { Sync, type RemoteMail } from "./backend/gmail/sync.js";
@@ -25,10 +31,15 @@ const isDev = process.argv.includes("--dev") || process.env.NORI_DEV === "1";
 interface AppState {
   window: BrowserWindow | null;
   emails: Map<string, UiEmail>;
-  labels: Array<{ id: number; name: string; colour: number }>;
+  /** Gmail label id -> Nori label, as the server knows them. */
+  labels: Array<{ id: string; name: string; colour: number }>;
   account: string | null;
   historyId?: string;
   settings: ReturnType<typeof defaultSettings>;
+  /** True while a first or incremental sync is running. */
+  syncing: boolean;
+  /** Mail id -> the non-system Gmail label ids it carries. */
+  labelAssignments: Map<string, string[]>;
 }
 
 const state: AppState = {
@@ -38,6 +49,8 @@ const state: AppState = {
   account: null,
   historyId: undefined,
   settings: defaultSettings(),
+  syncing: false,
+  labelAssignments: new Map(),
 };
 
 function userDataDir(): string {
@@ -70,6 +83,43 @@ function summaries(emails: UiEmail[]): EmailSummary[] {
   }));
 }
 
+/** Gmail's own labels for a mail: what write-backs are computed against. */
+function remoteLabelsOf(id: string): string[] {
+  const email = state.emails.get(id);
+  if (!email) return [];
+  const system = new Set(["INBOX", "UNREAD", "STARRED", "SENT", "DRAFT", "TRASH", "SPAM", "CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "CATEGORY_FORUMS"]);
+  const fromIndex = state.labelAssignments.get(id) ?? [];
+  const fromMail = (email as UiEmail & { labelIds?: string[] }).labelIds ?? [];
+  return [...new Set([...fromIndex, ...fromMail])].filter((l) => !system.has(l));
+}
+
+/** The full renderer snapshot. One call replaces six per-mailbox round-trips. */
+function snapshot(): Snapshot {
+  return {
+    account: state.account,
+    syncing: state.syncing,
+    emails: [...state.emails.values()].map((email): Email => ({
+      id: email.id,
+      sender: email.sender,
+      subject: email.subject,
+      preview: email.preview,
+      timestamp: email.timestamp,
+      unread: email.unread,
+      starred: email.starred,
+      address: email.address,
+      recipients: email.recipients,
+      fullDate: email.fullDate,
+      mailbox: email.mailbox,
+      threadId: email.threadId,
+      pinned: (email as UiEmail & { pinned?: boolean }).pinned ?? false,
+      labelIds: remoteLabelsOf(email.id),
+    })),
+    historyId: state.historyId,
+    labels: state.labels,
+    assignments: [...state.labelAssignments.entries()],
+  };
+}
+
 function visibleEmails(mailbox: Mailbox): UiEmail[] {
   const all = [...state.emails.values()];
   if (mailbox === "starred") return all.filter((e) => e.starred);
@@ -93,8 +143,8 @@ function saveIndex(): void {
   const current: MailIndex = {
     account: state.account,
     emails: emails.map((e) => ({ ...e, mailbox: e.mailbox })),
-    labels: state.labels,
-    assignments: [],
+    labels: state.labels.map((l) => ({ id: Number(l.id) || 0, name: l.name, colour: l.colour })),
+    assignments: [...state.labelAssignments.entries()].map(([id, labels]) => [id, labels]),
     historyId: state.historyId,
   };
   const cache = indexCacheFor(state.account);
@@ -121,28 +171,76 @@ async function restoreFromDisk(): Promise<void> {
         threadId: email.threadId ?? "",
       });
     }
-    state.labels = index.labels ?? [];
+    state.labels = (index.labels ?? []).map((l) => ({ id: String(l.id), name: l.name, colour: l.colour }));
     state.historyId = index.historyId;
+    state.labelAssignments = new Map(index.assignments ?? []);
   }
+}
+
+/** A Sync bound to the connected account, or null when there is none. */
+function syncForAccount(): Sync | null {
+  if (!state.account) return null;
+  return Sync.load(discoverCredentials(), tokenStoreFor(state.account));
+}
+
+/**
+ * One write-back path for every server-side change: star, archive, mark read,
+ * and label toggles all go through here so a single place settles local state
+ * from what Gmail actually accepted.
+ */
+async function modifyLabels(
+  id: string,
+  add: string[],
+  remove: string[],
+): Promise<{ unread: boolean; starred: boolean }> {
+  const email = state.emails.get(id);
+  if (!email) return { unread: false, starred: false };
+  const sync = syncForAccount();
+  if (sync) await sync.modify(id, add, remove);
+  if (add.includes("STARRED")) email.starred = true;
+  if (remove.includes("STARRED")) email.starred = false;
+  if (remove.includes("UNREAD")) email.unread = false;
+  if (add.includes("UNREAD")) email.unread = true;
+  // Removing INBOX is what archiving is: the mail leaves the mailbox and
+  // nothing else about it changes, which is why there is no delete beside it.
+  if (remove.includes("INBOX")) email.mailbox = "archive";
+  const held = remoteLabelsOf(id);
+  state.labelAssignments.set(id, held);
+  saveIndex();
+  return { unread: email.unread, starred: email.starred };
 }
 
 async function fullSync(): Promise<void> {
   if (!state.account) return;
-  const credentials = discoverCredentials();
-  const sync = Sync.load(credentials, tokenStoreFor(state.account));
-  const snapshot = await sync.full();
-  state.account = snapshot.account;
-  state.historyId = snapshot.historyId;
-  state.emails.clear();
-  for (const remote of snapshot.mail) {
-    const ui = toUiEmail(remote, snapshot.account);
-    state.emails.set(ui.id, ui);
-  }
-  state.labels = snapshot.labels.map((l, i) => ({ id: i + 1, name: l.name, colour: l.colour }));
-  new LastAccount(join(userDataDir(), "last-account")).save(snapshot.account);
-  saveIndex();
+  state.syncing = true;
   emit({ type: "emails-changed" });
+  try {
+    const sync = syncForAccount();
+    if (!sync) return;
+    const snap = await sync.full();
+    state.account = snap.account;
+    state.historyId = snap.historyId;
+    state.emails.clear();
+    state.labelAssignments.clear();
+    for (const remote of snap.mail) {
+      const ui = toUiEmail(remote, snap.account);
+      state.emails.set(ui.id, ui);
+      const custom = remote.labelIds.filter((l) => !SYSTEM_LABELS.has(l));
+      if (custom.length > 0) state.labelAssignments.set(ui.id, custom);
+    }
+    state.labels = snap.labels.map((l) => ({ id: l.id, name: l.name, colour: l.colour }));
+    new LastAccount(join(userDataDir(), "last-account")).save(snap.account);
+    saveIndex();
+  } finally {
+    state.syncing = false;
+    emit({ type: "emails-changed" });
+  }
 }
+
+const SYSTEM_LABELS = new Set([
+  "INBOX", "UNREAD", "STARRED", "SENT", "DRAFT", "TRASH", "SPAM",
+  "CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "CATEGORY_FORUMS",
+]);
 
 async function incrementalSync(): Promise<void> {
   if (!state.account || !state.historyId) {
@@ -150,8 +248,8 @@ async function incrementalSync(): Promise<void> {
     return;
   }
   try {
-    const credentials = discoverCredentials();
-    const sync = Sync.load(credentials, tokenStoreFor(state.account));
+    const sync = syncForAccount();
+    if (!sync) return;
     const result = await sync.incremental(state.historyId);
     if (!result) {
       await fullSync();
@@ -160,8 +258,13 @@ async function incrementalSync(): Promise<void> {
     for (const remote of result.changed) {
       const ui = toUiEmail(remote, state.account);
       state.emails.set(ui.id, ui);
+      const custom = remote.labelIds.filter((l) => !SYSTEM_LABELS.has(l));
+      state.labelAssignments.set(ui.id, custom);
     }
-    for (const id of result.deleted) state.emails.delete(id);
+    for (const id of result.deleted) {
+      state.emails.delete(id);
+      state.labelAssignments.delete(id);
+    }
     state.historyId = result.historyId ?? state.historyId;
     saveIndex();
     emit({ type: "emails-changed" });
@@ -173,41 +276,58 @@ async function incrementalSync(): Promise<void> {
 function registerIpc(): void {
   ipcMain.handle("nori:list", (_event, mailbox: Mailbox) => summaries(visibleEmails(mailbox)));
   ipcMain.handle("nori:get", (_event, id: string) => state.emails.get(id) ?? null);
+  ipcMain.handle("nori:snapshot", () => snapshot());
+  ipcMain.handle("nori:status", () => ({
+    account: state.account,
+    syncing: state.syncing,
+    settings: state.settings,
+  }));
+
+  // Every server-side change goes through one handler, so local state is
+  // settled from what Gmail accepted rather than from what was asked for.
+  ipcMain.handle("nori:modify", (_event, id: string, add: string[], remove: string[]) =>
+    modifyLabels(id, add ?? [], remove ?? []),
+  );
+  ipcMain.handle("nori:archive", async (_event, id: string) => {
+    await modifyLabels(id, [], ["INBOX"]);
+    emit({ type: "emails-changed" });
+  });
+  // Pinning is local — Gmail has no such concept — so it is answered from the
+  // cache the renderer already holds rather than pretended server-side.
+  ipcMain.handle("nori:togglePin", async (_event, id: string) => {
+    const email = state.emails.get(id);
+    if (!email) return false;
+    const pinned = !((email as UiEmail & { pinned?: boolean }).pinned ?? false);
+    (email as UiEmail & { pinned?: boolean }).pinned = pinned;
+    saveIndex();
+    return pinned;
+  });
+
   ipcMain.handle("nori:open", async (_event, id: string) => {
     const email = state.emails.get(id);
     if (!email) return;
-    if (state.settings.markReadOnOpen && email.unread && state.account) {
-      email.unread = false;
-      try {
-        const credentials = discoverCredentials();
-        const sync = Sync.load(credentials, tokenStoreFor(state.account));
-        await sync.modify(id, [], ["UNREAD"]);
-      } catch { /* offline: local state still updated */ }
-      saveIndex();
+    if (state.settings.markReadOnOpen && email.unread) {
+      await modifyLabels(id, [], ["UNREAD"]);
       emit({ type: "emails-changed" });
     }
   });
   ipcMain.handle("nori:toggleStar", async (_event, id: string) => {
     const email = state.emails.get(id);
     if (!email) return false;
-    email.starred = !email.starred;
-    if (state.account) {
-      try {
-        const credentials = discoverCredentials();
-        const sync = Sync.load(credentials, tokenStoreFor(state.account));
-        await sync.modify(id, email.starred ? ["STARRED"] : [], email.starred ? [] : ["STARRED"]);
-      } catch { /* offline */ }
-      saveIndex();
-    }
+    const settled = await modifyLabels(
+      id,
+      email.starred ? [] : ["STARRED"],
+      email.starred ? ["STARRED"] : [],
+    );
     emit({ type: "emails-changed" });
-    return email.starred;
+    return settled.starred;
   });
   ipcMain.handle("nori:search", async (_event, query: string) => {
     const local = [...state.emails.values()].filter((e) => emailMatches(e, query));
     if (!state.account || !query.trim()) return summaries(local);
     try {
-      const credentials = discoverCredentials();
-      const sync = Sync.load(credentials, tokenStoreFor(state.account));
+      const sync = syncForAccount();
+      if (!sync) return summaries(local);
       const remotes: RemoteMail[] = await sync.fetch(query, 100);
       return summaries(remotes.map((r) => toUiEmail(r, state.account as string)));
     } catch {
@@ -215,16 +335,14 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle("nori:send", async (_event, draft: { to: string; subject: string; body: string }) => {
-    if (!state.account) throw new Error("not signed in");
-    const credentials = discoverCredentials();
-    const sync = Sync.load(credentials, tokenStoreFor(state.account));
+    const sync = syncForAccount();
+    if (!sync) throw new Error("not signed in");
     await sync.send(draft.to, draft.subject, draft.body, []);
   });
   ipcMain.handle("nori:fetchBody", async (_event, id: string) => {
-    if (!state.account) return [];
+    const sync = syncForAccount();
+    if (!sync) return [];
     try {
-      const credentials = discoverCredentials();
-      const sync = Sync.load(credentials, tokenStoreFor(state.account));
       const bodies = await sync.bodies([id]);
       return bodies[0]?.[1] ?? [];
     } catch {
@@ -232,9 +350,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle("nori:counts", () => {
-    const all = [...state.emails.values()];
     const count = (mailbox: Mailbox): number => visibleEmails(mailbox).length;
-    void all;
     return {
       inbox: count("inbox"),
       starred: count("starred"),
@@ -252,16 +368,16 @@ function registerIpc(): void {
   ipcMain.handle("nori:signin", async () => {
     const credentials = discoverCredentials();
     const request = beginAuth(credentials);
-    // Fire-and-forget the callback wait; open the browser immediately.
+    // The callback wait is the slow part; open the browser immediately so the
+    // user is not staring at a frozen window while it binds.
     const codePromise = awaitCallback(request);
     await shell.openExternal(request.url);
     const code = await codePromise;
     const token = await exchange(credentials, request.redirectUri, code, request.verifier);
-    // Profile lookup determines the account address for the token filename.
+    // The profile lookup names the account, which is the token file's name.
     const { profile } = await import("./backend/gmail/gmail.js");
     const prof = await profile(token.accessToken);
-    const store = tokenStoreFor(prof.email || "default");
-    store.save(token);
+    tokenStoreFor(prof.email || "default").save(token);
     state.account = prof.email;
     new LastAccount(join(userDataDir(), "last-account")).save(prof.email);
     await fullSync();
@@ -277,6 +393,7 @@ function registerIpc(): void {
     state.emails.clear();
     state.labels = [];
     state.historyId = undefined;
+    state.labelAssignments.clear();
     emit({ type: "account-changed", address: null });
   });
   ipcMain.handle("nori:settings:get", () => state.settings);
@@ -286,15 +403,14 @@ function registerIpc(): void {
     return state.settings;
   });
 
-  // Unused today but reserved for parity with the Rust mailbox fetches.
+  void NORI_PROTOCOL_VERSION;
+  void homedir;
+  void dialog;
   void gmailQuery;
   void mailboxOf;
   void bodyParagraphs;
   void plainText;
   void parseHtmlBody;
-  void NORI_PROTOCOL_VERSION;
-  void homedir;
-  void dialog;
 }
 
 function setAppMenus(): void {

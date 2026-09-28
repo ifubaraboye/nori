@@ -13,6 +13,7 @@ import {
   type WorkspaceView,
 } from "../types/mail";
 import type { SettingsPage } from "./settings";
+import type { AccountStatus } from "../types/mail";
 
 export interface MailState {
   emails: Email[];
@@ -40,6 +41,17 @@ export interface MailState {
   labelMenuFor: EmailId | null;
   /** Sidebar label filter, or null when the filter is off. */
   labelFilter: LabelId | null;
+  /** Whether the account is connected, and what it is doing (account.rs). */
+  account: AccountStatus;
+  accountAddress: string | null;
+  /** True while the host is fetching; the list shows mail as it arrives. */
+  syncing: boolean;
+  /** Bodies not yet fetched, keyed by mail id (mail.rs body_loaded). */
+  bodies: Record<EmailId, string[]>;
+  /** Gmail label ids the mail carries, for write-back on label changes. */
+  remoteLabels: Record<EmailId, string[]>;
+  /** Gmail label id behind each local label, so a toggle can write back. */
+  remoteLabelIds: Record<LabelId, string>;
 }
 
 export interface NavEntry {
@@ -93,7 +105,21 @@ export type MailAction =
   | { type: "rename-label"; labelId: LabelId; name: string }
   | { type: "remove-label"; labelId: LabelId }
   | { type: "set-colour"; labelId: LabelId; colour: number }
-  | { type: "filter-by-label"; labelId: LabelId | null };
+  | { type: "filter-by-label"; labelId: LabelId | null }
+  | { type: "set-account"; status: AccountStatus; address?: string | null }
+  | { type: "set-syncing"; syncing: boolean }
+  | {
+      type: "load-snapshot";
+      emails: Email[];
+      labels: Label[];
+      /** Mail id -> the *Gmail* label ids it carries, straight from the host. */
+      assignments: Array<[EmailId, string[]]>;
+      remoteLabels: Record<EmailId, string[]>;
+      remoteLabelIds: Record<LabelId, string>;
+    }
+  | { type: "load-body"; id: EmailId; body: string[] }
+  | { type: "apply-labels"; id: EmailId; unread?: boolean; starred?: boolean }
+  | { type: "restore-remote-labels"; id: EmailId; remote: string[] };
 
 export function visibleEmails(emails: Email[], mailbox: Mailbox): Email[] {
   return emails.filter((email) => {
@@ -127,6 +153,12 @@ function initialState(): MailState {
     nextLabelId: 1,
     labelMenuFor: null,
     labelFilter: null,
+    account: "disconnected",
+    accountAddress: null,
+    syncing: false,
+    bodies: {},
+    remoteLabels: {},
+    remoteLabelIds: {},
   };
 }
 
@@ -474,6 +506,71 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
         ...state,
         labelFilter: state.labelFilter === action.labelId ? null : action.labelId,
       };
+    case "set-account":
+      return {
+        ...state,
+        account: action.status,
+        accountAddress:
+          action.address !== undefined ? action.address : state.accountAddress,
+      };
+    case "set-syncing":
+      return { ...state, syncing: action.syncing };
+    case "load-snapshot": {
+      // The host knows read/star state but nothing about pinning, which is
+      // local, so a pinned flag is carried across the refresh rather than
+      // overwritten. Pinned mail the host no longer lists is kept too, so a
+      // tab that is open does not vanish from under the reader.
+      const incoming = new Map(action.emails.map((e) => [e.id, e]));
+      const merged = action.emails.map((email) => {
+        const previous = state.emails.find((e) => e.id === email.id);
+        return previous ? { ...email, pinned: previous.pinned } : email;
+      });
+      const orphans = state.emails.filter((e) => e.pinned && !incoming.has(e.id));
+      // Gmail label ids and Nori's local ids are different namespaces, and
+      // this is the one place holding both sides of the mapping, so the
+      // translation happens here rather than in the renderer.
+      const toLocal = new Map<string, LabelId>();
+      for (const [local, remote] of Object.entries(action.remoteLabelIds)) {
+        toLocal.set(remote, Number(local) as LabelId);
+      }
+      return {
+        ...state,
+        emails: [...merged, ...orphans],
+        labels: action.labels,
+        assignments: action.assignments
+          .map(
+            ([id, remotes]): [EmailId, LabelId[]] => [
+              id,
+              remotes
+                .map((remote) => toLocal.get(remote))
+                .filter((local): local is LabelId => local !== undefined),
+            ],
+          )
+          .filter(([, held]) => held.length > 0),
+        remoteLabels: action.remoteLabels,
+        remoteLabelIds: action.remoteLabelIds,
+      };
+    }
+    case "load-body":
+      return { ...state, bodies: { ...state.bodies, [action.id]: action.body } };
+    case "apply-labels":
+      return {
+        ...state,
+        emails: state.emails.map((e) =>
+          e.id === action.id
+            ? {
+                ...e,
+                unread: action.unread ?? e.unread,
+                starred: action.starred ?? e.starred,
+              }
+            : e,
+        ),
+      };
+    case "restore-remote-labels":
+      return {
+        ...state,
+        remoteLabels: { ...state.remoteLabels, [action.id]: action.remote },
+      };
     case "open-search":
       return { ...state, overlay: "search" };
     case "open-compose": {
@@ -557,18 +654,25 @@ export function replySeed(email: Email, replyAll: boolean, forward: boolean): Dr
   return { to, subject, body };
 }
 
+/** A mail with its fetched body attached, for the reading view. */
+export function withBody(state: MailState, email: Email): Email {
+  const body = state.bodies[email.id];
+  return body ? { ...email, body } : email;
+}
+
 export interface MailStoreApi {
   state: MailState;
   dispatch: Dispatch<MailAction>;
   visible: Email[];
   summaries: EmailSummary[];
   selectedEmail: Email | null;
-  activeEmail: Email | null;
   counts: Record<Mailbox, number>;
   /** Pinned tabs, then the preview tab last (email_tabs.rs order). */
   tabs: EmailId[];
   previewTab: EmailId | null;
   labelsByEmail: Map<EmailId, Label[]>;
+  /** The open mail with its fetched body attached, when one has arrived. */
+  activeEmail: Email | null;
 }
 
 /** Chip colours: solid text over a translucent wash of the same hue. */
@@ -596,10 +700,9 @@ export function useMailStore(): MailStoreApi {
     const summaries = shown.map(emailSummary);
     const selectedEmail = shown[state.selectedIndex] ?? null;
     const view = state.workspaceView;
-    const activeEmail =
-      view.kind === "email"
-        ? (state.emails.find((e) => e.id === view.id) ?? null)
-        : null;
+    const opened =
+      view.kind === "email" ? (state.emails.find((e) => e.id === view.id) ?? null) : null;
+    const activeEmail = opened ? withBody(state, opened) : null;
     // Preview first, then pinned tabs: the strip reads "what is open, then
     // what is kept", with the provisional tab last and in italics.
     const previewTab =

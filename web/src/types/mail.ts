@@ -1,6 +1,11 @@
 // Port of crates/nori-ui/src/model/mail.rs (types only, no GPUI).
 
-export type EmailId = number;
+/**
+ * Gmail message ids are strings. The mock data uses the same shape ("1",
+ * "2", …) so a single store serves both the standalone web build and the
+ * Electron host without a second id type.
+ */
+export type EmailId = string;
 
 export type Mailbox = "inbox" | "starred" | "sent" | "drafts" | "archive" | "trash";
 
@@ -57,6 +62,14 @@ export interface EmailSummary {
   starred: boolean;
   threadCount: number;
 }
+
+export type AccountStatus =
+  | "disconnected"
+  | "connecting"
+  | "fetching"
+  | "connected"
+  | "needsReauth"
+  | "failed";
 
 export function emailSummary(email: Email): EmailSummary {
   return {

@@ -1,60 +1,150 @@
-// Renderer-side backend adapter: uses window.nori when running inside
-// Electron, otherwise stays on the in-memory mock store.
+// Host-backed store: Gmail data and every write-back.
 //
-// Phase 1 (this port): local reducer remains the source of truth so the UI
-// works standalone AND inside Electron. Host calls are fire-and-forget
-// mirrors (open/star/send/sync) plus a liveness subscription that re-syncs
-// the host on push events. A full host-backed store adapter can replace the
-// reducer later without changing components.
-import { useEffect } from "react";
-import { getNoriBridge } from "./noriBridge";
+// The reducer stays the single source of truth so components are unchanged
+// whether the app runs standalone on mock data or inside Electron. This module
+// is the seam: it pulls snapshots from the host, pushes the write-backs the
+// Rust app made (star, archive, mark read, label modify), and keeps the local
+// store in step with push events.
+import { useCallback, useEffect, useRef } from "react";
+import { getNoriBridge, type NoriBridge } from "./noriBridge";
+import type { LabelId } from "../state/store";
+import type { DraftSeed, Email, EmailId } from "../types/mail";
 
 export function isElectron(): boolean {
-  return getNoriBridge() !== null;
+  return getNoriBridge() != null;
 }
 
-export function useNoriBackend(): void {
+export interface HostBackend {
+  /** True when the host bridge is present and mail comes from Gmail. */
+  live: boolean;
+  refresh: () => Promise<void>;
+  /** Clear UNREAD. Only called for mail the user has not read. */
+  markRead: (id: EmailId) => void;
+  star: (id: EmailId, starred: boolean) => void;
+  /** Remove INBOX. Archiving is that and nothing more. */
+  archive: (id: EmailId) => void;
+  /** Write a label toggle back, given the mail's current Gmail labels. */
+  applyLabels: (
+    id: EmailId,
+    addedRemote: string[],
+    removedRemote: string[],
+  ) => void;
+  fetchBody: (id: EmailId) => Promise<string[]>;
+  search: (query: string) => Promise<Email[]>;
+  send: (draft: DraftSeed) => Promise<void>;
+  signin: () => Promise<void>;
+  signout: () => Promise<void>;
+  sync: () => Promise<void>;
+}
+
+type Dispatch = (action: unknown) => void;
+
+/**
+ * Wire the host to the store. Returns the backend for imperative calls, and
+ * pulls a snapshot on mount and whenever the host says something changed.
+ */
+export function useHostBackend(dispatch: Dispatch): HostBackend {
+  const bridgeRef = useRef<NoriBridge | null>(getNoriBridge());
+  const live = bridgeRef.current != null;
+
+  const refresh = useCallback(async () => {
+    const bridge = bridgeRef.current;
+    if (!bridge?.snapshot) return;
+    const snap = await bridge.snapshot();
+    // Local label ids are the snapshot's own order; the reducer holds the
+    // remote-to-local mapping, so only the forward direction travels.
+    const localToRemote: Record<LabelId, string> = {};
+    snap.labels.forEach((label, index) => {
+      localToRemote[(index + 1) as LabelId] = label.id;
+    });
+    dispatch({
+      type: "load-snapshot",
+      emails: snap.emails as Email[],
+      labels: snap.labels.map((label, index) => ({
+        id: (index + 1) as LabelId,
+        name: label.name,
+        colour: label.colour,
+      })),
+      assignments: snap.assignments,
+      remoteLabels: Object.fromEntries(snap.emails.map((e) => [e.id, e.labelIds ?? []])),
+      remoteLabelIds: localToRemote,
+    });
+    dispatch({ type: "set-syncing", syncing: snap.syncing });
+    dispatch({
+      type: "set-account",
+      status: snap.account ? "connected" : "disconnected",
+      address: snap.account,
+    });
+  }, [dispatch]);
+
   useEffect(() => {
-    const bridge = getNoriBridge();
+    const bridge = bridgeRef.current;
     if (!bridge) return;
     let cancelled = false;
-    (async () => {
-      try {
-        await bridge.sync?.();
-      } catch {
-        // Offline first run: mock store stays visible.
-      }
-    })();
-    const unsubscribe = bridge.subscribe(() => {
+    refresh().catch(() => undefined);
+    const unsubscribe = bridge.subscribe((event) => {
       if (cancelled) return;
-      bridge
-        .sync?.()
-        .catch(() => undefined);
+      if (event.type === "emails-changed" || event.type === "account-changed") {
+        refresh().catch(() => undefined);
+      }
     });
     return () => {
       cancelled = true;
       unsubscribe();
     };
-  }, []);
-}
+  }, [refresh]);
 
-/** Mirror a local open to the host (marks read server-side). */
-export function notifyOpen(id: number | string): void {
-  try {
-    void getNoriBridge()?.open(String(id));
-  } catch { /* standalone */ }
-}
+  const modify = useCallback(
+    (id: EmailId, add: string[], remove: string[]) =>
+      bridgeRef.current?.modify?.(id, add, remove),
+    [],
+  );
 
-/** Mirror a local star toggle to the host. */
-export function notifyToggleStar(id: number | string): void {
-  try {
-    void getNoriBridge()?.toggleStar(String(id));
-  } catch { /* standalone */ }
-}
-
-/** Mirror a local send to the host. */
-export function notifySend(draft: { to: string; subject: string; body: string }): void {
-  try {
-    void getNoriBridge()?.send(draft);
-  } catch { /* standalone */ }
+  return {
+    live,
+    refresh,
+    markRead(id) {
+      void modify(id, [], ["UNREAD"]);
+    },
+    star(id, starred) {
+      void modify(id, starred ? ["STARRED"] : [], starred ? [] : ["STARRED"])?.then((settled) =>
+        dispatch({ type: "apply-labels", id, ...settled }),
+      );
+    },
+    archive(id) {
+      void modify(id, [], ["INBOX"]);
+    },
+    applyLabels(id, addedRemote, removedRemote) {
+      void modify(id, addedRemote, removedRemote);
+    },
+    async fetchBody(id) {
+      const body = (await bridgeRef.current?.fetchBody?.(id)) ?? [];
+      if (body.length > 0) dispatch({ type: "load-body", id, body });
+      return body;
+    },
+    async search(query) {
+      const bridge = bridgeRef.current;
+      if (!bridge?.search) return [];
+      // The search endpoint answers with summaries; the reading view fills
+      // the rest in from the snapshot when one of them is opened.
+      return (await bridge.search(query)) as unknown as Email[];
+    },
+    async send(draft) {
+      await bridgeRef.current?.send(draft);
+    },
+    async signin() {
+      dispatch({ type: "set-account", status: "connecting" });
+      const address = await bridgeRef.current?.signin?.();
+      dispatch({ type: "set-account", status: "fetching", address });
+      await refresh();
+    },
+    async signout() {
+      await bridgeRef.current?.signout?.();
+      dispatch({ type: "set-account", status: "disconnected", address: null });
+    },
+    async sync() {
+      await bridgeRef.current?.sync?.();
+      await refresh();
+    },
+  };
 }

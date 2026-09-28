@@ -1,7 +1,7 @@
 // Electron preload: exposes the versioned window.nori bridge (context-isolated).
 // Port of the contract in web/src/bridge/noriBridge.ts, now implemented.
 import { contextBridge, ipcRenderer } from "electron";
-import type { DraftSeed, Email, EmailSummary, Mailbox, NoriEvent } from "./ipc.js";
+import type { DraftSeed, Email, EmailSummary, Mailbox, NoriEvent, Snapshot } from "./ipc.js";
 import { NORI_PROTOCOL_VERSION } from "./ipc.js";
 
 /** Same camelCase keys as the renderer's SettingsState (state/settings.ts). */
@@ -34,6 +34,11 @@ const api = {
   sync: () => invoke<{ account: string | null }>("nori:sync"),
   fetchBody: (id: string) => invoke<string[]>("nori:fetchBody", id),
   counts: () => invoke<Record<Mailbox, number>>("nori:counts"),
+  snapshot: () => invoke<Snapshot>("nori:snapshot"),
+  modify: (id: string, add: string[], remove: string[]) =>
+    invoke<{ unread: boolean; starred: boolean }>("nori:modify", id, add, remove),
+  archive: (id: string) => invoke<void>("nori:archive", id),
+  togglePin: (id: string) => invoke<boolean>("nori:togglePin", id),
   settingsGet: () => invoke<Partial<HostSettings> | null>("nori:settings:get"),
   settingsSet: (settings: HostSettings) =>
     invoke<HostSettings>("nori:settings:set", settings),
