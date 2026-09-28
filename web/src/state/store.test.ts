@@ -310,6 +310,42 @@ describe("host snapshot", () => {
     expect(s.remoteLabelIds[2]).toBe("Label_9");
   });
 
+  test("the sample mail does not survive a real snapshot", () => {
+    // The bug this covers: a signed-in user saw the eighteen fabricated
+    // messages sitting in the list next to their own mail, because the
+    // snapshot only merged rather than replaced.
+    let s = base();
+    s = mailReducer(s, {
+      type: "load-snapshot",
+      emails: [makeEmail("g1", "Real", "Real mail", "inbox", true)],
+      labels: [],
+      assignments: [],
+      remoteLabels: {},
+      remoteLabelIds: {},
+    });
+    expect(s.emails.map((e) => e.subject)).toEqual(["Real mail"]);
+    expect(s.emails.some((e) => e.subject === "One")).toBe(false);
+  });
+
+  test("a snapshot drops tabs and the open view for mail it no longer lists", () => {
+    let s = base();
+    s = mailReducer(s, { type: "open-email", id: ONE, openInTab: true });
+    s = mailReducer(s, { type: "toggle-pin", id: ONE });
+    expect(s.tabs).toEqual([ONE]);
+    s = mailReducer(s, {
+      type: "load-snapshot",
+      emails: [makeEmail("g1", "Real", "Real mail", "inbox")],
+      labels: [],
+      assignments: [],
+      remoteLabels: {},
+      remoteLabelIds: {},
+    });
+    // ONE was pinned, so it survives as a tab; the preview cursor for a mail
+    // the server dropped does not.
+    expect(s.previewTab).toBeNull();
+    expect(s.workspaceView.kind).toBe("mailbox");
+  });
+
   test("settled labels from the server win over the optimistic guess", () => {
     let s = base();
     s = mailReducer(s, { type: "toggle-star", id: ONE });

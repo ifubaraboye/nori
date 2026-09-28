@@ -14,7 +14,7 @@ import {
   type Snapshot,
 } from "./ipc.js";
 import { discoverCredentials, FileTokenStore, LastAccount } from "./backend/auth/token.js";
-import { beginAuth, awaitCallback, exchange } from "./backend/auth/oauth.js";
+import { beginAuth, exchange } from "./backend/auth/oauth.js";
 import { Sync, type RemoteMail } from "./backend/gmail/sync.js";
 import { IndexCache, mayReplaceIndex, type MailIndex } from "./backend/gmail/cache.js";
 import { gmailQuery, mailboxOf, toUiEmail, type UiEmail } from "./backend/gmail/account.js";
@@ -397,10 +397,10 @@ function registerIpc(): void {
   ipcMain.handle("nori:account", () => state.account);
   ipcMain.handle("nori:signin", async () => {
     const credentials = discoverCredentials();
-    const request = beginAuth(credentials);
-    // The callback wait is the slow part; open the browser immediately so the
-    // user is not staring at a frozen window while it binds.
-    const codePromise = awaitCallback(request);
+    // The listener is bound before the browser opens, because the port has to
+    // appear in the redirect URI the browser is sent to.
+    const { request, redirect } = await beginAuth(credentials);
+    const codePromise = redirect.awaitCallback(request.state);
     await shell.openExternal(request.url);
     const code = await codePromise;
     const token = await exchange(credentials, request.redirectUri, code, request.verifier);

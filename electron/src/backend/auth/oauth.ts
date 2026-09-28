@@ -4,6 +4,7 @@
 // await single callback -> exchange code. The secret never appears in the URL,
 // PKCE binds the attempt, state ties the callback to it.
 
+import { createServer, type Server } from "node:http";
 import { generatePkce, type Pkce } from "./pkce.js";
 import { textWithStatus, detailOf } from "../gmail/http.js";
 import { unixNow, type Token } from "./token.js";
@@ -24,8 +25,6 @@ export interface AuthorizationRequest {
   redirectUri: string;
   verifier: string;
   state: string;
-  /** Ports are OS-assigned; the server is created lazily by awaitCallback. */
-  port: number;
 }
 
 interface TokenResponse {
@@ -36,13 +35,137 @@ interface TokenResponse {
   token_type?: string;
 }
 
-export function beginAuth(credentials: Credentials): AuthorizationRequest {
+/**
+ * A loopback listener, already bound, so the redirect URI is known before the
+ * browser is ever launched.
+ *
+ * Port 0 lets the OS pick a free port. That is not a workaround: Google's
+ * loopback redirect matching ignores the port, so a range of them is correct
+ * and a fixed one would just invite collisions. Binding first is required,
+ * because the port has to appear in the redirect URI the browser is sent to.
+ */
+export class LoopbackRedirect {
+  private constructor(
+    private readonly server: Server,
+    readonly redirectUri: string,
+  ) {}
+
+  static async bind(): Promise<LoopbackRedirect> {
+    const server = createServer();
+    const port = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        if (address == null || typeof address === "string") {
+          reject(new Error("the loopback listener bound an unexpected address"));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+    return new LoopbackRedirect(server, `http://127.0.0.1:${port}`);
+  }
+
+  /**
+   * Serve exactly one request, checking the callback against this attempt's
+   * own state. Gives up after {@link CALLBACK_TIMEOUT_MS}: without a deadline
+   * an abandoned sign-in leaves the process holding the socket forever.
+   */
+  awaitCallback(expectedState: string, onReady?: () => void): Promise<string> {
+    const server = this.server;
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        server.close();
+        fn();
+      };
+
+      const timer = setTimeout(() => {
+        finish(() =>
+          reject(
+            new Error(
+              `timed out after ${CALLBACK_TIMEOUT_MS / 1000}s waiting for the browser to return`,
+            ),
+          ),
+        );
+      }, CALLBACK_TIMEOUT_MS);
+      // The deadline is cleared when a request lands; without this it would
+      // hold the process open for five minutes after a completed sign-in.
+      timer.unref?.();
+
+      // An abandoned sign-in must not keep the process alive on its own.
+      server.unref();
+
+      server.on("error", (err) => {
+        finish(() =>
+          reject(new Error(`the loopback listener on ${this.redirectUri} failed: ${err.message}`)),
+        );
+      });
+
+      // The request line carries the whole query string, and one request is
+      // served, so the connection closes immediately afterwards.
+      server.on("request", (req, res) => {
+        const target = req.url ?? "/";
+        const query = target.includes("?") ? target.slice(target.indexOf("?") + 1) : "";
+        let params: URLSearchParams;
+        try {
+          params = new URLSearchParams(query);
+        } catch (err) {
+          res.writeHead(400, { "content-type": "text/html; charset=utf-8" });
+          res.end(FAILURE_PAGE);
+          finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+          return;
+        }
+        try {
+          const code = interpretCallback(params, expectedState);
+          res.writeHead(200, {
+            "content-type": "text/html; charset=utf-8",
+            connection: "close",
+          });
+          res.end(SUCCESS_PAGE);
+          finish(() => resolve(code));
+        } catch (err) {
+          res.writeHead(400, {
+            "content-type": "text/html; charset=utf-8",
+            connection: "close",
+          });
+          // The detail stays out of the page: this text is rendered in the
+          // user's browser, and a token or a verifier must never reach it.
+          res.end(FAILURE_PAGE);
+          finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+        }
+      });
+
+      onReady?.();
+    });
+  }
+}
+
+const SUCCESS_PAGE =
+  `<!doctype html><meta charset=utf-8><title>Nori</title>` +
+  `<body style="font:16px system-ui;padding:3rem;max-width:32rem">` +
+  `<h1>Nori is connected</h1><p>You can close this tab and go back to Nori.</p>`;
+
+const FAILURE_PAGE =
+  `<!doctype html><meta charset=utf-8><title>Nori</title>` +
+  `<body style="font:16px system-ui;padding:3rem;max-width:32rem">` +
+  `<h1>Sign-in did not complete</h1>` +
+  `<p>You can close this tab. Nori will report the problem.</p>`;
+
+/** Start a sign-in: bind the loopback, then build the URL that points at it. */
+export async function beginAuth(
+  credentials: Credentials,
+): Promise<{ request: AuthorizationRequest; redirect: LoopbackRedirect }> {
+  const redirect = await LoopbackRedirect.bind();
+  const request = buildAuthUrl(credentials, redirect.redirectUri);
+  return { request, redirect };
+}
+
+function buildAuthUrl(credentials: Credentials, redirectUri: string): AuthorizationRequest {
   const pkce: Pkce = generatePkce();
-  // Bind port 0 semantics: ask the OS via a probe socket. Bun.serve itself
-  // binds lazily in awaitCallback; store the pkce + a reserved port hint.
-  // To keep the redirect URI stable we allocate the port now with a probe.
-  const port = probeFreePort();
-  const redirectUri = `http://127.0.0.1:${port}`;
   const url =
     `${AUTH_ENDPOINT}` +
     `?client_id=${urlencode(credentials.clientId)}` +
@@ -54,63 +177,7 @@ export function beginAuth(credentials: Credentials): AuthorizationRequest {
     `&code_challenge=${urlencode(pkce.challenge)}` +
     `&code_challenge_method=S256` +
     `&state=${urlencode(pkce.state)}`;
-  return { url, redirectUri, verifier: pkce.verifier, state: pkce.state, port };
-}
-
-function probeFreePort(): number {
-  // Bun has no sync "bind port 0 and read back" without serving; use a
-  // best-effort probe in the dynamic range. awaitCallback re-binds the exact
-  // port and retries on collision.
-  return 49152 + Math.floor(Math.random() * (65535 - 49152));
-}
-
-export async function awaitCallback(request: AuthorizationRequest): Promise<string> {
-  const expectedState = request.state;
-  return new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      try {
-        server.stop(true);
-      } catch { /* already stopped */ }
-      reject(
-        new Error(
-          `timed out after 300s waiting for the browser to return`,
-        ),
-      );
-    }, CALLBACK_TIMEOUT_MS);
-
-    const respond = (status: number, title: string, body: string) =>
-      new Response(
-        `<!doctype html><meta charset=utf-8><title>Nori</title>` +
-          `<body style="font:16px system-ui;padding:3rem;max-width:32rem">` +
-          `<h1>${title}</h1><p>${body}</p>`,
-        {
-          status,
-          headers: { "content-type": "text/html; charset=utf-8", connection: "close" },
-        },
-      );
-
-    const server = Bun.serve({
-      port: request.port,
-      hostname: "127.0.0.1",
-      fetch(req) {
-        const url = new URL(req.url);
-        const params = url.searchParams;
-        try {
-          const code = interpretCallback(params, expectedState);
-          clearTimeout(timer);
-          queueMicrotask(() => server.stop(true));
-          resolve(code);
-          return respond(200, "Nori is connected", "You can close this tab and go back to Nori.");
-        } catch (err) {
-          clearTimeout(timer);
-          queueMicrotask(() => server.stop(true));
-          reject(err instanceof Error ? err : new Error(String(err)));
-          // Never echo token/verifier detail into the browser page.
-          return respond(400, "Sign-in did not complete", "You can close this tab. Nori will report the problem.");
-        }
-      },
-    });
-  });
+  return { url, redirectUri, verifier: pkce.verifier, state: pkce.state };
 }
 
 export function interpretCallback(params: URLSearchParams, expectedState: string): string {

@@ -2,6 +2,7 @@
 // Pure helpers + a React reducer-based store. No backend calls.
 import { useMemo, useReducer, type Dispatch } from "react";
 import { mockEmails } from "../data/mock";
+import { getNoriBridge } from "../bridge/noriBridge";
 import {
   emailSummary,
   type DraftSeed,
@@ -133,9 +134,17 @@ export function countMailbox(emails: Email[], mailbox: Mailbox): number {
   return visibleEmails(emails, mailbox).length;
 }
 
+/**
+ * The sample mail is the standalone build's data source and nothing else's.
+ *
+ * Under Electron the host sends a snapshot before the first paint, and those
+ * real mails replace the sample outright. Seeding the sample anyway is what
+ * made a signed-in user see eighteen fabricated messages sitting in the list
+ * next to their own.
+ */
 function initialState(): MailState {
   return {
-    emails: mockEmails(),
+    emails: getNoriBridge() != null ? [] : mockEmails(),
     selectedMailbox: "inbox",
     selectedIndex: 0,
     tabs: [],
@@ -520,12 +529,26 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
       // local, so a pinned flag is carried across the refresh rather than
       // overwritten. Pinned mail the host no longer lists is kept too, so a
       // tab that is open does not vanish from under the reader.
-      const incoming = new Map(action.emails.map((e) => [e.id, e]));
+      //
+      // Nothing else survives: the first snapshot from a connected account
+      // replaces the sample mail outright. Keeping it would mean a signed-in
+      // user stares at eighteen fabricated messages on top of their real ones,
+      // which is the one thing that makes a connected client untrustworthy.
+      const previous = new Map(state.emails.map((e) => [e.id, e]));
       const merged = action.emails.map((email) => {
-        const previous = state.emails.find((e) => e.id === email.id);
-        return previous ? { ...email, pinned: previous.pinned } : email;
+        const held = previous.get(email.id);
+        return held ? { ...email, pinned: held.pinned } : email;
       });
+      const incoming = new Set(action.emails.map((e) => e.id));
       const orphans = state.emails.filter((e) => e.pinned && !incoming.has(e.id));
+      // The cursor moves on every snapshot, so a tab for a mail the server no
+      // longer lists would otherwise keep addressing a mail that is gone.
+      const liveIds = new Set(merged.map((e) => e.id));
+      const tabs = state.tabs.filter((id) => liveIds.has(id));
+      const activeTab =
+        state.activeTab != null && liveIds.has(state.activeTab) ? state.activeTab : null;
+      const previewTab =
+        state.previewTab != null && liveIds.has(state.previewTab) ? state.previewTab : null;
       // Gmail label ids and Nori's local ids are different namespaces, and
       // this is the one place holding both sides of the mapping, so the
       // translation happens here rather than in the renderer.
@@ -536,6 +559,14 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
       return {
         ...state,
         emails: [...merged, ...orphans],
+        tabs,
+        activeTab,
+        previewTab,
+        selectedIndex: 0,
+        workspaceView:
+          state.workspaceView.kind === "email" && !liveIds.has(state.workspaceView.id)
+            ? { kind: "mailbox" }
+            : state.workspaceView,
         labels: action.labels,
         assignments: action.assignments
           .map(

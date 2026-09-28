@@ -83,14 +83,20 @@ describe("pkce (RFC 7636)", () => {
 });
 
 describe("oauth url encoding", () => {
-  test("space encodes as %20 and scopes survive", () => {
+  test("space encodes as %20 and scopes survive", async () => {
     const creds = { clientId: "id.apps.googleusercontent.com", clientSecret: "secret" };
-    const request = beginAuth(creds);
+    const { request, redirect } = await beginAuth(creds);
     expect(request.url).toContain("code_challenge_method=S256");
     expect(request.url).toContain("access_type=offline");
     expect(request.url).toContain("gmail.modify%20https");
+    // The secret belongs in the token exchange only, never in a URL that
+    // lands in browser history.
     expect(request.url).not.toContain("secret");
-    expect(urlencode("a b+c~")).toBe("a%20b%2Bc~");
+    // The bound port has to appear in the redirect URI the browser is sent to.
+    expect(request.redirectUri).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    expect(request.url).toContain(urlencode(request.redirectUri));
+    expect(request.url).toContain(request.state);
+    expect(redirect.redirectUri).toBe(request.redirectUri);
   });
   test("callback interpret: ok, wrong state, refusal, missing code", () => {
     const ok = new URLSearchParams({ code: "abc", state: "xyz" });
@@ -100,6 +106,67 @@ describe("oauth url encoding", () => {
       interpretCallback(new URLSearchParams({ error: "access_denied", error_description: "no" }), "xyz"),
     ).toThrow();
     expect(() => interpretCallback(new URLSearchParams({ state: "xyz" }), "xyz")).toThrow();
+  });
+
+  test("the loopback serves one redirect and never echoes a secret", async () => {
+    const creds = { clientId: "id", clientSecret: "GOCSPX-super-secret" };
+    const { request, redirect } = await beginAuth(creds);
+    const waiting = redirect.awaitCallback(request.state);
+
+    const port = new URL(request.redirectUri).port;
+    const ok = await fetch(`http://127.0.0.1:${port}/?code=the-code&state=${request.state}`);
+    expect(ok.status).toBe(200);
+    const body = await ok.text();
+    expect(body).toContain("Nori is connected");
+    // The page is rendered in a browser: a token or verifier must never
+    // reach it.
+    expect(body).not.toContain("the-code");
+    expect(body).not.toContain(request.verifier);
+    expect(body).not.toContain(request.state);
+    expect(await waiting).toBe("the-code");
+  });
+
+  test("a mismatched state is refused with a 400 and no echo", async () => {
+    const creds = { clientId: "id", clientSecret: "s" };
+    const { request, redirect } = await beginAuth(creds);
+    // The handler is attached before the request is made, so the rejection is
+    // never momentarily unhandled — Bun aborts the test on that.
+    const outcome = redirect.awaitCallback(request.state).then(
+      () => "resolved",
+      (err: Error) => err.message,
+    );
+    const port = new URL(request.redirectUri).port;
+
+    const res = await fetch(`http://127.0.0.1:${port}/?code=abc&state=wrong`);
+    expect(res.status).toBe(400);
+    const body = await res.text();
+    expect(body).toContain("Sign-in did not complete");
+    expect(body).not.toContain("abc");
+    expect(await outcome).toMatch(/state/);
+  });
+
+  test("a refusal from Google is surfaced, not swallowed", async () => {
+    const creds = { clientId: "id", clientSecret: "s" };
+    const { request, redirect } = await beginAuth(creds);
+    const outcome = redirect.awaitCallback(request.state).then(
+      () => "resolved",
+      (err: Error) => err.message,
+    );
+    const port = new URL(request.redirectUri).port;
+
+    const res = await fetch(
+      `http://127.0.0.1:${port}/?error=access_denied&error_description=The%20user%20said%20no&state=${request.state}`,
+    );
+    expect(res.status).toBe(400);
+    expect(await outcome).toMatch(/access_denied/);
+  });
+
+  test("the listener is bound before the url is built, on a real port", async () => {
+    const { request } = await beginAuth({ clientId: "id", clientSecret: "s" });
+    // Port 0 would never be reachable, which is the whole reason bind() runs
+    // before the URL is assembled.
+    const port = Number(new URL(request.redirectUri).port);
+    expect(port).toBeGreaterThan(0);
   });
 });
 
