@@ -37,6 +37,7 @@
  */
 
 import type { DraftSeed, Email, EmailId, EmailSummary, Mailbox } from "../types/mail";
+import type { SettingsState } from "../state/settings";
 
 export const NORI_PROTOCOL_VERSION = 1;
 
@@ -58,6 +59,8 @@ export interface NoriBridge {
   fetchBody?: (id: string) => Promise<string[]>;
   signin?: () => Promise<string>;
   signout?: () => Promise<void>;
+  settingsGet?: () => Promise<Partial<SettingsState> | null>;
+  settingsSet?: (settings: SettingsState) => Promise<SettingsState>;
 }
 
 export type NoriEvent =

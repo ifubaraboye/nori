@@ -30,6 +30,7 @@ interface SidebarProps {
   onMailbox: (mailbox: Mailbox) => void;
   onSearch: () => void;
   onCompose: () => void;
+  onSettings: () => void;
   onToggle: () => void;
   onToggleGroup: () => void;
   onBeginResize: (startX: number) => void;
@@ -50,6 +51,7 @@ export function Sidebar({
   onToggleGroup,
   onBeginResize,
   onResizeStep,
+  onSettings,
 }: SidebarProps) {
   const clamped = clampSidebarWidth(width);
 
@@ -184,9 +186,9 @@ export function Sidebar({
             label=""
             buttonStyle="ghost"
             dense
-            disabled
-            ariaLabel="Preferences (unavailable in this prototype)"
-            icon={<Icon path="icons/settings.svg" size={14} color="var(--nori-faint)" />}
+            ariaLabel="Settings"
+            onClick={onSettings}
+            icon={<Icon path="icons/gear.svg" size={14} color="var(--nori-faint)" />}
           />
         </div>
       </div>

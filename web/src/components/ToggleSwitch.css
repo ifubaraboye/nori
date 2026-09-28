@@ -1,0 +1,44 @@
+.nori-toggle {
+  width: 30px;
+  height: 18px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 0 2px;
+  border-radius: 9px;
+  border: 1px solid var(--nori-hairline-strong);
+  background: var(--nori-surface);
+  cursor: pointer;
+}
+
+.nori-toggle--on {
+  justify-content: flex-end;
+  border-color: transparent;
+  background: var(--nori-accent);
+}
+
+.nori-toggle:hover {
+  background: var(--nori-raised);
+}
+
+.nori-toggle--on:hover {
+  background: var(--nori-accent);
+}
+
+.nori-toggle:focus-visible {
+  outline: 1px solid var(--nori-focus);
+  outline-offset: 1px;
+}
+
+.nori-toggle-knob {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border-radius: 7px;
+  background: var(--nori-faint);
+}
+
+.nori-toggle--on .nori-toggle-knob {
+  background: var(--nori-canvas);
+}

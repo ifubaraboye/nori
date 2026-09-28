@@ -4,6 +4,19 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DraftSeed, Email, EmailSummary, Mailbox, NoriEvent } from "./ipc.js";
 import { NORI_PROTOCOL_VERSION } from "./ipc.js";
 
+/** Same camelCase keys as the renderer's SettingsState (state/settings.ts). */
+interface HostSettings {
+  markReadOnOpen: boolean;
+  unreadBadges: boolean;
+  confirmBeforeArchive: boolean;
+  compactRows: boolean;
+  showSender: boolean;
+  lightMode: boolean;
+  openInTab: boolean;
+  groupConversations: boolean;
+  showAttachments: boolean;
+}
+
 function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
   return ipcRenderer.invoke(channel, ...args) as Promise<T>;
 }
@@ -21,6 +34,9 @@ const api = {
   sync: () => invoke<{ account: string | null }>("nori:sync"),
   fetchBody: (id: string) => invoke<string[]>("nori:fetchBody", id),
   counts: () => invoke<Record<Mailbox, number>>("nori:counts"),
+  settingsGet: () => invoke<Partial<HostSettings> | null>("nori:settings:get"),
+  settingsSet: (settings: HostSettings) =>
+    invoke<HostSettings>("nori:settings:set", settings),
   subscribe: (cb: (event: NoriEvent) => void) => {
     const listener = (_event: unknown, event: NoriEvent) => cb(event);
     (ipcRenderer as unknown as { on: (channel: string, listener: (event: unknown, data: NoriEvent) => void) => void }).on(

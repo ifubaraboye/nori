@@ -5,22 +5,25 @@ import "./EmailView.css";
 
 interface EmailViewProps {
   email: Email;
+  showSender: boolean;
   onReply: () => void;
   onReplyAll: () => void;
   onForward: () => void;
 }
 
 /** Port of views/email_view.rs. */
-export function EmailView({ email, onReply, onReplyAll, onForward }: EmailViewProps) {
+export function EmailView({ email, showSender, onReply, onReplyAll, onForward }: EmailViewProps) {
   return (
     <div id={`email-view-${email.id}`} className="nori-email-view" tabIndex={0}>
       <div className="nori-email-view-inner">
         <h1 className="nori-email-view-subject">{email.subject}</h1>
         <div className="nori-email-view-meta">
           <div className="nori-email-view-from">
-            <div className="nori-email-view-sender">
-              {email.sender} &lt;{email.address}&gt;
-            </div>
+            {showSender && (
+              <div className="nori-email-view-sender">
+                {email.sender} &lt;{email.address}&gt;
+              </div>
+            )}
             <div className="nori-email-view-to">To: {email.recipients.join(", ")}</div>
           </div>
           <div style={{ flex: 1 }} />

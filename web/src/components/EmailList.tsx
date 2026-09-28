@@ -7,13 +7,14 @@ import "./EmailList.css";
 interface EmailListProps {
   rows: EmailSummary[];
   selectedIndex: number;
+  compact: boolean;
   onOpen: (id: EmailId) => void;
   onStar: (id: EmailId) => void;
   onSelectIndex: (index: number) => void;
 }
 
 /** Port of views/inbox.rs + components/email_row.rs. */
-export function EmailList({ rows, selectedIndex, onOpen, onStar, onSelectIndex }: EmailListProps) {
+export function EmailList({ rows, selectedIndex, compact, onOpen, onStar, onSelectIndex }: EmailListProps) {
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -42,7 +43,13 @@ export function EmailList({ rows, selectedIndex, onOpen, onStar, onSelectIndex }
                 onSelectIndex(index);
                 onOpen(row.id);
               }}
-              className={selected ? "nori-email-row nori-email-row--selected" : "nori-email-row"}
+              className={[
+                "nori-email-row",
+                selected ? "nori-email-row--selected" : "",
+                compact ? "nori-email-row--compact" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
             >
               <div className="nori-email-row-main">
                 <div className="nori-email-row-top">

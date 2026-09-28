@@ -1,4 +1,5 @@
 import archiveSvg from "../assets/icons/archive.svg?raw";
+import appearanceSvg from "../assets/icons/appearance.svg?raw";
 import bellSvg from "../assets/icons/bell.svg?raw";
 import chevronDownSvg from "../assets/icons/chevron-down.svg?raw";
 import chevronLeftSvg from "../assets/icons/chevron-left.svg?raw";
@@ -8,7 +9,9 @@ import composeSvg from "../assets/icons/compose.svg?raw";
 import draftsSvg from "../assets/icons/drafts.svg?raw";
 import ellipsisSvg from "../assets/icons/ellipsis.svg?raw";
 import forwardSvg from "../assets/icons/forward.svg?raw";
+import gearSvg from "../assets/icons/gear.svg?raw";
 import inboxSvg from "../assets/icons/inbox.svg?raw";
+import infoSvg from "../assets/icons/info.svg?raw";
 import linkSvg from "../assets/icons/link.svg?raw";
 import mailSvg from "../assets/icons/mail.svg?raw";
 import panelLeftSvg from "../assets/icons/panel-left.svg?raw";
@@ -23,11 +26,13 @@ import settingsSvg from "../assets/icons/settings.svg?raw";
 import starFilledSvg from "../assets/icons/star-filled.svg?raw";
 import starSvg from "../assets/icons/star.svg?raw";
 import trashSvg from "../assets/icons/trash.svg?raw";
+import userSvg from "../assets/icons/user.svg?raw";
 
 import "./Icon.css";
 
 const ICONS: Record<string, string> = {
   "icons/archive.svg": archiveSvg,
+  "icons/appearance.svg": appearanceSvg,
   "icons/bell.svg": bellSvg,
   "icons/chevron-down.svg": chevronDownSvg,
   "icons/chevron-left.svg": chevronLeftSvg,
@@ -37,7 +42,9 @@ const ICONS: Record<string, string> = {
   "icons/drafts.svg": draftsSvg,
   "icons/ellipsis.svg": ellipsisSvg,
   "icons/forward.svg": forwardSvg,
+  "icons/gear.svg": gearSvg,
   "icons/inbox.svg": inboxSvg,
+  "icons/info.svg": infoSvg,
   "icons/link.svg": linkSvg,
   "icons/mail.svg": mailSvg,
   "icons/panel-left.svg": panelLeftSvg,
@@ -52,6 +59,7 @@ const ICONS: Record<string, string> = {
   "icons/star-filled.svg": starFilledSvg,
   "icons/star.svg": starSvg,
   "icons/trash.svg": trashSvg,
+  "icons/user.svg": userSvg,
 };
 
 interface IconProps {

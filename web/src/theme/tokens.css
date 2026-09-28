@@ -1,4 +1,5 @@
-/* Port of crates/nori-ui/src/theme.rs Theme::dark() into CSS variables. */
+/* Port of crates/nori-ui/src/theme.rs Theme::dark() + Theme::light(). */
+/* :root is the dark default; [data-theme="light"] is the light palette. */
 :root {
   --nori-canvas: #1a1a1a;
   --nori-chrome: #181818;
@@ -8,11 +9,47 @@
   --nori-border: #2d2d2d;
   --nori-strong-border: #3b3b3b;
   --nori-text: #e2e2e2;
+  --nori-text-dim: #c4c4c4;
   --nori-muted: #a3a3a3;
   --nori-faint: #7d7d7d;
+  --nori-ghost: #575757;
+  --nori-inset: #151515;
   --nori-accent: #e2795b;
+  --nori-danger: #d97a6b;
+  --nori-on-accent: #1a1a1a;
   --nori-selected: #2a2a2a;
+  --nori-selected-layer: rgba(240, 240, 240, 0.09);
+  --nori-hairline: rgba(230, 230, 230, 0.07);
+  --nori-hairline-strong: rgba(230, 230, 230, 0.14);
   --nori-hover: rgba(255, 255, 255, 0.06);
+  --nori-hover-subtle: rgba(255, 255, 255, 0.04);
   --nori-active: rgba(255, 255, 255, 0.1);
   --nori-focus: #e2795b;
+}
+
+[data-theme="light"] {
+  --nori-canvas: #fcfcfc;
+  --nori-chrome: #f2f2f2;
+  --nori-surface: #fdfdfd;
+  --nori-raised: #ffffff;
+  --nori-overlay: rgba(0, 0, 0, 0.26);
+  --nori-border: #e3e3e3;
+  --nori-strong-border: #d2d2d2;
+  --nori-text: #1c1c1c;
+  --nori-text-dim: #3f3f3f;
+  --nori-muted: #5e5e5e;
+  --nori-faint: #8c8c8c;
+  --nori-ghost: #b8b8b8;
+  --nori-inset: #f4f4f4;
+  --nori-accent: #dd6a44;
+  --nori-danger: #b3452f;
+  --nori-on-accent: #1c1c1c;
+  --nori-selected: #e4e4e4;
+  --nori-selected-layer: rgba(0, 0, 0, 0.09);
+  --nori-hairline: rgba(26, 26, 26, 0.07);
+  --nori-hairline-strong: rgba(26, 26, 26, 0.14);
+  --nori-hover: rgba(0, 0, 0, 0.04);
+  --nori-hover-subtle: rgba(0, 0, 0, 0.02);
+  --nori-active: rgba(0, 0, 0, 0.06);
+  --nori-focus: #cf5f38;
 }

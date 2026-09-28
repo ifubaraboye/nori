@@ -12,6 +12,7 @@ import {
   type Overlay,
   type WorkspaceView,
 } from "../types/mail";
+import type { SettingsPage } from "./settings";
 
 export interface MailState {
   emails: Email[];
@@ -22,13 +23,15 @@ export interface MailState {
   workspaceView: WorkspaceView;
   overlay: Overlay | null;
   composeSeed: DraftSeed | null;
+  /** Open settings page, or null. Holds the workspace while open. */
+  settingsPage: SettingsPage | null;
 }
 
 export type MailAction =
   | { type: "select-mailbox"; mailbox: Mailbox }
   | { type: "move-selection"; delta: number }
   | { type: "set-selected-index"; index: number }
-  | { type: "open-email"; id: EmailId }
+  | { type: "open-email"; id: EmailId; markRead?: boolean; openInTab?: boolean }
   | { type: "close-tab"; id: EmailId }
   | { type: "close-active-tab" }
   | { type: "cycle-tab"; direction: number }
@@ -36,7 +39,10 @@ export type MailAction =
   | { type: "open-search" }
   | { type: "open-compose"; seed: DraftSeed }
   | { type: "close-overlay" }
-  | { type: "open-email-from-search"; id: EmailId }
+  | { type: "open-email-from-search"; id: EmailId; markRead?: boolean; openInTab?: boolean }
+  | { type: "open-settings" }
+  | { type: "close-settings" }
+  | { type: "set-settings-page"; page: SettingsPage }
   | { type: "go-back" };
 
 export function visibleEmails(emails: Email[], mailbox: Mailbox): Email[] {
@@ -61,21 +67,28 @@ function initialState(): MailState {
     workspaceView: { kind: "mailbox" },
     overlay: null,
     composeSeed: null,
+    settingsPage: null,
   };
 }
 
-function openEmailInState(state: MailState, id: EmailId): MailState {
+function openEmailInState(
+  state: MailState,
+  id: EmailId,
+  opts?: { markRead?: boolean; openInTab?: boolean },
+): MailState {
   const found = state.emails.some((e) => e.id === id);
   if (!found) return state;
-  const emails = state.emails.map((e) =>
-    e.id === id ? { ...e, unread: false } : e,
-  );
-  const tabs = state.tabs.includes(id) ? state.tabs : [...state.tabs, id];
+  const markRead = opts?.markRead ?? true;
+  const openInTab = opts?.openInTab ?? true;
+  const emails = markRead
+    ? state.emails.map((e) => (e.id === id ? { ...e, unread: false } : e))
+    : state.emails;
+  const tabs = !openInTab || state.tabs.includes(id) ? state.tabs : [...state.tabs, id];
   return {
     ...state,
     emails,
     tabs,
-    activeTab: id,
+    activeTab: openInTab ? id : null,
     workspaceView: { kind: "email", id },
   };
 }
@@ -103,6 +116,7 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
         workspaceView: { kind: "mailbox" },
         overlay: null,
         composeSeed: null,
+        settingsPage: null,
       };
     case "move-selection": {
       const len = visibleEmails(state.emails, state.selectedMailbox).length;
@@ -113,9 +127,23 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
     case "set-selected-index":
       return { ...state, selectedIndex: action.index };
     case "open-email":
-      return openEmailInState(state, action.id);
+      return {
+        ...openEmailInState(state, action.id, {
+          markRead: action.markRead,
+          openInTab: action.openInTab,
+        }),
+        settingsPage: null,
+      };
     case "open-email-from-search":
-      return { ...openEmailInState(state, action.id), overlay: null, composeSeed: null };
+      return {
+        ...openEmailInState(state, action.id, {
+          markRead: action.markRead,
+          openInTab: action.openInTab,
+        }),
+        overlay: null,
+        composeSeed: null,
+        settingsPage: null,
+      };
     case "close-tab":
       return closeTabInState(state, action.id);
     case "close-active-tab":
@@ -142,10 +170,24 @@ export function mailReducer(state: MailState, action: MailAction): MailState {
       };
     case "open-search":
       return { ...state, overlay: "search" };
-    case "open-compose":
-      return { ...state, overlay: "compose", composeSeed: action.seed };
+    case "open-compose": {
+      const incoming = action.seed;
+      const blank =
+        incoming.to.trim() === "" && incoming.subject.trim() === "" && incoming.body.trim() === "";
+      // A blank open restores the parked draft; reply/forward seeds retire it.
+      return { ...state, overlay: "compose", composeSeed: blank && state.composeSeed ? state.composeSeed : incoming };
+    }
     case "close-overlay":
       return { ...state, overlay: null, composeSeed: null };
+    case "open-settings":
+      // Search is modal and would sit on top of settings, so it closes.
+      // The compose seed is parked, not discarded: reopening compose
+      // restores it, matching the Rust composer's hide (not destroy).
+      return { ...state, overlay: null, settingsPage: "general" };
+    case "close-settings":
+      return { ...state, settingsPage: null };
+    case "set-settings-page":
+      return { ...state, settingsPage: action.page };
     case "go-back": {
       if (state.overlay != null) return { ...state, overlay: null, composeSeed: null };
       return { ...state, workspaceView: { kind: "mailbox" } };

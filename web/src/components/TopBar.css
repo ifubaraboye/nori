@@ -41,3 +41,13 @@
   font-weight: 600;
   color: var(--nori-text);
 }
+
+.nori-topbar-prefix {
+  color: var(--nori-muted);
+  font-weight: 500;
+}
+
+.nori-topbar-separator {
+  color: var(--nori-faint);
+  font-weight: 400;
+}

@@ -40,6 +40,20 @@
   background: var(--nori-selected);
 }
 
+/* Compact density (density.rs): 40px, one line per message. */
+.nori-email-row--compact {
+  height: 40px;
+}
+
+.nori-email-row--compact .nori-email-row-main {
+  padding: 0 14px;
+  justify-content: center;
+}
+
+.nori-email-row--compact .nori-email-row-preview {
+  display: none;
+}
+
 .nori-email-row-main {
   flex: 1;
   min-width: 0;
