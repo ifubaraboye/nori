@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, DhtSessionConfig, ListenerOptions, ManagedTorrent, Session,
-    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions,
+    ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -29,6 +29,8 @@ use crate::torrent::{perms, playlist};
 
 const TICK: Duration = Duration::from_millis(500);
 const PERSIST_EVERY: Duration = Duration::from_secs(2);
+/// How long a fresh resume may take to find peers before it is restarted.
+const RESUME_GRACE: Duration = Duration::from_secs(25);
 
 /// Where a download is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -85,6 +87,17 @@ pub enum BatchMode {
     Queue,
 }
 
+/// One file inside a download, as the views see it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ItemFile {
+    /// Path relative to the torrent's own folder.
+    pub path: String,
+    #[serde(default)]
+    pub size: i64,
+    #[serde(default)]
+    pub downloaded: i64,
+}
+
 /// One download, as the views see it.
 ///
 /// The JSON field names are part of the on-disk queue format; keep them stable
@@ -120,6 +133,10 @@ pub struct Item {
     pub added_at: i64,
     #[serde(default, deserialize_with = "timestamp")]
     pub completed_at: i64,
+    /// Every real file in the torrent, kept so a finished download can still
+    /// show its contents after a restart without contacting the swarm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ItemFile>,
 
     /// Runtime-only counters.
     #[serde(skip)]
@@ -219,6 +236,26 @@ struct Entry {
     promoted: bool,
     /// Set when a start has been issued but the handle is not stored yet.
     starting: bool,
+    /// Set after an unpause so a torrent that never finds peers again can be
+    /// restarted from scratch.
+    resume_probe: Option<ResumeProbe>,
+}
+
+struct ResumeProbe {
+    started: Instant,
+    baseline: i64,
+}
+
+fn resume_probe_should_restart(
+    probe: &ResumeProbe,
+    peers: i64,
+    downloaded: i64,
+    speed: i64,
+) -> bool {
+    peers <= 0
+        && downloaded <= probe.baseline
+        && speed <= 0
+        && probe.started.elapsed() >= RESUME_GRACE
 }
 
 impl Entry {
@@ -228,6 +265,7 @@ impl Entry {
             handle: None,
             promoted: false,
             starting: false,
+            resume_probe: None,
         }
     }
 }
@@ -273,12 +311,17 @@ enum Command {
     Remove(String),
     SetMaxDownloads(i32),
     SetSeedTime(i32),
+    SetSeedingEnabled(bool),
     SetTrackers(Vec<String>),
     SetSeedPaused {
         id: String,
         paused: bool,
     },
     SetAllSeedPaused(bool),
+    PreviewFiles {
+        magnet: String,
+        response: async_channel::Sender<Result<Vec<ItemFile>, String>>,
+    },
     Restore(Vec<Item>),
     Shutdown,
 }
@@ -406,6 +449,23 @@ impl TorrentManager {
 
     pub fn set_seed_time(&self, minutes: i32) {
         let _ = self.shared.tx.send(Command::SetSeedTime(minutes.max(0)));
+    }
+
+    pub fn set_seeding_enabled(&self, enabled: bool) {
+        let _ = self.shared.tx.send(Command::SetSeedingEnabled(enabled));
+    }
+
+    /// Resolve a magnet's metadata without adding it to the download queue.
+    pub fn preview_files(
+        &self,
+        magnet: &str,
+    ) -> async_channel::Receiver<Result<Vec<ItemFile>, String>> {
+        let (tx, rx) = async_channel::bounded(1);
+        let _ = self.shared.tx.send(Command::PreviewFiles {
+            magnet: magnet.to_owned(),
+            response: tx,
+        });
+        rx
     }
 
     pub fn set_trackers(&self, trackers: Vec<String>) {
@@ -584,8 +644,11 @@ fn plan_downloads(state: &mut State, max: i32) -> Vec<String> {
 }
 
 /// Reattach handles to finished torrents that want to keep seeding.
-fn plan_reseeds(state: &mut State) -> Vec<String> {
+fn plan_reseeds(state: &mut State, seeding_enabled: bool) -> Vec<String> {
     let mut start = Vec::new();
+    if !seeding_enabled {
+        return start;
+    }
     for id in state.order.clone() {
         let Some(entry) = state.entries.get_mut(&id) else {
             continue;
@@ -642,11 +705,7 @@ impl Engine {
                     }
                     return false;
                 }
-                let dir = if dir.trim().is_empty() {
-                    self.config.lock().download_dir.clone()
-                } else {
-                    dir
-                };
+                let dir = dir;
                 let magnet = {
                     let trackers = self.config.lock().trackers.clone();
                     with_trackers(&magnet, &trackers)
@@ -696,6 +755,10 @@ impl Engine {
                 self.tick().await;
                 false
             }
+            Command::SetSeedingEnabled(enabled) => {
+                self.set_seeding_enabled(enabled).await;
+                false
+            }
             Command::SetTrackers(trackers) => {
                 self.config.lock().trackers = trackers;
                 false
@@ -706,6 +769,50 @@ impl Engine {
             }
             Command::SetAllSeedPaused(paused) => {
                 self.set_all_seed_paused(paused).await;
+                false
+            }
+            Command::PreviewFiles { magnet, response } => {
+                let session = self.session.clone();
+                let trackers = self.config.lock().trackers.clone();
+                tokio::spawn(async move {
+                    let magnet = with_trackers(&magnet, &trackers);
+                    let result = match session
+                        .add_torrent(
+                            AddTorrent::from_url(magnet),
+                            Some(AddTorrentOptions {
+                                list_only: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(AddTorrentResponse::ListOnly(list)) => Ok(list
+                            .info
+                            .iter_file_details()
+                            .filter_map(|file| {
+                                if file.attrs().padding {
+                                    return None;
+                                }
+                                Some(ItemFile {
+                                    path: file
+                                        .filename
+                                        .to_pathbuf()
+                                        .to_string_lossy()
+                                        .replace('\\', "/"),
+                                    size: file.len as i64,
+                                    downloaded: 0,
+                                })
+                            })
+                            .collect()),
+                        Ok(AddTorrentResponse::AlreadyManaged(_, handle))
+                        | Ok(AddTorrentResponse::Added(_, handle)) => {
+                            let stats = handle.stats();
+                            Ok(torrent_files(&handle, &stats.file_progress))
+                        }
+                        Err(error) => Err(format!("{error:#}")),
+                    };
+                    let _ = response.send(result).await;
+                });
                 false
             }
             Command::Restore(items) => {
@@ -735,7 +842,6 @@ impl Engine {
 
     async fn restore_items(&self, items: Vec<Item>, from_disk: bool) {
         let trackers = self.config.lock().trackers.clone();
-        let default_dir = self.config.lock().download_dir.clone();
         let mut state = self.state.lock();
         for mut item in items {
             if item.id.is_empty() || item.magnet.is_empty() {
@@ -746,9 +852,6 @@ impl Engine {
             }
             if from_disk {
                 item.status = restored_status(item.status);
-            }
-            if item.dir.trim().is_empty() {
-                item.dir = default_dir.clone();
             }
             item.magnet = with_trackers(&item.magnet, &trackers);
             item.speed = 0;
@@ -768,7 +871,6 @@ impl Engine {
         if items.is_empty() {
             return;
         }
-        let default_dir = self.config.lock().download_dir.clone();
         let trackers = self.config.lock().trackers.clone();
         // One timestamp for the whole batch keeps the chosen order stable when
         // the queue is sorted newest-first.
@@ -807,11 +909,7 @@ impl Engine {
                     }
                     continue;
                 }
-                let dir = if torrent.dir.trim().is_empty() {
-                    default_dir.clone()
-                } else {
-                    torrent.dir
-                };
+                let dir = torrent.dir;
                 let magnet = with_trackers(&torrent.magnet, &trackers);
                 added.push(Item {
                     id: torrent.id.clone(),
@@ -839,11 +937,14 @@ impl Engine {
     async fn schedule(&self) {
         let start = {
             let mut state = self.state.lock();
-            let max = self.config.lock().max_downloads;
+            let (max, seeding_enabled) = {
+                let config = self.config.lock();
+                (config.max_downloads, config.seeding_enabled)
+            };
             let mut start = plan_downloads(&mut state, max);
             // Finished torrents only need their handle back so they can seed;
             // they never pass through the download queue again.
-            start.extend(plan_reseeds(&mut state));
+            start.extend(plan_reseeds(&mut state, seeding_enabled));
             start
         };
         self.dirty.store(true, Ordering::Relaxed);
@@ -855,7 +956,7 @@ impl Engine {
     }
 
     async fn start(&self, id: &str) {
-        let (magnet, dir, trackers, status, seed_paused, handle) = {
+        let (magnet, dir, trackers, status, seed_paused, seeding_enabled, handle) = {
             let mut state = self.state.lock();
             let Some(entry) = state.entries.get_mut(id) else {
                 return;
@@ -874,6 +975,7 @@ impl Engine {
                 self.config.lock().trackers.clone(),
                 entry.item.status,
                 entry.item.seed_paused,
+                self.config.lock().seeding_enabled,
                 entry.handle.clone(),
             )
         };
@@ -881,14 +983,36 @@ impl Engine {
         // Resuming a paused or failed item that still has a handle only needs
         // the session unpaused; adding it a second time would duplicate work.
         if let Some(handle) = handle {
-            let should_pause =
-                status == Status::Paused || (status == Status::Completed && seed_paused);
+            let should_pause = status == Status::Paused
+                || (status == Status::Completed && (!seeding_enabled || seed_paused));
             if should_pause {
                 if !handle.is_paused() {
                     let _ = self.session.pause(&handle).await;
                 }
             } else if handle.is_paused() {
-                let _ = self.session.unpause(&handle).await;
+                match self.session.unpause(&handle).await {
+                    Ok(()) => {
+                        // Watch a fresh resume for a moment: a torrent that was
+                        // paused for a long time may not find its swarm again
+                        // until it is restarted.
+                        if status != Status::Completed {
+                            let mut state = self.state.lock();
+                            if let Some(entry) = state.entries.get_mut(id) {
+                                entry.resume_probe = Some(ResumeProbe {
+                                    started: Instant::now(),
+                                    baseline: entry.item.downloaded,
+                                });
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("could not resume {id}: {err:#}");
+                        let mut state = self.state.lock();
+                        if let Some(entry) = state.entries.get_mut(id) {
+                            entry.item.error = format!("Could not resume: {err:#}");
+                        }
+                    }
+                }
             }
             {
                 let mut state = self.state.lock();
@@ -900,12 +1024,22 @@ impl Engine {
             return;
         }
 
+        let pause_after = status == Status::Completed && (!seeding_enabled || seed_paused);
         let mut options = AddTorrentOptions {
             overwrite: true,
-            output_folder: Some(dir).filter(|d| !d.trim().is_empty()),
-            paused: status == Status::Completed && seed_paused,
+            // An empty folder means "use the session default". librqbit then
+            // keeps single-file torrents flat and gives multi-file torrents
+            // their own folder, so nothing is scattered into the download root.
+            output_folder: None,
+            paused: pause_after,
+            // Re-announce periodically so a swarm that went quiet is picked up
+            // again without restarting the app.
+            force_tracker_interval: Some(Duration::from_secs(300)),
             ..Default::default()
         };
+        if !dir.trim().is_empty() {
+            options.output_folder = Some(dir);
+        }
         if !trackers.is_empty() {
             options.trackers = Some(trackers);
         }
@@ -920,12 +1054,24 @@ impl Engine {
                         .await;
                     return;
                 };
+                // The real output folder is only known after metadata resolves:
+                // multi-file torrents get a folder of their own.
+                let folder = handle.output_folder().to_string_lossy().into_owned();
+                let stats = handle.stats();
+                let files = torrent_files(&handle, &stats.file_progress);
                 let keep = {
                     let mut state = self.state.lock();
                     match state.entries.get_mut(id) {
                         Some(entry) => {
                             entry.handle = Some(handle.clone());
                             entry.starting = false;
+                            entry.resume_probe = None;
+                            if !folder.is_empty() {
+                                entry.item.dir = folder;
+                            }
+                            if !files.is_empty() {
+                                entry.item.files = files;
+                            }
                             true
                         }
                         None => false,
@@ -941,22 +1087,25 @@ impl Engine {
                 }
 
                 // The pause flag can change while metadata is resolving.
-                let (status, seed_paused) = {
+                let (status, seed_paused, seeding_enabled) = {
                     let state = self.state.lock();
+                    let seeding_enabled = self.config.lock().seeding_enabled;
                     state
                         .entries
                         .get(id)
-                        .map(|entry| (entry.item.status, entry.item.seed_paused))
-                        .unwrap_or((Status::Failed, false))
+                        .map(|entry| (entry.item.status, entry.item.seed_paused, seeding_enabled))
+                        .unwrap_or((Status::Failed, false, seeding_enabled))
                 };
-                let should_pause =
-                    status == Status::Paused || (status == Status::Completed && seed_paused);
+                let should_pause = status == Status::Paused
+                    || (status == Status::Completed && (!seeding_enabled || seed_paused));
                 if should_pause {
                     if !handle.is_paused() {
                         let _ = self.session.pause(&handle).await;
                     }
                 } else if handle.is_paused() {
-                    let _ = self.session.unpause(&handle).await;
+                    if let Err(err) = self.session.unpause(&handle).await {
+                        tracing::warn!("could not start {id}: {err:#}");
+                    }
                 }
                 self.publish();
             }
@@ -1020,6 +1169,7 @@ impl Engine {
         if let Some(handle) = handle {
             let _ = self.session.pause(&handle).await;
         }
+        tracing::debug!("pausing {id}");
         self.dirty.store(true, Ordering::Relaxed);
         self.publish();
         self.schedule().await;
@@ -1041,6 +1191,10 @@ impl Engine {
             entry.item.speed = 0;
             entry.item.up_speed = 0;
             entry.starting = false;
+            entry.resume_probe = entry.handle.as_ref().map(|_| ResumeProbe {
+                started: Instant::now(),
+                baseline: entry.item.downloaded,
+            });
             entry.handle.clone()
         };
         if let Some(handle) = handle
@@ -1050,6 +1204,7 @@ impl Engine {
             // item waits for a slot or its batch turn.
             let _ = self.session.pause(&handle).await;
         }
+        tracing::debug!("resuming {id}");
         self.dirty.store(true, Ordering::Relaxed);
         self.schedule().await;
     }
@@ -1075,6 +1230,10 @@ impl Engine {
     }
 
     async fn set_seed_paused(&self, id: &str, paused: bool) {
+        if !paused && !self.config.lock().seeding_enabled {
+            // The global switch wins over the per-torrent play button.
+            return;
+        }
         let handle = {
             let mut state = self.state.lock();
             let Some(entry) = state.entries.get_mut(id) else {
@@ -1103,6 +1262,9 @@ impl Engine {
     }
 
     async fn set_all_seed_paused(&self, paused: bool) {
+        if !paused && !self.config.lock().seeding_enabled {
+            return;
+        }
         let handles = {
             let mut state = self.state.lock();
             let mut handles = Vec::new();
@@ -1134,11 +1296,55 @@ impl Engine {
         self.schedule().await;
     }
 
+    /// Turn seeding on or off globally. Finished torrents stay in Seeding
+    /// either way; this only starts or stops the upload side.
+    async fn set_seeding_enabled(&self, enabled: bool) {
+        self.config.lock().seeding_enabled = enabled;
+        let mut actions: Vec<(Arc<ManagedTorrent>, bool)> = Vec::new();
+        {
+            let mut state = self.state.lock();
+            for id in state.order.clone() {
+                let Some(entry) = state.entries.get_mut(&id) else {
+                    continue;
+                };
+                if entry.item.status != Status::Completed {
+                    continue;
+                }
+                let Some(handle) = &entry.handle else {
+                    continue;
+                };
+                if enabled {
+                    if !entry.item.seed_paused && handle.is_paused() {
+                        actions.push((handle.clone(), false));
+                    }
+                } else if !handle.is_paused() {
+                    actions.push((handle.clone(), true));
+                }
+            }
+        }
+        for (handle, pause) in actions {
+            if pause {
+                let _ = self.session.pause(&handle).await;
+            } else if let Err(err) = self.session.unpause(&handle).await {
+                tracing::warn!("could not resume seeding: {err:#}");
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        self.publish();
+        // With seeding back on, finished torrents without a handle are
+        // re-attached here.
+        self.schedule().await;
+    }
+
     async fn tick(&self) {
         let now = unix_now();
-        let seed_minutes = self.config.lock().seed_time_minutes;
+        let (seed_minutes, seeding_enabled) = {
+            let config = self.config.lock();
+            (config.seed_time_minutes, config.seeding_enabled)
+        };
         let mut finished: Vec<(String, String, Vec<String>)> = Vec::new();
         let mut stop_seeding: Vec<Arc<ManagedTorrent>> = Vec::new();
+        let mut restarts: Vec<String> = Vec::new();
         let mut changed = false;
         let mut slot_freed = false;
 
@@ -1193,6 +1399,27 @@ impl Engine {
                     entry.item.name = name;
                 }
 
+                // Keep the file list and its per-file progress current. The
+                // list itself only changes once, when metadata arrives.
+                let files = torrent_files(&handle, &stats.file_progress);
+                if !files.is_empty() {
+                    let same = entry.item.files.len() == files.len()
+                        && entry
+                            .item
+                            .files
+                            .iter()
+                            .zip(&files)
+                            .all(|(old, new)| old.path == new.path && old.size == new.size);
+                    if same {
+                        for (slot, fresh) in entry.item.files.iter_mut().zip(files) {
+                            slot.downloaded = fresh.downloaded;
+                        }
+                    } else {
+                        entry.item.files = files;
+                        changed = true;
+                    }
+                }
+
                 let total = entry.item.size_bytes;
                 let downloaded = entry.item.downloaded;
                 if total > 0 {
@@ -1206,10 +1433,32 @@ impl Engine {
                     entry.item.speed = 0;
                     entry.item.completed_at = now;
                     entry.promoted = false;
+                    for file in &mut entry.item.files {
+                        file.downloaded = file.size;
+                    }
+                    if !seeding_enabled {
+                        stop_seeding.push(handle.clone());
+                    }
                     changed = true;
                     slot_freed = true;
                     let paths = file_paths(&handle);
                     finished.push((id.clone(), entry.item.dir.clone(), paths));
+                }
+
+                // A resume that never finds its swarm is restarted from
+                // scratch, which forces a fresh tracker and DHT announce.
+                if entry.item.status == Status::Downloading {
+                    let clear = entry
+                        .resume_probe
+                        .as_ref()
+                        .is_some_and(|probe| peers > 0 || downloaded > probe.baseline || down > 0);
+                    if clear {
+                        entry.resume_probe = None;
+                    } else if entry.resume_probe.as_ref().is_some_and(|probe| {
+                        resume_probe_should_restart(probe, peers, downloaded, down)
+                    }) {
+                        restarts.push(id.clone());
+                    }
                 }
 
                 if entry.item.status == Status::Completed {
@@ -1217,8 +1466,11 @@ impl Engine {
                     if entry.item.completed_at == 0 {
                         entry.item.completed_at = now;
                     }
-                    if entry.item.seed_paused {
+                    if entry.item.seed_paused || !seeding_enabled {
                         entry.item.up_speed = 0;
+                        if !seeding_enabled && !handle.is_paused() {
+                            stop_seeding.push(handle.clone());
+                        }
                     } else if seed_minutes > 0 && entry.item.completed_at > 0 {
                         let age = now - entry.item.completed_at;
                         if age >= (seed_minutes as i64) * 60 {
@@ -1242,6 +1494,12 @@ impl Engine {
         for handle in stop_seeding {
             let _ = self.session.pause(&handle).await;
         }
+        if !restarts.is_empty() {
+            for id in restarts {
+                self.restart(&id).await;
+            }
+            slot_freed = true;
+        }
         for (id, dir, paths) in finished {
             self.promote(id, dir, paths);
         }
@@ -1255,6 +1513,34 @@ impl Engine {
         } else {
             self.publish();
         }
+    }
+
+    /// Drop a stalled handle (keeping its files) so the scheduler can add the
+    /// torrent again with a fresh set of tracker and DHT announces.
+    async fn restart(&self, id: &str) {
+        let handle = {
+            let mut state = self.state.lock();
+            let Some(entry) = state.entries.get_mut(id) else {
+                return;
+            };
+            if entry.item.status != Status::Downloading {
+                return;
+            }
+            entry.resume_probe = None;
+            entry.starting = false;
+            entry.item.status = Status::Queued;
+            entry.item.speed = 0;
+            entry.item.up_speed = 0;
+            entry.handle.take()
+        };
+        if let Some(handle) = handle {
+            tracing::info!("{id} found no peers after resuming; restarting the torrent");
+            let _ = self
+                .session
+                .delete(TorrentIdOrHash::Id(handle.id()), false)
+                .await;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// The completion hook: files stay ordinary read/write files, and folders
@@ -1399,6 +1685,25 @@ fn file_paths(handle: &Arc<ManagedTorrent>) -> Vec<String> {
                 .iter()
                 .filter(|file| !file.attrs.padding)
                 .map(|file| file.relative_filename.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Every real file with its size and downloaded bytes, for the downloads view.
+fn torrent_files(handle: &Arc<ManagedTorrent>, progress: &[u64]) -> Vec<ItemFile> {
+    handle
+        .with_metadata(|metadata| {
+            metadata
+                .file_infos
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| !file.attrs.padding)
+                .map(|(index, file)| ItemFile {
+                    path: file.relative_filename.to_string_lossy().replace('\\', "/"),
+                    size: file.len as i64,
+                    downloaded: progress.get(index).copied().unwrap_or(0) as i64,
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
@@ -1554,5 +1859,36 @@ mod tests {
         let back: Item = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.queue_group.as_deref(), Some("batch"));
         assert!(back.start_all);
+    }
+
+    #[test]
+    fn completed_items_are_not_reseeded_when_disabled() {
+        let mut state = test_state(vec![test_item("done", Status::Completed)]);
+        assert!(plan_reseeds(&mut state, false).is_empty());
+        assert_eq!(plan_reseeds(&mut state, true), vec!["done"]);
+    }
+
+    #[test]
+    fn file_metadata_round_trips_with_the_queue() {
+        let mut item = test_item("files", Status::Completed);
+        item.files.push(ItemFile {
+            path: "Season 1/episode.mkv".into(),
+            size: 123,
+            downloaded: 123,
+        });
+        let back: Item = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(back.files, item.files);
+    }
+
+    #[test]
+    fn stalled_resume_probe_requires_no_progress() {
+        let probe = ResumeProbe {
+            started: Instant::now() - RESUME_GRACE - Duration::from_secs(1),
+            baseline: 100,
+        };
+        assert!(resume_probe_should_restart(&probe, 0, 100, 0));
+        assert!(!resume_probe_should_restart(&probe, 1, 100, 0));
+        assert!(!resume_probe_should_restart(&probe, 0, 101, 0));
+        assert!(!resume_probe_should_restart(&probe, 0, 100, 1));
     }
 }

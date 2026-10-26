@@ -1,0 +1,82 @@
+name: Linux AppImage
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-appimage:
+    name: Build x86_64 AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install GPUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            clang \
+            cmake \
+            libasound2-dev \
+            libfontconfig-dev \
+            libgit2-dev \
+            libglib2.0-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            libva-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev \
+            pkg-config
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build Nori
+        run: cargo build --release --locked -p nori
+
+      - name: Package AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          LDAI_OUTPUT: Nori-x86_64.AppImage
+          LINUXDEPLOY_OUTPUT_APP_NAME: Nori
+        run: |
+          curl --fail --location --retry 3 \
+            --output linuxdeploy-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable target/release/nori \
+            --desktop-file packaging/nori.desktop \
+            --icon-file packaging/nori.svg \
+            --output appimage
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nori-appimage-x86_64
+          path: Nori-x86_64.AppImage
+          if-no-files-found: error
+          retention-days: 30

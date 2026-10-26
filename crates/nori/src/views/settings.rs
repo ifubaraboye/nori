@@ -164,6 +164,34 @@ pub fn view(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
                 })),
         );
 
+    let seed_switch = div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_grow(1.0)
+                .gap(px(2.))
+                .child(widgets::text("Seed Finished Downloads", 12., theme.text))
+                .child(widgets::text(
+                    "Turn off to keep finished downloads in Seeding without sending any data.",
+                    10.,
+                    theme.text_tertiary,
+                )),
+        )
+        .child(
+            widgets::checkbox(theme, app.cfg.seeding_enabled, "")
+                .id("seed-enabled")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cfg.seeding_enabled = !this.cfg.seeding_enabled;
+                    this.manager.set_seeding_enabled(this.cfg.seeding_enabled);
+                    this.save_config();
+                    cx.notify();
+                })),
+        );
+
     page = page.child(widgets::section(
         theme,
         "Downloads",
@@ -174,7 +202,10 @@ pub fn view(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
             .child(folder)
             .child(widgets::divider(theme))
             .child(max_row)
-            .child(seed_row),
+            .child(widgets::divider(theme))
+            .child(seed_row)
+            .child(widgets::divider(theme))
+            .child(seed_switch),
     ));
 
     // Results -----------------------------------------------------------
@@ -223,6 +254,7 @@ pub fn view(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
                 let next = !this.cfg.enabled(id);
                 this.cfg.set_enabled(id, next);
                 this.save_config();
+                this.sources_changed(cx);
                 cx.notify();
             }),
         ));

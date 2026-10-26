@@ -19,6 +19,9 @@ pub struct Config {
     pub max_downloads: i32,
     /// 0 keeps seeding.
     pub seed_time_minutes: i32,
+    /// When false, finished torrents stay in Seeding but do not send data.
+    #[serde(default = "yes")]
+    pub seeding_enabled: bool,
     pub disabled_sources: Vec<String>,
     pub hide_dead: bool,
     /// `system`, `light`, or `dark`.
@@ -32,6 +35,7 @@ impl Default for Config {
             trackers: Vec::new(),
             max_downloads: 0,
             seed_time_minutes: 0,
+            seeding_enabled: true,
             disabled_sources: Vec::new(),
             hide_dead: false,
             theme: "system".into(),
@@ -74,6 +78,10 @@ pub fn default_download_dir() -> PathBuf {
         .join("nori")
 }
 
+fn yes() -> bool {
+    true
+}
+
 impl Config {
     /// Read the settings, falling back to defaults for missing or malformed fields.
     pub fn load() -> Self {
@@ -90,6 +98,7 @@ impl Config {
         cfg.trackers = clean_trackers(&parsed.trackers);
         cfg.max_downloads = parsed.max_downloads.max(0);
         cfg.seed_time_minutes = parsed.seed_time_minutes.max(0);
+        cfg.seeding_enabled = parsed.seeding_enabled;
         cfg.disabled_sources = parsed.disabled_sources;
         cfg.hide_dead = parsed.hide_dead;
         cfg.theme = match parsed.theme.as_str() {
@@ -178,6 +187,12 @@ fn clean_trackers(input: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_seeding_switch_defaults_on() {
+        let cfg: Config = serde_json::from_str(r#"{"download_dir":"/tmp/nori"}"#).unwrap();
+        assert!(cfg.seeding_enabled);
+    }
 
     #[test]
     fn trackers_are_cleaned_and_deduped() {

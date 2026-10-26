@@ -7,11 +7,12 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, Context, Div, Entity, FontWeight, Hsla, SharedString, TextAlign, Window, div, list,
-    prelude::*, px, uniform_list,
+    AnyElement, Context, CursorStyle, Div, Entity, FontWeight, Hsla, MouseButton, MouseMoveEvent,
+    SharedString, TextAlign, Window, div, list, prelude::*, px, uniform_list,
 };
 use nori_core::search::model::{source_by_id, source_tag};
 use nori_core::search::{SearchResult, human_age, human_size};
+use nori_core::torrent::ItemFile;
 
 use crate::app::App;
 use crate::icons;
@@ -22,7 +23,7 @@ pub fn view(
     app: &App,
     theme: &Theme,
     width: f32,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<App>,
 ) -> AnyElement {
     let rows = app.pick();
@@ -35,8 +36,7 @@ pub fn view(
     if rows.is_empty() {
         return results_pane(app, theme, width, cx);
     }
-    let detail_width = if width < 1120. { 300. } else { 340. };
-    let _ = window;
+    let detail_width = constrained_detail_width(app.detail_width, width);
     div()
         .flex()
         .items_stretch()
@@ -52,6 +52,23 @@ pub fn view(
         )
         .child(
             div()
+                .id("detail-resize-handle")
+                .w(px(7.))
+                .h_full()
+                .flex_shrink_0()
+                .cursor(CursorStyle::ResizeLeftRight)
+                .bg(theme.border)
+                .hover(move |style| style.bg(theme.text_tertiary))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.detail_resizing = true;
+                        cx.notify();
+                    }),
+                ),
+        )
+        .child(
+            div()
                 .flex()
                 .flex_col()
                 .w(px(detail_width))
@@ -60,7 +77,39 @@ pub fn view(
                 .border_color(theme.border)
                 .child(detail_pane(app, theme, width, cx)),
         )
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+            if !this.detail_resizing || !event.dragging() {
+                return;
+            }
+            let window_width = window.bounds().size.width.as_f32();
+            let max_width = (window_width * 0.7).min(window_width - 420.).max(280.);
+            this.detail_width = (window_width - event.position.x.as_f32()).clamp(280., max_width);
+            cx.notify();
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                if this.detail_resizing {
+                    this.detail_resizing = false;
+                    cx.notify();
+                }
+            }),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                if this.detail_resizing {
+                    this.detail_resizing = false;
+                    cx.notify();
+                }
+            }),
+        )
         .into_any_element()
+}
+
+fn constrained_detail_width(requested: f32, window_width: f32) -> f32 {
+    let max_width = (window_width * 0.7).min(window_width - 420.).max(280.);
+    requested.clamp(280., max_width)
 }
 
 fn compact_detail(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -> AnyElement {
@@ -99,7 +148,7 @@ fn compact_detail(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -
 fn results_pane(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -> AnyElement {
     let side = if width >= 1020. { 196. } else { 54. };
     let detail = if width >= 900. && !app.pick().is_empty() {
-        if width >= 1120. { 340. } else { 300. }
+        constrained_detail_width(app.detail_width, width) + 7.
     } else {
         0.
     };
@@ -288,6 +337,7 @@ fn result_row(
     cx: &mut Context<App>,
 ) -> AnyElement {
     let pad = if compact { 12. } else { 16. };
+    let preview_result = result.clone();
     let selected = app.selected == Some(index);
     let chosen = app.chosen.contains(&result.info_hash);
     let active = selected || chosen;
@@ -340,12 +390,18 @@ fn result_row(
                 .id(("result-check", index))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.focus_list(window, cx);
-                    if !this.chosen.remove(&hash) {
-                        this.chosen.insert(hash.clone());
+                    if let Some(result) = this
+                        .shown
+                        .iter()
+                        .find(|result| result.info_hash == hash)
+                        .cloned()
+                    {
+                        this.toggle_chosen(&result);
                     }
                     this.selected = None;
                     this.reset_detail_expansion();
                     this.refresh();
+                    this.request_preview_for_pick(cx);
                     cx.notify();
                     cx.stop_propagation();
                 }))
@@ -370,9 +426,10 @@ fn result_row(
     row.id(("result", index))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.focus_list(window, cx);
-            this.chosen.clear();
+            this.clear_chosen();
             this.reset_detail_expansion();
             this.selected = Some(index);
+            this.request_preview(&preview_result, cx);
             if compact {
                 this.detail_open = true;
             }
@@ -548,34 +605,38 @@ fn detail_pane(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -> A
             theme.accent,
         ));
     }
-    body = body.child(source_row).child(stats_card).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(
-                widgets::primary_button(theme, label)
-                    .w_full()
-                    .id("detail-download")
-                    .on_click(cx.listener(|this, _, _, cx| this.download_picked(cx))),
-            )
-            .child(
-                widgets::button(theme, "Copy Magnet")
-                    .w_full()
-                    .id("detail-copy")
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_picked(cx))),
-            )
-            .child(
-                widgets::button(theme, "View Source")
-                    .w_full()
-                    .id("detail-open-source")
-                    .on_click(cx.listener(move |_this, _, _, cx| {
-                        if let Some(home) = home {
-                            cx.open_url(home);
-                        }
-                    })),
-            ),
-    );
+    body = body
+        .child(source_row)
+        .child(stats_card)
+        .child(contents_preview(app, theme, &result, cx))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    widgets::primary_button(theme, label)
+                        .w_full()
+                        .id("detail-download")
+                        .on_click(cx.listener(|this, _, _, cx| this.download_picked(cx))),
+                )
+                .child(
+                    widgets::button(theme, "Copy Magnet")
+                        .w_full()
+                        .id("detail-copy")
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_picked(cx))),
+                )
+                .child(
+                    widgets::button(theme, "View Source")
+                        .w_full()
+                        .id("detail-open-source")
+                        .on_click(cx.listener(move |_this, _, _, cx| {
+                            if let Some(home) = home {
+                                cx.open_url(home);
+                            }
+                        })),
+                ),
+        );
 
     pane = pane.child(
         div()
@@ -614,6 +675,10 @@ fn multi_detail_pane(
         .iter()
         .map(|result| app.reports_health(&result.source))
         .collect();
+    let preview_hash = app.preview_hash.clone();
+    let preview_files = app.preview_files.clone();
+    let preview_loading = app.preview_loading;
+    let preview_error = app.preview_error.clone();
 
     let mut pane = div()
         .flex()
@@ -652,6 +717,10 @@ fn multi_detail_pane(
             result,
             open,
             health.get(index).copied().unwrap_or(true),
+            preview_hash.as_deref() == Some(result.info_hash.as_str()),
+            &preview_files,
+            preview_loading,
+            preview_error.as_deref(),
         ));
         if index + 1 < count {
             row = row.pb(px(8.));
@@ -697,6 +766,10 @@ fn selected_result_card(
     result: &SearchResult,
     open: bool,
     reports_health: bool,
+    preview_matches: bool,
+    preview_files: &[ItemFile],
+    preview_loading: bool,
+    preview_error: Option<&str>,
 ) -> Div {
     let hash = result.info_hash.clone();
     let toggle_hash = hash.clone();
@@ -785,15 +858,247 @@ fn selected_result_card(
         .border_color(theme.border)
         .child(header);
     if open {
+        let preview = expanded_contents_preview(
+            theme,
+            result,
+            preview_matches,
+            preview_files,
+            preview_loading,
+            preview_error,
+        );
         card = card.child(
             div()
                 .p(px(12.))
                 .border_t_1()
                 .border_color(theme.border)
-                .child(result_stats(theme, result, reports_health)),
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .child(result_stats(theme, result, reports_health))
+                        .child(preview),
+                ),
         );
     }
     card
+}
+
+fn expanded_contents_preview(
+    theme: &Theme,
+    result: &SearchResult,
+    preview_matches: bool,
+    files: &[ItemFile],
+    loading: bool,
+    error: Option<&str>,
+) -> Div {
+    let mut preview = div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .pt(px(10.))
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(widgets::uppercase(
+                    "Torrent Contents",
+                    9.,
+                    theme.text_tertiary,
+                ))
+                .child(widgets::text(
+                    if preview_matches && !files.is_empty() {
+                        format!(
+                            "{} files · {}",
+                            files.len(),
+                            human_size(files.iter().map(|f| f.size).sum())
+                        )
+                    } else {
+                        format!("{} files", count_text(result.num_files))
+                    },
+                    10.,
+                    theme.text_secondary,
+                )),
+        );
+
+    if !preview_matches || loading {
+        preview = preview.child(widgets::text(
+            "Loading file names and sizes…",
+            10.,
+            theme.text_secondary,
+        ));
+    } else if let Some(error) = error {
+        preview = preview.child(widgets::text(
+            format!("Could not load contents: {error}"),
+            10.,
+            theme.text_tertiary,
+        ));
+    } else if files.is_empty() {
+        preview = preview.child(widgets::text(
+            "No file list was provided.",
+            10.,
+            theme.text_tertiary,
+        ));
+    } else {
+        let mut rows = div()
+            .id("accordion-contents-files")
+            .flex()
+            .flex_col()
+            .min_h(px(0.))
+            .max_h(px(190.))
+            .overflow_y_scroll();
+        for file in files {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(27.))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .font_family(UI_FONT)
+                            .text_size(px(10.5))
+                            .text_color(theme.text)
+                            .truncate()
+                            .child(file.path.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(UI_FONT)
+                            .text_size(px(10.))
+                            .text_color(theme.text_secondary)
+                            .child(human_size(file.size)),
+                    ),
+            );
+        }
+        preview = preview.child(rows);
+    }
+
+    preview
+}
+
+fn contents_preview(
+    app: &App,
+    theme: &Theme,
+    result: &SearchResult,
+    cx: &mut Context<App>,
+) -> AnyElement {
+    let files = if app.preview_hash.as_deref() == Some(result.info_hash.as_str()) {
+        app.preview_files.clone()
+    } else {
+        Vec::new()
+    };
+    let loading =
+        app.preview_hash.as_deref() != Some(result.info_hash.as_str()) || app.preview_loading;
+    let error = if app.preview_hash.as_deref() == Some(result.info_hash.as_str()) {
+        app.preview_error.clone()
+    } else {
+        None
+    };
+    let total: i64 = files.iter().map(|file| file.size).sum();
+
+    let mut section = div()
+        .flex()
+        .flex_col()
+        .gap(px(7.))
+        .pt(px(10.))
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(widgets::uppercase(
+                    "Torrent Contents",
+                    9.,
+                    theme.text_tertiary,
+                ))
+                .child(widgets::text(
+                    if files.is_empty() {
+                        format!("{} files", count_text(result.num_files))
+                    } else {
+                        format!("{} files · {}", files.len(), human_size(total))
+                    },
+                    10.,
+                    theme.text_secondary,
+                )),
+        );
+
+    if loading {
+        section = section.child(widgets::text(
+            "Loading file names and sizes from torrent metadata…",
+            10.5,
+            theme.text_secondary,
+        ));
+    } else if let Some(error) = error {
+        section = section.child(widgets::text(
+            format!("Could not load torrent contents: {error}"),
+            10.,
+            theme.text_tertiary,
+        ));
+    } else if files.is_empty() {
+        section = section.child(widgets::text(
+            "This torrent did not provide a file list.",
+            10.5,
+            theme.text_tertiary,
+        ));
+    } else {
+        let theme_copy = *theme;
+        let row_count = files.len();
+        section = section.child(
+            uniform_list(
+                "torrent-preview-files",
+                row_count,
+                cx.processor(move |_this, range: Range<usize>, _window, _cx| {
+                    range
+                        .filter_map(|index| files.get(index))
+                        .map(|file| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .h(px(27.))
+                                .border_b_1()
+                                .border_color(theme_copy.border)
+                                .child(
+                                    div()
+                                        .flex_grow(1.0)
+                                        .min_w(px(0.))
+                                        .font_family(UI_FONT)
+                                        .text_size(px(10.5))
+                                        .text_color(theme_copy.text)
+                                        .truncate()
+                                        .child(file.path.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(10.))
+                                        .text_color(theme_copy.text_secondary)
+                                        .child(human_size(file.size)),
+                                )
+                                .into_any_element()
+                        })
+                        .collect()
+                }),
+            )
+            .h(px(190.))
+            .max_h(px(230.))
+            .w_full(),
+        );
+    }
+
+    section.into_any_element()
 }
 
 fn result_stats(theme: &Theme, result: &SearchResult, reports_health: bool) -> Div {

@@ -16,7 +16,7 @@ use nori_core::search::{
     self, CancellationToken, Group, SearchEvent, SearchResult, Searcher, SourceMeta, build_magnet,
     filter_by_text, is_info_hash, normalize_hash, parse_magnet, sources, sources_for,
 };
-use nori_core::torrent::{BatchMode, Item, Status, TorrentManager};
+use nori_core::torrent::{BatchMode, Item, ItemFile, Status, TorrentManager};
 
 use crate::icons;
 use crate::input::TextInput;
@@ -141,6 +141,19 @@ impl Sort {
 /// The source tags the source sort can pin, in a stable order.
 pub static SORT_SOURCES: [&str; 8] = ["FG", "YTS", "EZTV", "NYAA", "SUB", "TPB", "1337", "BT"];
 
+/// Source tags that should be offered for a category, keeping only tags with
+/// at least one enabled source in that group.
+pub fn sort_tags_for(group: Option<Group>, enabled: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    SORT_SOURCES
+        .into_iter()
+        .filter(|tag| {
+            sources_for(group)
+                .iter()
+                .any(|source| source_tag(source.key) == *tag && enabled(source.key))
+        })
+        .collect()
+}
+
 pub struct Toast {
     pub message: String,
     pub at: Instant,
@@ -180,12 +193,21 @@ pub struct App {
     pub sort_menu_at: Option<Point<Pixels>>,
     pub hide_dead: bool,
     pub chosen: HashSet<String>,
+    /// Chosen results in the order they were ticked. Kept separately so a
+    /// filter or a new search does not lose the selection's details.
+    pub chosen_results: Vec<SearchResult>,
     pub selected: Option<usize>,
     pub show_filter: bool,
     pub detail_open: bool,
     pub detail_touched: bool,
     pub detail_expanded: Option<String>,
     pub detail_list: ListState,
+    pub detail_width: f32,
+    pub detail_resizing: bool,
+    pub preview_hash: Option<String>,
+    pub preview_files: Vec<ItemFile>,
+    pub preview_loading: bool,
+    pub preview_error: Option<String>,
 
     pub downloads: Vec<Item>,
     pub dl_selected: Option<usize>,
@@ -311,12 +333,19 @@ impl App {
             sort_menu_at: None,
             hide_dead,
             chosen: HashSet::new(),
+            chosen_results: Vec::new(),
             selected: None,
             show_filter: false,
             detail_open: false,
             detail_touched: false,
             detail_expanded: None,
             detail_list: ListState::new(0, ListAlignment::Top, px(300.)),
+            detail_width: 340.,
+            detail_resizing: false,
+            preview_hash: None,
+            preview_files: Vec::new(),
+            preview_loading: false,
+            preview_error: None,
             downloads,
             dl_selected: None,
             done_selected: None,
@@ -439,6 +468,43 @@ impl App {
             .collect()
     }
 
+    /// Source tags that should appear in the sort submenu: only sources the
+    /// user has left enabled in this category, in the stable tag order.
+    pub fn enabled_sort_tags(&self) -> Vec<&'static str> {
+        sort_tags_for(self.category_group(), |key| self.cfg.enabled(key))
+    }
+
+    /// Reconcile the browse state after a source is switched on or off.
+    pub fn sources_changed(&mut self, cx: &mut Context<Self>) {
+        let enabled: HashSet<String> = self
+            .enabled_sources()
+            .iter()
+            .map(|source| source.key.to_owned())
+            .collect();
+        self.states.retain(|key, _| enabled.contains(key));
+        self.results
+            .retain(|result| self.cfg.enabled(&result.source));
+
+        // A result from a source the user just disabled should not linger in
+        // the details bar either.
+        self.chosen_results
+            .retain(|result| self.cfg.enabled(&result.source));
+        let keep: HashSet<String> = self
+            .chosen_results
+            .iter()
+            .map(|result| result.info_hash.clone())
+            .collect();
+        self.chosen.retain(|hash| keep.contains(hash));
+
+        if let Some(pinned) = self.sort.source
+            && !self.enabled_sort_tags().contains(&pinned)
+        {
+            self.sort = Sort::default();
+        }
+        self.refresh();
+        cx.notify();
+    }
+
     pub fn reports_health(&self, source_id: &str) -> bool {
         sources()
             .iter()
@@ -452,7 +518,10 @@ impl App {
             .results
             .iter()
             .filter(|result| {
-                !(self.hide_dead && result.seeders == 0 && self.reports_health(&result.source))
+                self.cfg.enabled(&result.source)
+                    && !(self.hide_dead
+                        && result.seeders == 0
+                        && self.reports_health(&result.source))
             })
             .cloned()
             .collect();
@@ -476,8 +545,20 @@ impl App {
         {
             self.selected = self.shown.len().checked_sub(1);
         }
-        self.chosen
-            .retain(|hash| self.shown.iter().any(|r| &r.info_hash == hash));
+        // Selections survive filtering and new searches. Keep the stored
+        // copies fresh whenever the same torrent shows up in the new results.
+        if !self.chosen_results.is_empty() {
+            let fresh: HashMap<&str, &SearchResult> = self
+                .results
+                .iter()
+                .map(|result| (result.info_hash.as_str(), result))
+                .collect();
+            for result in &mut self.chosen_results {
+                if let Some(updated) = fresh.get(result.info_hash.as_str()) {
+                    *result = (*updated).clone();
+                }
+            }
+        }
     }
 
     pub fn cancel_search(&mut self) {
@@ -488,7 +569,6 @@ impl App {
 
     pub fn start_search(&mut self, cx: &mut Context<Self>) {
         self.cancel_search();
-        self.detail_open = false;
         self.batch_prompt = None;
         self.search_id = self.search_id.wrapping_add(1);
         let id = self.search_id;
@@ -520,7 +600,6 @@ impl App {
             })
             .collect();
         self.results.clear();
-        self.chosen.clear();
         self.selected = None;
         self.reset_detail_expansion();
         self.loading = enabled.len();
@@ -558,6 +637,12 @@ impl App {
     }
 
     pub fn apply_event(&mut self, event: SearchEvent) {
+        // A source may have been switched off while its search was running.
+        if !self.cfg.enabled(&event.source) {
+            self.loading = self.loading.saturating_sub(1);
+            self.refresh();
+            return;
+        }
         let state = self
             .states
             .entry(event.source.clone())
@@ -641,25 +726,117 @@ impl App {
                 self.detail_list.splice(index..index + 1, 1);
             }
         }
+        if !is_open && let Some(result) = rows.iter().find(|row| row.info_hash == hash).cloned() {
+            self.request_preview(&result, cx);
+        }
         cx.notify();
     }
 
     pub fn pick(&self) -> Vec<SearchResult> {
         if !self.chosen.is_empty() {
-            let picked: Vec<SearchResult> = self
-                .shown
-                .iter()
-                .filter(|result| self.chosen.contains(&result.info_hash))
-                .cloned()
-                .collect();
-            if !picked.is_empty() {
-                return picked;
-            }
+            return self.chosen_results.clone();
         }
         self.selected
             .and_then(|index| self.shown.get(index).cloned())
             .into_iter()
             .collect()
+    }
+
+    /// Resolve and cache the file listing for a selected search result.
+    pub fn request_preview(&mut self, result: &SearchResult, cx: &mut Context<Self>) {
+        if self.preview_hash.as_deref() == Some(result.info_hash.as_str())
+            && (self.preview_loading
+                || !self.preview_files.is_empty()
+                || self.preview_error.is_some())
+        {
+            return;
+        }
+
+        let hash = result.info_hash.clone();
+        self.preview_hash = Some(hash.clone());
+        self.preview_files.clear();
+        self.preview_error = None;
+        self.preview_loading = true;
+
+        let response = self.manager.preview_files(&result.magnet);
+        cx.spawn(async move |this, cx| {
+            let result = response
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("File preview was cancelled".to_owned()));
+            let _ = this.update(cx, |app, cx| {
+                if app.preview_hash.as_deref() != Some(hash.as_str()) {
+                    return;
+                }
+                app.preview_loading = false;
+                match result {
+                    Ok(files) => app.preview_files = files,
+                    Err(error) => app.preview_error = Some(error),
+                }
+                let picked = app.pick();
+                if picked.len() > 1
+                    && let Some(index) = picked.iter().position(|row| row.info_hash == hash)
+                {
+                    app.detail_list.splice(index..index + 1, 1);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn request_preview_for_pick(&mut self, cx: &mut Context<Self>) {
+        let rows = self.pick();
+        let selected = if rows.len() == 1 {
+            rows.first()
+        } else if self.detail_touched {
+            self.detail_expanded
+                .as_deref()
+                .and_then(|hash| rows.iter().find(|row| row.info_hash == hash))
+        } else {
+            rows.first()
+        };
+        if let Some(selected) = selected.cloned() {
+            self.request_preview(&selected, cx);
+        }
+    }
+
+    /// Drop every chosen result, including any the current filter hides.
+    pub fn clear_chosen(&mut self) {
+        self.chosen.clear();
+        self.chosen_results.clear();
+    }
+
+    /// Tick or untick one result, keeping the ordered copies in step.
+    pub fn toggle_chosen(&mut self, result: &SearchResult) {
+        if self.chosen.remove(&result.info_hash) {
+            self.chosen_results
+                .retain(|picked| picked.info_hash != result.info_hash);
+        } else {
+            self.chosen.insert(result.info_hash.clone());
+            self.chosen_results.push(result.clone());
+        }
+    }
+
+    /// Add every visible result to the selection, or remove only the visible
+    /// ones. Selections hidden by the current filter are left alone.
+    pub fn set_all_shown_chosen(&mut self, on: bool) {
+        let visible: HashSet<String> = self
+            .shown
+            .iter()
+            .map(|result| result.info_hash.clone())
+            .collect();
+        if on {
+            for result in &self.shown {
+                if self.chosen.insert(result.info_hash.clone()) {
+                    self.chosen_results.push(result.clone());
+                }
+            }
+        } else {
+            self.chosen.retain(|hash| !visible.contains(hash));
+            self.chosen_results
+                .retain(|picked| !visible.contains(&picked.info_hash));
+        }
     }
 
     pub fn download_picked(&mut self, cx: &mut Context<Self>) {
@@ -681,7 +858,7 @@ impl App {
         let row = &rows[0];
         match self.manager.add(&row.magnet, &row.source) {
             Ok(()) => {
-                self.chosen.clear();
+                self.clear_chosen();
                 self.reset_detail_expansion();
                 self.set_toast(format!("Added {}", row.name), cx);
             }
@@ -701,7 +878,7 @@ impl App {
             .collect();
         match self.manager.add_batch(&rows, mode) {
             Ok(count) => {
-                self.chosen.clear();
+                self.clear_chosen();
                 self.selected = None;
                 self.reset_detail_expansion();
                 let verb = if mode == BatchMode::Queue {
@@ -765,7 +942,7 @@ impl App {
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
-        self.chosen.clear();
+        self.clear_chosen();
         self.selected = None;
         self.detail_open = false;
         self.reset_detail_expansion();
@@ -788,6 +965,9 @@ impl App {
                 };
                 self.selected = Some(next);
                 self.detail_open = false;
+                if let Some(result) = self.shown.get(next).cloned() {
+                    self.request_preview(&result, cx);
+                }
                 self.result_scroll
                     .scroll_to_item(next, gpui::ScrollStrategy::Center);
             }
@@ -835,7 +1015,13 @@ impl App {
     }
 
     pub fn open_folder(&self, item: &Item, _cx: &mut Context<Self>) {
-        reveal_item(item);
+        if item.dir.trim().is_empty() {
+            // Metadata has not named the folder yet; the configured download
+            // folder is the best answer.
+            reveal_path(std::path::Path::new(&self.cfg.download_dir));
+        } else {
+            reveal_item(item);
+        }
     }
 
     pub fn choose_folder(&mut self, cx: &mut Context<Self>) {
@@ -895,10 +1081,14 @@ impl App {
         } else if self.section == Section::Browse
             && (!self.chosen.is_empty() || self.selected.is_some())
         {
-            self.chosen.clear();
+            self.clear_chosen();
             self.selected = None;
             self.reset_detail_expansion();
             self.refresh();
+        } else if self.section == Section::Downloads && self.dl_selected.is_some() {
+            self.dl_selected = None;
+        } else if self.section == Section::Seeding && self.seed_selected.is_some() {
+            self.seed_selected = None;
         }
         self.focus_list(window, cx);
         cx.notify();
@@ -1009,7 +1199,7 @@ impl App {
             return;
         };
         self.manager.remove(&item.id);
-        self.set_toast("Removed from the list; its files stay on disk", cx);
+        self.set_toast("Deleted", cx);
     }
 
     fn action_open_folder(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1063,15 +1253,7 @@ impl App {
             .shown
             .iter()
             .all(|result| self.chosen.contains(&result.info_hash));
-        if all {
-            self.chosen.clear();
-        } else {
-            self.chosen = self
-                .shown
-                .iter()
-                .map(|result| result.info_hash.clone())
-                .collect();
-        }
+        self.set_all_shown_chosen(!all);
         self.selected = None;
         self.reset_detail_expansion();
         self.focus_list(window, cx);
@@ -1082,13 +1264,8 @@ impl App {
         if self.section != Section::Browse || self.shown.is_empty() {
             return;
         }
-        self.chosen = self
-            .shown
-            .iter()
-            .map(|result| result.info_hash.clone())
-            .collect();
+        self.set_all_shown_chosen(true);
         self.selected = None;
-        self.detail_open = false;
         self.reset_detail_expansion();
         self.focus_list(window, cx);
         cx.notify();
@@ -1554,33 +1731,36 @@ impl App {
             }
         }
 
-        // Source, with every source tag as an option.
-        panel = panel.child(self.sort_row(
-            theme,
-            "Source",
-            SortBy::Source,
-            self.sort.by == SortBy::Source,
-            true,
-            cx,
-        ));
-        if self.sort_submenu == Some(SortBy::Source) {
-            for (slot, tag) in SORT_SOURCES.into_iter().enumerate() {
-                let chosen = self.sort.by == SortBy::Source && self.sort.source == Some(tag);
-                let available = self.source_has_results(tag);
-                let next = Sort {
-                    by: SortBy::Source,
-                    desc: self.sort.desc,
-                    source: Some(tag),
-                };
-                panel = panel.child(self.sort_option(
-                    theme,
-                    tag,
-                    slot + 4,
-                    chosen,
-                    available,
-                    next,
-                    cx,
-                ));
+        // Source, with only the sources the user has left enabled.
+        let tags = self.enabled_sort_tags();
+        if !tags.is_empty() {
+            panel = panel.child(self.sort_row(
+                theme,
+                "Source",
+                SortBy::Source,
+                self.sort.by == SortBy::Source,
+                true,
+                cx,
+            ));
+            if self.sort_submenu == Some(SortBy::Source) {
+                for (slot, tag) in tags.into_iter().enumerate() {
+                    let chosen = self.sort.by == SortBy::Source && self.sort.source == Some(tag);
+                    let available = self.source_has_results(tag);
+                    let next = Sort {
+                        by: SortBy::Source,
+                        desc: self.sort.desc,
+                        source: Some(tag),
+                    };
+                    panel = panel.child(self.sort_option(
+                        theme,
+                        tag,
+                        slot + 4,
+                        chosen,
+                        available,
+                        next,
+                        cx,
+                    ));
+                }
             }
         }
 
@@ -1804,6 +1984,9 @@ pub fn width_of(window: &Window) -> f32 {
 /// The path to reveal: the item itself when it exists on disk, otherwise the
 /// folder that holds it.
 pub fn item_target(item: &Item) -> PathBuf {
+    if item.dir.trim().is_empty() {
+        return PathBuf::new();
+    }
     let path = Path::new(&item.dir).join(&item.name);
     if path.exists() {
         path
@@ -2067,6 +2250,21 @@ pub fn row_background(theme: &Theme, selected: bool) -> Hsla {
 
 pub fn tint(id: &str, theme: &Theme) -> Hsla {
     source_tint(id, theme)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_sort_tags_follow_group_and_enabled_sources() {
+        let tags = sort_tags_for(Some(Group::Movies), |key| {
+            key != "yts" && key != "tpb-movies"
+        });
+        assert!(!tags.contains(&"YTS"));
+        assert!(!tags.contains(&"TPB"));
+        assert!(tags.contains(&"1337"));
+    }
 }
 
 pub fn _keep_imports_used() {

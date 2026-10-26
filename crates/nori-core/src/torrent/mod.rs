@@ -4,4 +4,4 @@ pub mod manager;
 pub mod perms;
 pub mod playlist;
 
-pub use manager::{BatchMode, Item, Status, TorrentManager};
+pub use manager::{BatchMode, Item, ItemFile, Status, TorrentManager};
