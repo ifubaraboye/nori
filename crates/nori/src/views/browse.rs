@@ -53,12 +53,13 @@ pub fn view(
         .child(
             div()
                 .id("detail-resize-handle")
-                .w(px(7.))
+                .w(px(6.))
                 .h_full()
                 .flex_shrink_0()
                 .cursor(CursorStyle::ResizeLeftRight)
-                .bg(theme.border)
-                .hover(move |style| style.bg(theme.text_tertiary))
+                .flex()
+                .justify_center()
+                .child(div().w(px(1.)).h_full().bg(theme.border))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -73,8 +74,6 @@ pub fn view(
                 .flex_col()
                 .w(px(detail_width))
                 .flex_shrink_0()
-                .border_l_1()
-                .border_color(theme.border)
                 .child(detail_pane(app, theme, width, cx)),
         )
         .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -148,7 +147,7 @@ fn compact_detail(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -
 fn results_pane(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -> AnyElement {
     let side = if width >= 1020. { 196. } else { 54. };
     let detail = if width >= 900. && !app.pick().is_empty() {
-        constrained_detail_width(app.detail_width, width) + 7.
+        constrained_detail_width(app.detail_width, width) + 6.
     } else {
         0.
     };
