@@ -12,15 +12,8 @@ use crate::icons;
 use crate::theme::Theme;
 use crate::widgets::{self, UI_FONT};
 
-pub fn downloads_view(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -> AnyElement {
-    let list = downloads_list(app, theme, cx);
-    let Some(item) = app
-        .dl_selected
-        .and_then(|index| app.active_downloads().get(index).cloned())
-    else {
-        return list;
-    };
-    files_layout(app, theme, width, list, &item, FilesKind::Download, cx)
+pub fn downloads_view(app: &App, theme: &Theme, _width: f32, cx: &mut Context<App>) -> AnyElement {
+    downloads_list(app, theme, cx)
 }
 
 fn downloads_list(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
@@ -70,15 +63,8 @@ fn downloads_list(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement
     column.into_any_element()
 }
 
-pub fn seeding_view(app: &App, theme: &Theme, width: f32, cx: &mut Context<App>) -> AnyElement {
-    let list = seeding_list(app, theme, cx);
-    let Some(item) = app
-        .seed_selected
-        .and_then(|index| app.completed_downloads().get(index).cloned())
-    else {
-        return list;
-    };
-    files_layout(app, theme, width, list, &item, FilesKind::Seed, cx)
+pub fn seeding_view(app: &App, theme: &Theme, _width: f32, cx: &mut Context<App>) -> AnyElement {
+    seeding_list(app, theme, cx)
 }
 
 fn seeding_list(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
@@ -96,11 +82,7 @@ fn seeding_list(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
         .child(widgets::strong("Seeding", 12., theme.text))
         .child(div().flex_grow(1.0));
     if !app.cfg.seeding_enabled {
-        bar = bar.child(widgets::text(
-            "Seeding Off",
-            10.,
-            theme.text_tertiary,
-        ));
+        bar = bar.child(widgets::text("Seeding Off", 10., theme.text_tertiary));
     }
 
     let mut column = div().flex().flex_col().size_full().min_h(px(0.)).child(bar);
@@ -146,291 +128,6 @@ fn seeding_list(app: &App, theme: &Theme, cx: &mut Context<App>) -> AnyElement {
     );
 
     column.into_any_element()
-}
-
-#[derive(Clone, Copy)]
-enum FilesKind {
-    Download,
-    Seed,
-}
-
-impl FilesKind {
-    fn clear(self, app: &mut App) {
-        match self {
-            FilesKind::Download => app.dl_selected = None,
-            FilesKind::Seed => app.seed_selected = None,
-        }
-    }
-}
-
-/// Put the file pane beside the queue, or replace the queue with it on a
-/// narrow window.
-fn files_layout(
-    app: &App,
-    theme: &Theme,
-    width: f32,
-    list: AnyElement,
-    item: &Item,
-    kind: FilesKind,
-    cx: &mut Context<App>,
-) -> AnyElement {
-    if width < 900. {
-        return compact_files(app, theme, item, kind, cx);
-    }
-    let pane_width = if width < 1120. { 300. } else { 340. };
-    div()
-        .flex()
-        .size_full()
-        .min_h(px(0.))
-        .child(div().flex_grow(1.0).min_w(px(0.)).h_full().child(list))
-        .child(
-            div()
-                .w(px(pane_width))
-                .h_full()
-                .flex_shrink_0()
-                .border_l_1()
-                .border_color(theme.border)
-                .child(files_pane(app, theme, item, kind, false, cx)),
-        )
-        .into_any_element()
-}
-
-fn compact_files(
-    app: &App,
-    theme: &Theme,
-    item: &Item,
-    kind: FilesKind,
-    cx: &mut Context<App>,
-) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .size_full()
-        .min_h(px(0.))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .h(px(40.))
-                .px(px(12.))
-                .flex_shrink_0()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    widgets::button(theme, "Back")
-                        .id("files-back")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            kind.clear(this);
-                            cx.notify();
-                        })),
-                )
-                .child(widgets::strong("Files", 12., theme.text)),
-        )
-        .child(files_pane(app, theme, item, kind, true, cx))
-        .into_any_element()
-}
-
-fn files_pane(
-    app: &App,
-    theme: &Theme,
-    item: &Item,
-    kind: FilesKind,
-    compact: bool,
-    cx: &mut Context<App>,
-) -> AnyElement {
-    let count = item.files.len();
-    let total: i64 = if item.size_bytes > 0 {
-        item.size_bytes
-    } else {
-        item.files.iter().map(|file| file.size).sum()
-    };
-
-    let mut header = div()
-        .flex()
-        .flex_col()
-        .gap(px(3.))
-        .flex_shrink_0()
-        .px(px(16.))
-        .pt(px(14.))
-        .pb(px(10.))
-        .child(
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(13.))
-                .line_height(px(18.))
-                .text_color(theme.text)
-                .truncate()
-                .child(item.name.clone()),
-        )
-        .child(
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(10.5))
-                .line_height(px(15.))
-                .text_color(theme.text_secondary)
-                .child(format!(
-                    "{} files  ·  {}  ·  {}",
-                    count,
-                    human_size(total),
-                    item.status.label()
-                )),
-        );
-    if item.status == Status::Downloading {
-        header = header.child(widgets::progress(theme, item.fraction() as f32));
-    }
-    if item.status == Status::Completed && !app.cfg.seeding_enabled {
-        header = header.child(widgets::text(
-            "Seeding is off in Settings. Files are complete.",
-            10.,
-            theme.text_tertiary,
-        ));
-    }
-
-    let files = item.files.clone();
-    let completed = item.status == Status::Completed;
-    let theme_copy = *theme;
-    let body: AnyElement = if files.is_empty() {
-        div()
-            .flex()
-            .flex_grow(1.0)
-            .items_center()
-            .justify_center()
-            .px(px(20.))
-            .child(widgets::text(
-                "The file list appears once the torrent's metadata is ready.",
-                10.5,
-                theme.text_tertiary,
-            ))
-            .into_any_element()
-    } else {
-        let rows = files.len();
-        uniform_list(
-            "item-files",
-            rows,
-            cx.processor(move |_this, range: Range<usize>, _window, _cx| {
-                range
-                    .filter_map(|index| {
-                        files
-                            .get(index)
-                            .map(|file| file_row(&theme_copy, file, completed))
-                    })
-                    .collect()
-            }),
-        )
-        .flex_grow(1.0)
-        .w_full()
-        .min_h(px(0.))
-        .into_any_element()
-    };
-
-    let footer = div()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .flex_shrink_0()
-        .px(px(16.))
-        .py(px(10.))
-        .border_t_1()
-        .border_color(theme.border)
-        .child(
-            widgets::button(theme, "Show in Folder")
-                .id("files-folder")
-                .on_click(cx.listener({
-                    let item = item.clone();
-                    move |this, _, _, cx| {
-                        this.open_folder(&item, cx);
-                    }
-                })),
-        );
-
-    let mut pane = div().flex().flex_col().size_full().min_h(px(0.));
-    if !compact {
-        pane = pane.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .h(px(30.))
-                .px(px(8.))
-                .flex_shrink_0()
-                .child(
-                    widgets::icon_button(theme, icons::X, 12., theme.text_secondary)
-                        .id("files-close")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            kind.clear(this);
-                            cx.notify();
-                        })),
-                ),
-        );
-    }
-    pane.child(header)
-        .child(body)
-        .child(footer)
-        .into_any_element()
-}
-
-fn file_row(theme: &Theme, file: &nori_core::torrent::ItemFile, completed: bool) -> AnyElement {
-    let fraction = if file.size > 0 {
-        (file.downloaded as f64 / file.size as f64).clamp(0.0, 1.0) as f32
-    } else {
-        1.0
-    };
-    let path = file.path.rsplit('/').next().unwrap_or(&file.path);
-    let folder = file
-        .path
-        .rsplit_once('/')
-        .map(|(folder, _)| folder)
-        .unwrap_or_default();
-
-    let mut label = div()
-        .flex()
-        .flex_col()
-        .flex_grow(1.0)
-        .min_w(px(0.))
-        .gap(px(1.))
-        .child(
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(11.))
-                .line_height(px(15.))
-                .text_color(theme.text)
-                .truncate()
-                .child(path.to_owned()),
-        );
-    if !folder.is_empty() {
-        label = label.child(
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(9.5))
-                .line_height(px(13.))
-                .text_color(theme.text_tertiary)
-                .truncate()
-                .child(folder.to_owned()),
-        );
-    }
-
-    let mut row = div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .gap(px(4.))
-        .px(px(16.))
-        .py(px(6.))
-        .child(
-            div().flex().items_center().gap(px(10.)).child(label).child(
-                div()
-                    .flex_shrink_0()
-                    .font_family(UI_FONT)
-                    .text_size(px(10.))
-                    .text_color(theme.text_secondary)
-                    .child(human_size(file.size)),
-            ),
-        );
-    if !completed && fraction < 1.0 {
-        row = row.child(widgets::progress(theme, fraction));
-    }
-    row.into_any_element()
 }
 
 fn download_row(
@@ -526,20 +223,27 @@ fn download_row(
                     )
                     .id(("dl-toggle", index))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if paused {
-                            this.manager.resume(&toggle_id);
+                        let result = if paused {
+                            this.manager.resume(&toggle_id)
                         } else {
-                            this.manager.pause(&toggle_id);
+                            this.manager.pause(&toggle_id)
+                        };
+                        if let Err(error) = result {
+                            this.set_toast(error, cx);
+                        } else {
+                            cx.notify();
                         }
-                        cx.notify();
                     })),
                 )
                 .child(
                     widgets::icon_button(theme, icons::STOP, 20., theme.danger)
                         .id(("dl-stop", index))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.manager.pause(&stop_id);
-                            cx.notify();
+                            if let Err(error) = this.manager.pause(&stop_id) {
+                                this.set_toast(error, cx);
+                            } else {
+                                cx.notify();
+                            }
                         })),
                 )
                 .child(
@@ -553,8 +257,11 @@ fn download_row(
                     widgets::icon_button(theme, icons::TRASH, 18., theme.danger)
                         .id(("dl-remove", index))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.manager.remove(&remove_id);
-                            this.set_toast("Removed from the list; its files stay on disk", cx);
+                            if let Err(error) = this.manager.remove(&remove_id) {
+                                this.set_toast(error, cx);
+                            } else {
+                                this.set_toast("Removed from the list; its files stay on disk", cx);
+                            }
                         })),
                 ),
         );
@@ -678,8 +385,11 @@ fn seed_row(
                     widgets::icon_button(theme, icons::TRASH, 18., theme.danger)
                         .id(("seed-remove", index))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.manager.remove(&remove_id);
-                            cx.notify();
+                            if let Err(error) = this.manager.remove(&remove_id) {
+                                this.set_toast(error, cx);
+                            } else {
+                                cx.notify();
+                            }
                         })),
                 ),
         );

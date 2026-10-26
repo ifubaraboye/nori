@@ -759,6 +759,24 @@ impl App {
         self.preview_loading = true;
 
         let response = self.manager.preview_files(&result.magnet);
+        let timeout_hash = hash.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(20))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.preview_hash.as_deref() == Some(timeout_hash.as_str()) && app.preview_loading
+                {
+                    app.preview_loading = false;
+                    app.preview_error = Some(
+                        "Metadata did not arrive within 20 seconds; try selecting it again"
+                            .to_owned(),
+                    );
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let result = response
                 .recv()
@@ -859,6 +877,13 @@ impl App {
         match self.manager.add(&row.magnet, &row.source) {
             Ok(()) => {
                 self.clear_chosen();
+                // Stay on the results, with the added torrent still selected, so
+                // its details and file list stay on screen.
+                self.selected = self
+                    .shown
+                    .iter()
+                    .position(|result| result.info_hash == row.info_hash)
+                    .or(self.selected);
                 self.reset_detail_expansion();
                 self.set_toast(format!("Added {}", row.name), cx);
             }
@@ -879,7 +904,15 @@ impl App {
         match self.manager.add_batch(&rows, mode) {
             Ok(count) => {
                 self.clear_chosen();
-                self.selected = None;
+                if let Some(first) = prompt.rows.first() {
+                    // Keep the batch visible in the details pane instead of
+                    // jumping to Downloads.
+                    self.selected = self
+                        .shown
+                        .iter()
+                        .position(|result| result.info_hash == first.info_hash)
+                        .or(self.selected);
+                }
                 self.reset_detail_expansion();
                 let verb = if mode == BatchMode::Queue {
                     "Queued"
@@ -1185,12 +1218,16 @@ impl App {
         let Some(item) = self.dl_selected.and_then(|index| active.get(index)) else {
             return;
         };
-        if matches!(item.status, Status::Paused | Status::Failed) {
-            self.manager.resume(&item.id);
+        let result = if matches!(item.status, Status::Paused | Status::Failed) {
+            self.manager.resume(&item.id)
         } else {
-            self.manager.pause(&item.id);
+            self.manager.pause(&item.id)
+        };
+        if let Err(error) = result {
+            self.set_toast(error, cx);
+        } else {
+            cx.notify();
         }
-        cx.notify();
     }
 
     fn action_remove_download(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1198,8 +1235,11 @@ impl App {
         let Some(item) = self.dl_selected.and_then(|index| active.get(index)) else {
             return;
         };
-        self.manager.remove(&item.id);
-        self.set_toast("Deleted", cx);
+        if let Err(error) = self.manager.remove(&item.id) {
+            self.set_toast(error, cx);
+        } else {
+            self.set_toast("Deleted", cx);
+        }
     }
 
     fn action_open_folder(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1232,8 +1272,11 @@ impl App {
         let Some(item) = self.seed_selected.and_then(|index| done.get(index)) else {
             return;
         };
-        self.manager.remove(&item.id);
-        cx.notify();
+        if let Err(error) = self.manager.remove(&item.id) {
+            self.set_toast(error, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn action_select_next(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

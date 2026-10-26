@@ -370,6 +370,19 @@ impl TorrentManager {
             .cloned()
     }
 
+    /// Reflect a queue command in the UI snapshot before the network thread
+    /// has finished its filesystem or session work. The engine remains the
+    /// source of truth and publishes its full state immediately afterwards.
+    fn update_snapshot(&self, update: impl FnOnce(&mut Vec<Item>)) {
+        update(&mut self.shared.items.write());
+        let _ = self.shared.changes.try_send(());
+    }
+
+    fn persist_snapshot(&self) {
+        let items = self.shared.items.read().clone();
+        persist_items(&items);
+    }
+
     /// The channel that signals "the queue changed".
     pub fn changes(&self) -> async_channel::Receiver<()> {
         self.shared
@@ -389,12 +402,33 @@ impl TorrentManager {
         if id.is_empty() {
             return Err("The magnet link carries no info hash".into());
         }
-        let _ = self.shared.tx.send(Command::Add {
-            id,
-            name,
-            magnet,
-            source: source_label(source),
-            dir: String::new(),
+        let source = source_label(source);
+        self.shared
+            .tx
+            .send(Command::Add {
+                id: id.clone(),
+                name: name.clone(),
+                magnet: magnet.clone(),
+                source: source.clone(),
+                dir: String::new(),
+            })
+            .map_err(|_| "Torrent manager is unavailable".to_owned())?;
+        self.update_snapshot(|items| {
+            if items.iter().all(|item| item.id != id) {
+                items.insert(
+                    0,
+                    Item {
+                        id,
+                        name,
+                        magnet,
+                        source,
+                        dir: String::new(),
+                        status: Status::Downloading,
+                        added_at: unix_now(),
+                        ..Default::default()
+                    },
+                );
+            }
         });
         Ok(())
     }
@@ -427,20 +461,92 @@ impl TorrentManager {
             return Err("Choose at least one result".into());
         }
         let count = items.len();
-        let _ = self.shared.tx.send(Command::AddBatch { items, mode });
+        let added_at = unix_now();
+        let group = (mode == BatchMode::Queue)
+            .then(|| items.first().map(|item| item.id.clone()))
+            .flatten();
+        let optimistic: Vec<Item> = items
+            .iter()
+            .map(|item| Item {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                magnet: item.magnet.clone(),
+                source: item.source.clone(),
+                dir: item.dir.clone(),
+                status: if mode == BatchMode::AllAtOnce {
+                    Status::Downloading
+                } else {
+                    Status::Queued
+                },
+                added_at,
+                queue_group: group.clone(),
+                start_all: mode == BatchMode::AllAtOnce,
+                ..Default::default()
+            })
+            .collect();
+        self.shared
+            .tx
+            .send(Command::AddBatch { items, mode })
+            .map_err(|_| "Torrent manager is unavailable".to_owned())?;
+        self.update_snapshot(|items| {
+            let mut new_items = Vec::new();
+            for item in optimistic {
+                if let Some(existing) = items.iter_mut().find(|old| old.id == item.id) {
+                    if matches!(existing.status, Status::Paused | Status::Failed) {
+                        existing.status = Status::Queued;
+                        existing.error.clear();
+                        existing.speed = 0;
+                        existing.up_speed = 0;
+                    }
+                } else {
+                    new_items.push(item);
+                }
+            }
+            items.splice(0..0, new_items);
+        });
         Ok(count)
     }
 
-    pub fn pause(&self, id: &str) {
-        let _ = self.shared.tx.send(Command::Pause(id.to_owned()));
+    pub fn pause(&self, id: &str) -> Result<(), String> {
+        self.shared
+            .tx
+            .send(Command::Pause(id.to_owned()))
+            .map_err(|_| "Torrent manager is unavailable".to_owned())?;
+        self.update_snapshot(|items| {
+            if let Some(item) = items.iter_mut().find(|item| item.id == id) {
+                item.status = Status::Paused;
+                item.speed = 0;
+                item.up_speed = 0;
+                item.error.clear();
+            }
+        });
+        Ok(())
     }
 
-    pub fn resume(&self, id: &str) {
-        let _ = self.shared.tx.send(Command::Resume(id.to_owned()));
+    pub fn resume(&self, id: &str) -> Result<(), String> {
+        self.shared
+            .tx
+            .send(Command::Resume(id.to_owned()))
+            .map_err(|_| "Torrent manager is unavailable".to_owned())?;
+        self.update_snapshot(|items| {
+            if let Some(item) = items.iter_mut().find(|item| item.id == id) {
+                item.status = Status::Queued;
+                item.error.clear();
+                item.speed = 0;
+                item.up_speed = 0;
+            }
+        });
+        Ok(())
     }
 
-    pub fn remove(&self, id: &str) {
-        let _ = self.shared.tx.send(Command::Remove(id.to_owned()));
+    pub fn remove(&self, id: &str) -> Result<(), String> {
+        self.shared
+            .tx
+            .send(Command::Remove(id.to_owned()))
+            .map_err(|_| "Torrent manager is unavailable".to_owned())?;
+        self.update_snapshot(|items| items.retain(|item| item.id != id));
+        self.persist_snapshot();
+        Ok(())
     }
 
     pub fn set_max_downloads(&self, n: i32) {
@@ -505,6 +611,7 @@ impl Drop for TorrentManager {
 struct Engine {
     shared: Arc<Shared>,
     session: Arc<Session>,
+    preview_session: Arc<Session>,
     state: Mutex<State>,
     config: Mutex<Config>,
     dirty: AtomicBool,
@@ -537,10 +644,19 @@ fn run(config: Config, shared: Arc<Shared>, rx: UnboundedReceiver<Command>) {
                 return;
             }
         };
+        let preview_session = match build_preview_session(&config).await {
+            Ok(session) => session,
+            Err(err) => {
+                *shared.startup_error.lock() =
+                    Some(format!("Could not start metadata previews: {err:#}"));
+                return;
+            }
+        };
         let (start_tx, mut start_rx) = unbounded_channel::<String>();
         let engine = Engine {
             shared,
             session,
+            preview_session,
             state: Mutex::new(State::default()),
             config: Mutex::new(config),
             dirty: AtomicBool::new(false),
@@ -566,13 +682,18 @@ async fn build_session(config: &Config) -> anyhow::Result<Arc<Session>> {
     std::fs::create_dir_all(config::data_dir())?;
 
     let mut opts = SessionOptions::default();
+    // Many Linux environments have working IPv4 internet access but no
+    // usable IPv6 route. Binding the peer and DHT sockets to IPv6 in that
+    // situation leaves magnets stuck at zero peers while HTTP search still
+    // works normally.
+    opts.ipv4_only = true;
     opts.dht = Some(DhtSessionConfig {
         bootstrap_addrs: None,
         port: None,
         persistence: None,
     });
     opts.listen = Some(ListenerOptions {
-        listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+        listen_addr: (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
         ..Default::default()
     });
     opts.disable_local_service_discovery = true;
@@ -584,6 +705,32 @@ async fn build_session(config: &Config) -> anyhow::Result<Arc<Session>> {
     let session = Session::new_with_opts(config.download_path(), opts)
         .await
         .context("creating the torrent session")?;
+    tracing::info!(
+        listen_addr = ?session.listen_addr(),
+        ipv4_only = true,
+        "torrent session started"
+    );
+    Ok(session)
+}
+
+/// Metadata previews must not wait behind a live download resolving its
+/// magnet. This session has its own DHT/UDP resources and never owns files.
+async fn build_preview_session(config: &Config) -> anyhow::Result<Arc<Session>> {
+    let mut opts = SessionOptions::default();
+    opts.ipv4_only = true;
+    opts.dht = Some(DhtSessionConfig {
+        bootstrap_addrs: None,
+        port: None,
+        persistence: None,
+    });
+    opts.listen = None;
+    opts.disable_local_service_discovery = true;
+    opts.client_name_and_version = Some("nori/0.1-preview".into());
+
+    let session = Session::new_with_opts(config.download_path(), opts)
+        .await
+        .context("creating the metadata preview session")?;
+    tracing::info!("metadata preview session started");
     Ok(session)
 }
 
@@ -772,44 +919,49 @@ impl Engine {
                 false
             }
             Command::PreviewFiles { magnet, response } => {
-                let session = self.session.clone();
+                let session = self.preview_session.clone();
                 let trackers = self.config.lock().trackers.clone();
                 tokio::spawn(async move {
                     let magnet = with_trackers(&magnet, &trackers);
-                    let result = match session
-                        .add_torrent(
+                    let result = match tokio::time::timeout(
+                        Duration::from_secs(20),
+                        session.add_torrent(
                             AddTorrent::from_url(magnet),
                             Some(AddTorrentOptions {
                                 list_only: true,
                                 ..Default::default()
                             }),
-                        )
-                        .await
+                        ),
+                    )
+                    .await
                     {
-                        Ok(AddTorrentResponse::ListOnly(list)) => Ok(list
-                            .info
-                            .iter_file_details()
-                            .filter_map(|file| {
-                                if file.attrs().padding {
-                                    return None;
-                                }
-                                Some(ItemFile {
-                                    path: file
-                                        .filename
-                                        .to_pathbuf()
-                                        .to_string_lossy()
-                                        .replace('\\', "/"),
-                                    size: file.len as i64,
-                                    downloaded: 0,
+                        Ok(Ok(response)) => match response {
+                            AddTorrentResponse::ListOnly(list) => Ok(list
+                                .info
+                                .iter_file_details()
+                                .filter_map(|file| {
+                                    if file.attrs().padding {
+                                        return None;
+                                    }
+                                    Some(ItemFile {
+                                        path: file
+                                            .filename
+                                            .to_pathbuf()
+                                            .to_string_lossy()
+                                            .replace('\\', "/"),
+                                        size: file.len as i64,
+                                        downloaded: 0,
+                                    })
                                 })
-                            })
-                            .collect()),
-                        Ok(AddTorrentResponse::AlreadyManaged(_, handle))
-                        | Ok(AddTorrentResponse::Added(_, handle)) => {
-                            let stats = handle.stats();
-                            Ok(torrent_files(&handle, &stats.file_progress))
-                        }
-                        Err(error) => Err(format!("{error:#}")),
+                                .collect()),
+                            AddTorrentResponse::AlreadyManaged(_, handle)
+                            | AddTorrentResponse::Added(_, handle) => {
+                                let stats = handle.stats();
+                                Ok(torrent_files(&handle, &stats.file_progress))
+                            }
+                        },
+                        Ok(Err(error)) => Err(format!("{error:#}")),
+                        Err(_) => Err("Timed out waiting for torrent metadata".to_owned()),
                     };
                     let _ = response.send(result).await;
                 });
@@ -956,7 +1108,15 @@ impl Engine {
     }
 
     async fn start(&self, id: &str) {
-        let (magnet, dir, trackers, status, seed_paused, seeding_enabled, handle) = {
+        // Read the settings once, before touching the state. Taking
+        // `self.config.lock()` twice in one expression would keep the first
+        // guard alive until the expression ends and deadlock on itself, which
+        // wedges the whole engine the first time a download starts.
+        let (trackers, seeding_enabled) = {
+            let config = self.config.lock();
+            (config.trackers.clone(), config.seeding_enabled)
+        };
+        let (magnet, dir, status, seed_paused, handle) = {
             let mut state = self.state.lock();
             let Some(entry) = state.entries.get_mut(id) else {
                 return;
@@ -972,10 +1132,8 @@ impl Engine {
             (
                 entry.item.magnet.clone(),
                 entry.item.dir.clone(),
-                self.config.lock().trackers.clone(),
                 entry.item.status,
                 entry.item.seed_paused,
-                self.config.lock().seeding_enabled,
                 entry.handle.clone(),
             )
         };
@@ -1043,10 +1201,15 @@ impl Engine {
         if !trackers.is_empty() {
             options.trackers = Some(trackers);
         }
-        let response = self
-            .session
-            .add_torrent(AddTorrent::from_url(magnet), Some(options))
-            .await;
+        tracing::info!(id, "starting torrent metadata acquisition");
+        let response = tokio::time::timeout(
+            Duration::from_secs(60),
+            self.session
+                .add_torrent(AddTorrent::from_url(magnet), Some(options)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for torrent metadata"))
+        .and_then(|result| result);
         match response {
             Ok(response) => {
                 let Some(handle) = response.into_handle() else {
@@ -1110,6 +1273,7 @@ impl Engine {
                 self.publish();
             }
             Err(err) => {
+                tracing::warn!(id, error = %err, "torrent start failed");
                 self.start_failed(id, &format!("{err:#}")).await;
             }
         }
@@ -1166,12 +1330,12 @@ impl Engine {
             entry.item.error.clear();
             entry.handle.clone()
         };
+        self.dirty.store(true, Ordering::Relaxed);
+        self.publish();
         if let Some(handle) = handle {
             let _ = self.session.pause(&handle).await;
         }
         tracing::debug!("pausing {id}");
-        self.dirty.store(true, Ordering::Relaxed);
-        self.publish();
         self.schedule().await;
     }
 
@@ -1197,6 +1361,8 @@ impl Engine {
             });
             entry.handle.clone()
         };
+        self.dirty.store(true, Ordering::Relaxed);
+        self.publish();
         if let Some(handle) = handle
             && !handle.is_paused()
         {
@@ -1218,14 +1384,14 @@ impl Engine {
             state.order.retain(|existing| existing != id);
             entry.handle
         };
+        self.dirty.store(true, Ordering::Relaxed);
+        self.publish();
         if let Some(handle) = handle {
             let _ = self
                 .session
                 .delete(TorrentIdOrHash::Id(handle.id()), false)
                 .await;
         }
-        self.dirty.store(true, Ordering::Relaxed);
-        self.publish();
         self.schedule().await;
     }
 
@@ -1618,19 +1784,23 @@ impl Engine {
                 })
                 .collect()
         };
-        let Some(parent) = config::queue_path().parent().map(PathBuf::from) else {
-            return;
-        };
-        if std::fs::create_dir_all(&parent).is_err() {
-            return;
-        }
-        let Ok(raw) = serde_json::to_vec_pretty(&items) else {
-            return;
-        };
-        let tmp = config::queue_path().with_extension("json.tmp");
-        if std::fs::write(&tmp, raw).is_ok() {
-            let _ = std::fs::rename(&tmp, config::queue_path());
-        }
+        persist_items(&items);
+    }
+}
+
+fn persist_items(items: &[Item]) {
+    let Some(parent) = config::queue_path().parent().map(PathBuf::from) else {
+        return;
+    };
+    if std::fs::create_dir_all(&parent).is_err() {
+        return;
+    }
+    let Ok(raw) = serde_json::to_vec_pretty(items) else {
+        return;
+    };
+    let tmp = config::queue_path().with_extension("json.tmp");
+    if std::fs::write(&tmp, raw).is_ok() {
+        let _ = std::fs::rename(&tmp, config::queue_path());
     }
 }
 
@@ -1774,6 +1944,57 @@ mod tests {
         state
     }
 
+    fn test_manager(items: Vec<Item>) -> (TorrentManager, UnboundedReceiver<Command>) {
+        let (tx, rx) = unbounded_channel();
+        let (changes, change_rx) = async_channel::bounded(8);
+        (
+            TorrentManager {
+                shared: Arc::new(Shared {
+                    tx,
+                    items: RwLock::new(items),
+                    changes,
+                    change_rx: Mutex::new(Some(change_rx)),
+                    startup_error: Mutex::new(None),
+                    thread: Mutex::new(None),
+                }),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn queue_commands_update_the_visible_snapshot_immediately() {
+        let mut item = test_item(
+            "0123456789abcdef0123456789abcdef01234567",
+            Status::Downloading,
+        );
+        item.speed = 10;
+        let id = item.id.clone();
+        let (manager, _commands) = test_manager(vec![item]);
+
+        manager.pause(&id).unwrap();
+        assert_eq!(manager.snapshot()[0].status, Status::Paused);
+        assert_eq!(manager.snapshot()[0].speed, 0);
+
+        manager.resume(&id).unwrap();
+        assert_eq!(manager.snapshot()[0].status, Status::Queued);
+
+        manager.remove(&id).unwrap();
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn add_is_visible_before_the_engine_starts_it() {
+        let (manager, _commands) = test_manager(Vec::new());
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Cyberpunk";
+
+        manager.add(magnet, "tpb").unwrap();
+
+        let item = manager.snapshot().pop().unwrap();
+        assert_eq!(item.status, Status::Downloading);
+        assert_eq!(item.name, "Cyberpunk");
+    }
+
     #[test]
     fn queued_batches_run_one_at_a_time() {
         let mut first = test_item("first", Status::Queued);
@@ -1800,11 +2021,7 @@ mod tests {
         last.start_all = true;
         let mut state = test_state(vec![first, normal, last]);
 
-        assert_eq!(
-            plan_downloads(&mut state, 1),
-            vec!["first", "last"],
-            "start-all items start even when the cap is full"
-        );
+        assert_eq!(plan_downloads(&mut state, 1), vec!["first", "last"]);
     }
 
     #[test]
