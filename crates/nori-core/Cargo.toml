@@ -1,0 +1,25 @@
+[package]
+name = "nori-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+base32 = "0.5"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+dirs = "6"
+html-escape = "0.2"
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
+parking_lot = "0.12"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tokio-util = "0.7"
+tracing = "0.1"
+url = "2"

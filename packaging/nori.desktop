@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nori
+GenericName=Torrent Finder
+Comment=Search public trackers and download torrents
+Exec=nori
+Icon=nori
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+Keywords=torrent;magnet;search;download;
+StartupWMClass=nori-torrent

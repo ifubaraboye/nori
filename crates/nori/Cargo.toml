@@ -1,0 +1,24 @@
+[package]
+name = "nori"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A native torrent finder and download queue"
+
+[[bin]]
+name = "nori"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "57bd4fe181639797d395978d5de17bc9e10a6219" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "57bd4fe181639797d395978d5de17bc9e10a6219", features = ["wayland", "x11"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+nori-core = { path = "../nori-core" }
+unicode-segmentation = "1"
