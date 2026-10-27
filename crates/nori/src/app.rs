@@ -1497,11 +1497,15 @@ impl App {
             .iter()
             .filter(|item| matches!(item.status, Status::Downloading | Status::Queued))
             .count();
-        let seeding = self
-            .downloads
-            .iter()
-            .filter(|item| item.status == Status::Completed && !item.seed_paused)
-            .count();
+        let seeding = if self.cfg.seeding_enabled {
+            self.downloads
+                .iter()
+                .filter(|item| item.status == Status::Completed && !item.seed_paused)
+                .count()
+        } else {
+            // Nothing is seeding while the global switch is off.
+            0
+        };
         if width < 1020. {
             return self.compact_sidebar(theme, active, seeding, cx);
         }
