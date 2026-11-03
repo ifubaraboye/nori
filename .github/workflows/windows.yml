@@ -1,0 +1,105 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*", "[0-9]*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to attach the Windows build to (leave blank for artifact only)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build x86_64 Windows binary
+    runs-on: windows-latest
+    env:
+      # A single self-contained exe: no VC++ redistributable to install.
+      RUSTFLAGS: -C target-feature=+crt-static
+      # Fetch the pinned Zed revision with the git CLI, which core.longpaths
+      # applies to. The repo's checkout paths get long on Windows.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+
+      - name: Enable long paths for git
+        run: git config --global core.longpaths true
+
+      - name: Locate the DirectX shader compiler
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName | Select-Object -Last 1
+          if ($fxc) {
+            "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "Using $($fxc.FullName)"
+          } else {
+            Write-Warning "fxc.exe not found; GPUI will search the SDK registry itself"
+          }
+
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build Nori
+        run: cargo build --release --locked -p nori
+
+      - name: Test nori-core
+        run: cargo test --locked -p nori-core
+
+      - name: Package executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/nori.exe dist/nori.exe
+          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md dist/
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nori-windows-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Attach Windows binary to GitHub Release
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nori-windows-x86_64
+          path: dist
+
+      - name: Publish Windows binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/nori.exe --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/nori.exe --generate-notes --verify-tag
+          fi

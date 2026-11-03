@@ -1058,40 +1058,66 @@ impl App {
     }
 
     pub fn choose_folder(&mut self, cx: &mut Context<Self>) {
-        let start = self.cfg.download_dir.clone();
-        let (tx, rx) = async_channel::bounded::<Option<PathBuf>>(1);
-        std::thread::spawn(move || {
-            let output = std::process::Command::new("zenity")
-                .arg("--file-selection")
-                .arg("--directory")
-                .arg("--title=Download folder")
-                .arg(format!("--filename={start}/"))
-                .output();
-            let path = output
-                .ok()
-                .filter(|out| out.status.success())
-                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from);
-            let _ = tx.send_blocking(path);
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Some(path)) = rx.recv().await else {
-                return;
-            };
-            let _ = this.update(cx, |app, cx| {
-                app.cfg.set_download_dir(&path);
-                app.save_config();
-                app.set_toast(
-                    format!(
-                        "Download folder set: {} (applies after restart)",
-                        path.display()
-                    ),
-                    cx,
-                );
+        #[cfg(not(windows))]
+        {
+            let start = self.cfg.download_dir.clone();
+            let (tx, rx) = async_channel::bounded::<Option<PathBuf>>(1);
+            std::thread::spawn(move || {
+                let output = std::process::Command::new("zenity")
+                    .arg("--file-selection")
+                    .arg("--directory")
+                    .arg("--title=Download folder")
+                    .arg(format!("--filename={start}/"))
+                    .output();
+                let path = output
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from);
+                let _ = tx.send_blocking(path);
             });
-        })
-        .detach();
+            cx.spawn(async move |this, cx| {
+                let Ok(Some(path)) = rx.recv().await else {
+                    return;
+                };
+                let _ = this.update(cx, |app, cx| app.set_download_dir(path, cx));
+            })
+            .detach();
+        }
+
+        #[cfg(windows)]
+        {
+            let options = gpui::PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Use Folder".into()),
+            };
+            let rx = cx.prompt_for_paths(options);
+            cx.spawn(async move |this, cx| {
+                let Ok(Ok(Some(paths))) = rx.await else {
+                    return;
+                };
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                let _ = this.update(cx, |app, cx| app.set_download_dir(path, cx));
+            })
+            .detach();
+        }
+    }
+
+    fn set_download_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.cfg.set_download_dir(&path);
+        self.save_config();
+        self.set_toast(
+            format!(
+                "Download folder set: {} (applies after restart)",
+                path.display()
+            ),
+            cx,
+        );
     }
 
     // ---- actions -------------------------------------------------------
@@ -2049,6 +2075,7 @@ pub fn reveal_item(item: &Item) {
 /// Open the file manager with the file (or folder) selected, rather than
 /// launching it. Falls back to a plain folder open when no file manager
 /// supports the freedesktop interface.
+#[cfg(not(windows))]
 pub fn reveal_path(target: &Path) {
     let uri = file_uri(target);
     let shown = std::process::Command::new("dbus-send")
@@ -2079,6 +2106,24 @@ pub fn reveal_path(target: &Path) {
     let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
 }
 
+/// Open Explorer at the path. A file is selected in its folder; a folder is
+/// opened directly; a path that does not exist yet opens its nearest folder.
+#[cfg(windows)]
+pub fn reveal_path(target: &Path) {
+    let argument = if target.is_dir() {
+        target.display().to_string()
+    } else if target.exists() {
+        format!("/select,{}", target.display())
+    } else {
+        match target.parent() {
+            Some(parent) => parent.display().to_string(),
+            None => return,
+        }
+    };
+    let _ = std::process::Command::new("explorer").arg(argument).spawn();
+}
+
+#[cfg(not(windows))]
 fn file_uri(path: &Path) -> String {
     let mut uri = String::from("file://");
     for byte in path.to_string_lossy().bytes() {

@@ -1,4 +1,5 @@
-//! Settings and file locations, following XDG on Linux.
+//! Settings and file locations, following XDG on Linux and the platform's
+//! per-user folders on Windows and macOS.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,23 +45,27 @@ impl Default for Config {
 }
 
 /// The per-user configuration directory.
+///
+/// Windows uses `%APPDATA%\nori-torrent`; the XDG variables only apply on
+/// Unix.
 pub fn config_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(x).join(APP_DIR);
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".").join(".config"))
-        .join(APP_DIR)
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(x) if cfg!(unix) => PathBuf::from(x),
+        _ => dirs::config_dir().unwrap_or_else(|| PathBuf::from(".").join(".config")),
+    };
+    base.join(APP_DIR)
 }
 
 /// The per-user data directory.
+///
+/// Windows uses `%LOCALAPPDATA%\nori-torrent`; the XDG variables only apply
+/// on Unix.
 pub fn data_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(x).join(APP_DIR);
-    }
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from(".").join(".local/share"))
-        .join(APP_DIR)
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(x) if cfg!(unix) => PathBuf::from(x),
+        _ => dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".").join(".local/share")),
+    };
+    base.join(APP_DIR)
 }
 
 pub fn config_path() -> PathBuf {

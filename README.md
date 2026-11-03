@@ -13,12 +13,27 @@ no browser, no account, and nothing in the middle.
 Requirements:
 
 - Rust 2024 edition toolchain
-- A Wayland or X11 session, plus the usual GPUI build dependencies
-  (`libwayland-dev`, `libxkbcommon-dev`, `libfontconfig-dev`, `libssl-dev`)
+
+On Linux, a Wayland or X11 session plus the usual GPUI build dependencies
+(`libwayland-dev`, `libxkbcommon-dev`, `libfontconfig-dev`, `libssl-dev`).
+
+On Windows, the MSVC toolchain with Visual Studio Build Tools ("Desktop
+development with C++") and a Windows 10/11 SDK. Release builds also use the
+SDK's `fxc.exe` shader compiler; if GPUI cannot find it, set `GPUI_FXC_PATH`
+to its full path.
 
 ```sh
 cargo build --release
+```
+
+```sh
+# Linux
 ./target/release/nori
+```
+
+```powershell
+# Windows
+.\target\release\nori.exe
 ```
 
 The binary ships with Inter and JetBrains Mono Nerd Font, so no system font
@@ -26,12 +41,32 @@ setup is needed.
 
 ## Installing
 
+Linux:
+
 ```sh
 ./packaging/install.sh
 ```
 
 This builds the release binary and installs `nori`, the desktop entry, and the
 icon under your home directory.
+
+Windows: download `nori.exe` from the latest release and run it. There is no
+installer and no runtime to install; to uninstall, delete the executable and
+the state folders below. The first launch may show a SmartScreen prompt
+(*More info* → *Run anyway*) and a Windows Firewall prompt when the torrent
+engine starts listening for peers.
+
+## Releasing
+
+Tag a version and push it:
+
+```sh
+git tag 0.0.3
+git push origin 0.0.3
+```
+
+The Linux and Windows workflows build their assets and attach them to the
+GitHub release for that tag.
 
 ## Using it
 
@@ -86,9 +121,9 @@ the field, so `Escape` returns to the list first.
 
 | Path | Contents |
 | --- | --- |
-| `~/.config/nori-torrent/config.json` | Download folder, limits, sources, trackers, theme |
-| `~/.local/share/nori-torrent/queue.json` | Download queue and seeding state |
-| `~/Downloads/nori` | Default download folder |
+| `~/.config/nori-torrent/config.json` (Linux)<br>`%APPDATA%\nori-torrent\config.json` (Windows) | Download folder, limits, sources, trackers, theme |
+| `~/.local/share/nori-torrent/queue.json` (Linux)<br>`%LOCALAPPDATA%\nori-torrent\queue.json` (Windows) | Download queue and seeding state |
+| `~/Downloads/nori` (Linux)<br>`%USERPROFILE%\Downloads\nori` (Windows) | Default download folder |
 
 The `nori-torrent` suffix keeps this app's state apart from other desktop apps
 that use the Nori name.

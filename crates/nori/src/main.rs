@@ -1,5 +1,9 @@
 //! Nori: a native torrent finder and download queue.
 
+// Release builds are GUI apps on Windows; without this every launch also
+// opens a console window. Debug builds keep the console for its output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod icons;
 mod input;
