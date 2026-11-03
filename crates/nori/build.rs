@@ -1,8 +1,12 @@
-//! Embed the Windows icon, manifest and version metadata into `nori.exe`.
+//! Embed the Windows icon and version metadata into `nori.exe`.
 //!
 //! The resource is compiled by the Windows SDK's `rc.exe`, so it only runs
 //! when the build itself is on Windows. `cargo check` and non-Windows builds
 //! are unaffected.
+//!
+//! The application manifest is not here: GPUI already embeds one (its
+//! `windows-manifest` feature is on by default), and a second MANIFEST
+//! resource makes `cvtres` fail the link with CVT1100.
 
 fn main() {
     #[cfg(windows)]
@@ -26,8 +30,7 @@ fn embed_resources() {
     // Resource paths are relative to the crate root, which is the working
     // directory Cargo runs build scripts from.
     let body = format!(
-        r#"1 24 "assets/windows/nori.manifest"
-1 ICON "assets/windows/nori.ico"
+        r#"1 ICON "assets/windows/nori.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION {major},{minor},{patch},{build}
@@ -61,11 +64,10 @@ END
 
     std::fs::write(&rc_path, body).expect("write the generated Windows resource script");
     println!("cargo:rerun-if-changed=assets/windows/nori.ico");
-    println!("cargo:rerun-if-changed=assets/windows/nori.manifest");
 
     embed_resource::compile(&rc_path, embed_resource::NONE)
         .manifest_required()
-        .expect("embed the Windows icon, manifest and version info");
+        .expect("embed the Windows icon and version info");
 }
 
 #[cfg(windows)]
