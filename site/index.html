@@ -485,10 +485,11 @@
 
               
 
-              <div class="mt-7 flex flex-wrap items-center gap-4">
+              <div class="mt-7 flex flex-wrap items-center gap-4" id="download-buttons">
                 <a
                   href="https://github.com/ifubaraboye/nori/releases/download/0.0.2/Nori-x86_64.AppImage"
                   download="Nori-x86_64.AppImage"
+                  data-download-platform="linux"
                   class="inline-flex items-center gap-2 bg-white px-4 py-2.5 text-[13.5px] font-medium text-black shadow-[inset_0_1px_0_rgba(255,255,255,0.6)] transition-all duration-200 hover:bg-fog-200 active:scale-[0.985]"
                 >
                   <svg viewBox="0 0 24 24" class="h-[14px] w-[14px]" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -501,6 +502,7 @@
                 <a
                   href="https://github.com/ifubaraboye/nori/releases/download/0.0.3/nori-windows-x86_64.zip"
                   download="nori-windows-x86_64.zip"
+                  data-download-platform="windows"
                   class="inline-flex items-center gap-2 border border-white/10 px-4 py-2.5 text-[13.5px] font-medium text-fog-200 transition-all duration-200 hover:bg-white/[0.03] hover:text-white"
                 >
                   <svg viewBox="0 0 24 24" class="h-[14px] w-[14px]" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -512,9 +514,11 @@
                 </a>
               </div>
 
-              <div class="mt-6 border-l border-white/10 pl-4 font-mono text-[11px] leading-[1.8] text-fog-500">
-                <p>Windows 10 (1903+) or Windows 11, x64.</p>
-                <p>Unzip and run <code class="text-fog-300">nori.exe</code>; no installer or runtime.</p>
+              <p id="download-other" class="mt-4 text-[12px] text-fog-500" hidden></p>
+
+              <div id="download-note" class="mt-6 border-l border-white/10 pl-4 font-mono text-[11px] leading-[1.8] text-fog-500">
+                <p>Linux x64 &middot; Windows 10 (1903+) or Windows 11, x64.</p>
+                <p>No installer or runtime required.</p>
               </div>
             </div>
           </div>
@@ -667,6 +671,75 @@
             },
             { passive: true }
           );
+        }
+
+        /* ── offer the build that matches this machine ──────────── */
+        var downloadButtons = document.querySelectorAll("[data-download-platform]");
+        var downloadOther = document.getElementById("download-other");
+        var downloadNote = document.getElementById("download-note");
+
+        if (downloadButtons.length && downloadOther && downloadNote) {
+          var ua = navigator.userAgent || "";
+          // Chromium exposes userAgentData.platform; everything else falls
+          // back to the deprecated platform and UA strings. Android and
+          // ChromeOS both report "Linux", but neither runs the AppImage.
+          var reported =
+            (navigator.userAgentData && navigator.userAgentData.platform) ||
+            navigator.platform ||
+            "";
+          var isAndroid = /Android/i.test(ua);
+          var isChromeOS = /CrOS/i.test(ua);
+          var isWindows = /Win/i.test(reported) || /Windows/i.test(ua);
+          var isLinux =
+            !isAndroid &&
+            !isChromeOS &&
+            (/Linux/i.test(reported) || /Linux/i.test(ua));
+          var platform = isWindows ? "windows" : isLinux ? "linux" : "";
+
+          var primary =
+            "inline-flex items-center gap-2 bg-white px-4 py-2.5 text-[13.5px] font-medium text-black shadow-[inset_0_1px_0_rgba(255,255,255,0.6)] transition-all duration-200 hover:bg-fog-200 active:scale-[0.985]";
+          var secondary =
+            "inline-flex items-center gap-2 border border-white/10 px-4 py-2.5 text-[13.5px] font-medium text-fog-200 transition-all duration-200 hover:bg-white/[0.03] hover:text-white";
+
+          var notes = {
+            windows: [
+              "Windows 10 (1903+) or Windows 11, x64.",
+              'Unzip and run <code class="text-fog-300">nori.exe</code>; no installer or runtime.'
+            ],
+            linux: [
+              "Linux x64, AppImage.",
+              "Make it executable and run it; no installer."
+            ],
+            other: [
+              "Nori runs on Linux and Windows.",
+              "There is no macOS build yet."
+            ]
+          };
+          var note = notes[platform || "other"];
+          downloadNote.innerHTML = "<p>" + note[0] + "</p><p>" + note[1] + "</p>";
+
+          if (platform) {
+            Array.prototype.forEach.call(downloadButtons, function (button) {
+              if (button.getAttribute("data-download-platform") === platform) {
+                button.className = primary;
+              } else {
+                button.className = secondary;
+                button.style.display = "none";
+
+                var alt = document.createElement("a");
+                alt.href = button.getAttribute("href");
+                alt.className =
+                  "underline decoration-white/20 underline-offset-2 transition-colors hover:text-fog-200";
+                alt.textContent =
+                  "Also available for " +
+                  (button.getAttribute("data-download-platform") === "windows"
+                    ? "Windows"
+                    : "Linux");
+                downloadOther.appendChild(alt);
+                downloadOther.hidden = false;
+              }
+            });
+          }
         }
       })();
     </script>
