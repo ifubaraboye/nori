@@ -332,7 +332,10 @@
 
               <div class="reveal mt-10 flex flex-wrap items-center gap-x-5 gap-y-4" style="transition-delay: 180ms">
                 <a
+                  id="hero-download"
                   href="#download"
+                  data-href-linux="https://github.com/ifubaraboye/nori/releases/download/0.0.2/Nori-x86_64.AppImage"
+                  data-href-windows="https://github.com/ifubaraboye/nori/releases/download/0.0.3/nori-windows-x86_64.zip"
                   class="inline-flex items-center gap-2 bg-white px-4 py-2.5 text-[13.5px] font-medium text-black shadow-[inset_0_1px_0_rgba(255,255,255,0.6),0_8px_24px_-12px_rgba(255,255,255,0.4)] transition-all duration-200 hover:bg-fog-200 active:scale-[0.985]"
                 >
                   <svg viewBox="0 0 24 24" class="h-[14px] w-[14px]" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -340,7 +343,7 @@
                     <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
                     <path d="M4.5 19.5h15" />
                   </svg>
-                  Download for Linux
+                  <span id="hero-download-label">Download</span>
                 </a>
                 <!--<a
                   href="https://github.com/ifubaraboye/nori"
@@ -674,28 +677,37 @@
         }
 
         /* ── offer the build that matches this machine ──────────── */
+        // Chromium exposes userAgentData.platform; everything else falls back
+        // to the deprecated platform and UA strings. Android and ChromeOS both
+        // report "Linux", but neither runs the AppImage.
+        var ua = navigator.userAgent || "";
+        var reported =
+          (navigator.userAgentData && navigator.userAgentData.platform) ||
+          navigator.platform ||
+          "";
+        var isAndroid = /Android/i.test(ua);
+        var isChromeOS = /CrOS/i.test(ua);
+        var isWindows = /Win/i.test(reported) || /Windows/i.test(ua);
+        var isLinux =
+          !isAndroid &&
+          !isChromeOS &&
+          (/Linux/i.test(reported) || /Linux/i.test(ua));
+        var platform = isWindows ? "windows" : isLinux ? "linux" : "";
+
+        var heroDownload = document.getElementById("hero-download");
+        var heroLabel = document.getElementById("hero-download-label");
+        if (heroDownload && heroLabel && platform) {
+          var heroHref = heroDownload.getAttribute("data-href-" + platform);
+          if (heroHref) heroDownload.href = heroHref;
+          heroLabel.textContent =
+            platform === "windows" ? "Download for Windows" : "Download for Linux";
+        }
+
         var downloadButtons = document.querySelectorAll("[data-download-platform]");
         var downloadOther = document.getElementById("download-other");
         var downloadNote = document.getElementById("download-note");
 
         if (downloadButtons.length && downloadOther && downloadNote) {
-          var ua = navigator.userAgent || "";
-          // Chromium exposes userAgentData.platform; everything else falls
-          // back to the deprecated platform and UA strings. Android and
-          // ChromeOS both report "Linux", but neither runs the AppImage.
-          var reported =
-            (navigator.userAgentData && navigator.userAgentData.platform) ||
-            navigator.platform ||
-            "";
-          var isAndroid = /Android/i.test(ua);
-          var isChromeOS = /CrOS/i.test(ua);
-          var isWindows = /Win/i.test(reported) || /Windows/i.test(ua);
-          var isLinux =
-            !isAndroid &&
-            !isChromeOS &&
-            (/Linux/i.test(reported) || /Linux/i.test(ua));
-          var platform = isWindows ? "windows" : isLinux ? "linux" : "";
-
           var primary =
             "inline-flex items-center gap-2 bg-white px-4 py-2.5 text-[13.5px] font-medium text-black shadow-[inset_0_1px_0_rgba(255,255,255,0.6)] transition-all duration-200 hover:bg-fog-200 active:scale-[0.985]";
           var secondary =
@@ -706,17 +718,19 @@
               "Windows 10 (1903+) or Windows 11, x64.",
               'Unzip and run <code class="text-fog-300">nori.exe</code>; no installer or runtime.'
             ],
-            linux: [
-              "Linux x64, AppImage.",
-              "Make it executable and run it; no installer."
-            ],
+            linux: [],
             other: [
               "Nori runs on Linux and Windows.",
               "There is no macOS build yet."
             ]
           };
           var note = notes[platform || "other"];
-          downloadNote.innerHTML = "<p>" + note[0] + "</p><p>" + note[1] + "</p>";
+          if (note.length) {
+            downloadNote.innerHTML = "<p>" + note.join("</p><p>") + "</p>";
+            downloadNote.hidden = false;
+          } else {
+            downloadNote.hidden = true;
+          }
 
           if (platform) {
             Array.prototype.forEach.call(downloadButtons, function (button) {
