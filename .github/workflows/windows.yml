@@ -98,8 +98,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/nori.exe --clobber
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/nori.exe -R "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$RELEASE_TAG" dist/nori.exe --generate-notes --verify-tag
+            gh release create "$RELEASE_TAG" dist/nori.exe -R "$GITHUB_REPOSITORY" --generate-notes --verify-tag
           fi
