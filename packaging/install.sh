@@ -17,7 +17,7 @@ install -m 644 "$root/packaging/nori.desktop" "$apps/nori.desktop"
 for size in 16 24 32 48 64 128 256; do
   dir="${icons}/${size}x${size}/apps"
   mkdir -p "$dir"
-  install -m 644 "$root/packaging/icons/nori-${size}.png" "$dir/nori.png"
+  install -m 644 "$root/packaging/icons/hicolor/${size}x${size}/apps/nori.png" "$dir/nori.png"
 done
 
 # The icon used to be a single scalable SVG. Drop the stale copy so themed
