@@ -77,7 +77,7 @@ jobs:
             --appdir AppDir \
             --executable target/release/nori \
             --desktop-file packaging/nori.desktop \
-            --icon-file packaging/nori.svg \
+            --icon-file packaging/icons/nori-256.png \
             --output appimage
 
       - name: Upload AppImage artifact
