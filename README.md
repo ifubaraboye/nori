@@ -50,11 +50,11 @@ Linux:
 This builds the release binary and installs `nori`, the desktop entry, and the
 icon under your home directory.
 
-Windows: download the Windows build from the latest release, unzip it, and run
-`nori.exe`. There is no installer and no runtime to install; to uninstall,
-delete the executable and the state folders below. The first launch may show a
-SmartScreen prompt (*More info* → *Run anyway*) and a Windows Firewall prompt
-when the torrent engine starts listening for peers.
+Windows: download `nori.exe` from the latest release and run it. There is no
+installer and no runtime to install; to uninstall, delete the executable and
+the state folders below. The first launch may show a SmartScreen prompt
+(*More info* → *Run anyway*) and a Windows Firewall prompt when the torrent
+engine starts listening for peers.
 
 ## Releasing
 
